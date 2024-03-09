@@ -36,10 +36,13 @@ use lazy_static::lazy_static;
 use regex::Regex;
 
 lazy_static! {
-    static ref RE_SYSTEM_MESSAGE: Regex = Regex::new(r"(?<username>[\w\s\-_\.]+)(:\s)(?<system><\w+>)\s(?<clipboard>[\w\+=]+)").unwrap();
+    static ref RE_SYSTEM_MESSAGE: Regex =
+        Regex::new(r"(?<username>[\w\s\-_\.]+)(:\s)(?<system><\w+>)\s\|(?<clipboard>[\w+=]+)\|")
+            .unwrap();
+    static ref CLIPBOARD: SystemClipboard = get_current_clipboard();
 }
 
-const BANNER : &str = r#"
+const BANNER: &str = r#"
 ██████  ██      ██ ███████ ███    ██ ████████ 
 ██      ██      ██ ██      ████   ██    ██    
 ██      ██      ██ █████   ██ ██  ██    ██    
@@ -72,23 +75,27 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let (tx, rx) = mpsc::channel::<Bytes>(10);
     let rx = tokio_stream::wrappers::ReceiverStream::new(rx);
 
+    let _ = CLIPBOARD.set_string_contents("".to_string()); //UGLY shit
+
     // Spawn a task to monitor clipboard changes
     tokio::spawn(async move {
-        let Ok(clipboard) = SystemClipboard::new() else {
-            eprintln!("could not connect to clipboard");
-            exit(100); // We exit here, as if this doesn't work, there is no use continue the client
-        };
-        let mut previous_content = clipboard.get_string_contents().unwrap_or_default();
-        let mut interval = time::interval(Duration::from_secs(1));
+        let mut previous_content = CLIPBOARD.get_string_contents().unwrap_or_default();
+        let mut interval = time::interval(Duration::from_secs(5));
         loop {
             interval.tick().await;
-            let current_content = clipboard
+            let current_content = CLIPBOARD
                 .get_string_contents()
                 .expect("error getting the contents of the clipboard");
             if current_content != previous_content {
                 let encoded = general_purpose::STANDARD.encode(&current_content);
                 // Send the encoded content to the channel
-                if tx.send(Bytes::from(format!("<clipboard> {} \n",encoded))).await.is_err() { //the newline is IMPORTANT HERE!
+                //println!("encoded :: |{}|", encoded);
+                if tx
+                    .send(Bytes::from(format!("<clipboard> |{}|\n", encoded)))
+                    .await
+                    .is_err()
+                {
+                    //the newline is IMPORTANT HERE!
                     eprintln!("Failed to send encoded content");
                     break;
                 }
@@ -110,6 +117,28 @@ async fn main() -> Result<(), Box<dyn Error>> {
         udp::connect(&addr, stdin, stdout).await?;
     }
 
+    Ok(())
+}
+
+fn get_current_clipboard() -> SystemClipboard {
+    let Ok(clipboard) = SystemClipboard::new() else {
+        eprintln!("could not connect to clipboard");
+        exit(100); // We exit here, as if this doesn't work, there is no use continue the client
+    };
+    clipboard
+}
+
+fn replace_clipboard_content(content: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let decoded = general_purpose::STANDARD.decode(content)?;
+    let decoded_string = String::from_utf8(decoded)?;
+    //println!("decoded :: |{decoded_string}|");
+    let current_content = CLIPBOARD
+        .get_string_contents()
+        .expect("error getting the contents of the clipboard");
+    //println!("current_content :: |{current_content}| ");
+    if current_content != decoded_string {
+        CLIPBOARD.set_string_contents(decoded_string)?;
+    };
     Ok(())
 }
 
@@ -137,38 +166,38 @@ mod tcp {
                     // HERE IS WHERE WE CAN CHECK INCOMMING MESSAGES!!!
                     //println!("incomming message :: {:?}", std::str::from_utf8(&i.as_ref()));
 
-                    if let Ok(message) = std::str::from_utf8(&i.as_ref()){
+                    if let Ok(message) = std::str::from_utf8(&i.as_ref()) {
                         if let Some(captures) = crate::RE_SYSTEM_MESSAGE.captures(message) {
                             //println!("message :: {}",&message);
                             //let username = captures.name("username").map_or("", |m| m.as_str());
                             let system = captures.name("system").map_or("", |m| m.as_str());
                             let clipboard = captures.name("clipboard").map_or("", |m| m.as_str());
-                            // Now you can use the username and message to filter out specific commands
-                            // For example, if the message is a specific command, you could handle it differently
+                            // Filter stuff here
                             if system == "<clipboard>" {
-                                // Handle the command
-                                //println!("{} command was called, by {}", message, username);
+                                //println!("replace |{clipboard}|");
                                 match crate::replace_clipboard_content(clipboard) {
                                     Ok(_) => (),
                                     Err(err) => {
-                                        eprintln!("could not replace the clipboard content, {}",err)
+                                        eprintln!(
+                                            "could not replace the clipboard content, {}",
+                                            err
+                                        )
                                     }
                                 }
-                                
                             } else {
                                 // Handle normal messages
                                 println!("command {} doesn't exist", message)
                                 //peer.lines.send(&msg).await?;
-                            }}
+                            }
+                        }
                     } else {
                         eprintln!("message was not UTF8")
                     }
-                    
 
                     future::ready(Some(i.freeze()))
                 }
                 Err(e) => {
-                    println!("failed to read from socket; error={}", e);
+                    eprintln!("failed to read from socket; error={}", e);
                     future::ready(None)
                 }
             })
@@ -179,16 +208,6 @@ mod tcp {
             _ => Ok(()),
         }
     }
-}
-
-fn replace_clipboard_content(content: &str) -> Result<(), crossclip::ClipboardError>{
-    //println!("trying to replace the current clipboard with {}", content);
-    let Ok(clipboard) = SystemClipboard::new() else {
-        eprintln!("could not connect to clipboard");
-        exit(100); // We exit here, as if this doesn't work, there is no use continue the client
-    };
-    clipboard.set_string_contents(content.to_string())?;
-    Ok(())
 }
 
 mod udp {
