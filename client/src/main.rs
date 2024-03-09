@@ -125,6 +125,35 @@ mod tcp {
                 Ok(i) => {
                     // HERE IS WHERE WE CAN CHECK INCOMMING MESSAGES!!!
                     //println!("incomming message :: {:?}", std::str::from_utf8(&i.as_ref()));
+
+                    if let Ok(message) = std::str::from_utf8(&i.as_ref()){
+                        if let Some(captures) = crate::RE_SYSTEM_MESSAGE.captures(message) {
+                            //println!("message :: {}",&message);
+                            //let username = captures.name("username").map_or("", |m| m.as_str());
+                            let system = captures.name("system").map_or("", |m| m.as_str());
+                            let clipboard = captures.name("clipboard").map_or("", |m| m.as_str());
+                            // Now you can use the username and message to filter out specific commands
+                            // For example, if the message is a specific command, you could handle it differently
+                            if system == "<clipboard>" {
+                                // Handle the command
+                                //println!("{} command was called, by {}", message, username);
+                                match crate::replace_clipboard_content(clipboard) {
+                                    Ok(_) => (),
+                                    Err(err) => {
+                                        eprintln!("could not replace the clipboard content, {}",err)
+                                    }
+                                }
+                                
+                            } else {
+                                // Handle normal messages
+                                println!("command {} doesn't exist", message)
+                                //peer.lines.send(&msg).await?;
+                            }}
+                    } else {
+                        eprintln!("message was not UTF8")
+                    }
+                    
+
                     future::ready(Some(i.freeze()))
                 }
                 Err(e) => {
@@ -139,6 +168,16 @@ mod tcp {
             _ => Ok(()),
         }
     }
+}
+
+fn replace_clipboard_content(content: &str) -> Result<(), crossclip::ClipboardError>{
+    //println!("trying to replace the current clipboard with {}", content);
+    let Ok(clipboard) = SystemClipboard::new() else {
+        eprintln!("could not connect to clipboard");
+        exit(100); // We exit here, as if this doesn't work, there is no use continue the client
+    };
+    clipboard.set_string_contents(content.to_string())?;
+    Ok(())
 }
 
 mod udp {

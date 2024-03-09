@@ -79,12 +79,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .nth(1)
         .unwrap_or_else(|| "127.0.0.1:4242".to_string());
 
+    println!("broker started on : {}",&addr); //
+
     // Bind a TCP listener to the socket address.
     //
     // Note that this is the Tokio TcpListener, which is fully async.
     let listener = TcpListener::bind(&addr).await?;
 
-    tracing::info!("server running on {}", addr);
+    tracing::info!("server running on {}", addr); //#######################################
 
     loop {
         // Asynchronously wait for an inbound TcpStream.
