@@ -16,16 +16,20 @@
 
 #![warn(rust_2018_idioms)]
 
-use futures::StreamExt;
+//use futures::StreamExt;
 use tokio::io;
+use tokio::sync::mpsc;
+use tokio::time::{self, Duration};
 use tokio_util::codec::{BytesCodec, FramedRead, FramedWrite};
+use tokio_stream::StreamExt;
 
 use std::env;
 use std::error::Error;
 use std::net::SocketAddr;
 
-use crossclip::{Clipboard, SystemClipboard};
 use base64::{engine::general_purpose, Engine as _};
+use crossclip::{Clipboard, SystemClipboard};
+use bytes::Bytes;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -45,14 +49,38 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .ok_or("this program requires at least one argument")?;
     let addr = addr.parse::<SocketAddr>()?;
 
-    let stdin = FramedRead::new(io::stdin(), BytesCodec::new());
-    let stdin = stdin.map(|i| i.map(|bytes| bytes.freeze()));
-    let stdout = FramedWrite::new(io::stdout(), BytesCodec::new());
+    // ------------------- [begin] codeiumAI suggestions
 
-    let clipboard = SystemClipboard::new()?;
-    let content = clipboard.get_string_contents()?;
-    let encoded = general_purpose::STANDARD.encode(&content);
-    println!("clipboard :: {}",encoded);
+    let (tx, rx) = mpsc::channel::<Bytes>(10);
+    let rx = tokio_stream::wrappers::ReceiverStream::new(rx);
+
+    // Spawn a task to monitor clipboard changes
+    tokio::spawn(async move {
+        let clipboard = SystemClipboard::new().expect("error reading clipboard"); //TODO: handle this better
+        let mut previous_content = clipboard.get_string_contents().expect("error getting the contents of clipboard");
+        let mut interval = time::interval(Duration::from_secs(1));
+        loop {
+            interval.tick().await;
+            let current_content = clipboard.get_string_contents().expect("error getting the contents of the clipboard");
+            if current_content != previous_content {
+                let encoded = general_purpose::STANDARD.encode(&current_content);
+                println!("Clipboard changed, encoded content: {}", encoded);
+                // Send the encoded content to the channel
+                if tx.send(Bytes::from(encoded)).await.is_err() {
+                    eprintln!("Failed to send encoded content");
+                    break;
+                }
+                previous_content = current_content;
+            }
+        }
+    });
+    // ------------------- [end] codeiumAI suggestions
+
+    let stdin = FramedRead::new(io::stdin(), BytesCodec::new())
+    .map(|i| i.map(|bytes| bytes.freeze()))
+    .merge(rx.map(Result::<Bytes, io::Error>::Ok));
+
+    let stdout = FramedWrite::new(io::stdout(), BytesCodec::new());
 
     if tcp {
         tcp::connect(&addr, stdin, stdout).await?;
