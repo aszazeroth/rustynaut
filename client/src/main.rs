@@ -26,6 +26,7 @@ use tokio_stream::StreamExt;
 use std::env;
 use std::error::Error;
 use std::net::SocketAddr;
+use std::process::exit;
 
 use base64::{engine::general_purpose, Engine as _};
 use crossclip::{Clipboard, SystemClipboard};
@@ -50,14 +51,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let addr = addr.parse::<SocketAddr>()?;
 
     // ------------------- [begin] codeiumAI suggestions
-
     let (tx, rx) = mpsc::channel::<Bytes>(10);
     let rx = tokio_stream::wrappers::ReceiverStream::new(rx);
 
     // Spawn a task to monitor clipboard changes
     tokio::spawn(async move {
-        let clipboard = SystemClipboard::new().expect("error reading clipboard"); //TODO: handle this better
-        let mut previous_content = clipboard.get_string_contents().expect("error getting the contents of clipboard");
+        let Ok(clipboard) = SystemClipboard::new() else {
+            eprintln!("could not connect to clipboard");
+            exit(100); // We exit here, as if this doesn't work, there is no use continue the client
+        };
+        let mut previous_content = clipboard.get_string_contents().unwrap_or_default();
         let mut interval = time::interval(Duration::from_secs(1));
         loop {
             interval.tick().await;
