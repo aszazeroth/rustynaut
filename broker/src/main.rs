@@ -39,6 +39,13 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use lazy_static::lazy_static;
+use regex::Regex;
+
+lazy_static! {
+    static ref RE_MESSAGE: Regex = Regex::new(r"(?<username>\w+)(:\S)(?<message>/\w+)").unwrap();
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     use tracing_subscriber::{fmt::format::FmtSpan, EnvFilter};
@@ -201,31 +208,52 @@ async fn process(
     // Process incoming messages until our stream is exhausted by a disconnect.
     loop {
         tokio::select! {
-            // A message was received from a peer. Send it to the current user.
-            Some(msg) = peer.rx.recv() => {
-                peer.lines.send(&msg).await?;
-            }
-            result = peer.lines.next() => match result {
-                // A message was received from the current user, we should
-                // broadcast this message to the other users.
-                Some(Ok(msg)) => {
-                    let mut state = state.lock().await;
-                    let msg = format!("{}: {}", username, msg);
+                    // A message was received from a peer. Send it to the current user.
+                    Some(msg) = peer.rx.recv() => {
+                        println!("peer->current-user::message: {:#?}",&msg);
+                        peer.lines.send(&msg).await?;
+                        /*
+                        //println!("peer->current-user::message: {:#?}",&msg);
 
-                    state.broadcast(addr, &msg).await;
+                        if let Some(captures) = RE_MESSAGE.captures(&msg) {
+                            let username = captures.name("username").map_or("", |m| m.as_str());
+                            let message = captures.name("message").map_or("", |m| m.as_str());
+                            // Now you can use the username and message to filter out specific commands
+                            // For example, if the message is a specific command, you could handle it differently
+                            if message == "/help" {
+                                // Handle the command
+                                println!("{} command was called, by {}", message, username);
+                            } else {
+                                // Handle normal messages
+                                println!("command {} doesn't exist", message)
+                                //peer.lines.send(&msg).await?;
+                            }
+                        } else {
+                            peer.lines.send(&msg).await?;
+                        }
+                        */
+                    }
+                    result = peer.lines.next() => match result {
+                        // A message was received from the current user, we should
+                        // broadcast this message to the other users.
+                        Some(Ok(msg)) => {
+                            let mut state = state.lock().await;
+                            let msg = format!("{}: {}", username, msg);
+                            println!("current-user->peers::message: {:#?}",&msg);
+                            state.broadcast(addr, &msg).await;
+                        }
+                        // An error occurred.
+                        Some(Err(e)) => {
+                            tracing::error!(
+                                "an error occurred while processing messages for {}; error = {:?}",
+                                username,
+                                e
+                            );
+                        }
+                        // The stream has been exhausted.
+                        None => break,
+                    },
                 }
-                // An error occurred.
-                Some(Err(e)) => {
-                    tracing::error!(
-                        "an error occurred while processing messages for {}; error = {:?}",
-                        username,
-                        e
-                    );
-                }
-                // The stream has been exhausted.
-                None => break,
-            },
-        }
     }
 
     // If this section is reached it means that the client was disconnected!

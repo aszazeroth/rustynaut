@@ -69,7 +69,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 .expect("error getting the contents of the clipboard");
             if current_content != previous_content {
                 let encoded = general_purpose::STANDARD.encode(&current_content);
-                //println!("<clipboard>: {}", encoded);
+                println!("<clipboard>: {}", encoded);
                 // Send the encoded content to the channel
                 if tx.send(Bytes::from(format!("<clipboard> {}",encoded))).await.is_err() {
                     eprintln!("Failed to send encoded content");
@@ -118,7 +118,7 @@ mod tcp {
                 //BytesMut into Bytes
                 Ok(i) => {
                     // HERE IS WHERE WE CAN CHECK INCOMMING MESSAGES!!!
-                    println!("incomming message :: {:?}", std::str::from_utf8(&i.as_ref()));
+                    //println!("incomming message :: {:?}", std::str::from_utf8(&i.as_ref()));
                     future::ready(Some(i.freeze()))
                 }
                 Err(e) => {
