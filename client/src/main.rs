@@ -39,8 +39,19 @@ lazy_static! {
     static ref RE_SYSTEM_MESSAGE: Regex = Regex::new(r"(?<username>[\w\s\-_\.]+)(:\s)(?<system><\w+>)\s(?<clipboard>[\w\+=]+)").unwrap();
 }
 
+const BANNER : &str = r#"
+██████  ██      ██ ███████ ███    ██ ████████ 
+██      ██      ██ ██      ████   ██    ██    
+██      ██      ██ █████   ██ ██  ██    ██    
+██      ██      ██ ██      ██  ██ ██    ██    
+██████  ███████ ██ ███████ ██   ████    ██    
+                                              
+https://github.com/aszazeroth/rustynaut                                                
+"#;
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    println!("{BANNER}");
     // Determine if we're going to run in TCP or UDP mode
     let mut args = env::args().skip(1).collect::<Vec<_>>();
     let tcp = match args.iter().position(|a| a == "--udp") {

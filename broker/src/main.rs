@@ -46,8 +46,20 @@ lazy_static! {
     static ref RE_MESSAGE: Regex = Regex::new(r"(?<username>\w+)(:\S)(?<message>/\w+)").unwrap();
 }
 
+const BANNER: &str = r#"
+██████  ██████   ██████  ██   ██ ███████ ██████  
+██   ██ ██   ██ ██    ██ ██  ██  ██      ██   ██ 
+██████  ██████  ██    ██ █████   █████   ██████  
+██   ██ ██   ██ ██    ██ ██  ██  ██      ██   ██ 
+██████  ██   ██  ██████  ██   ██ ███████ ██   ██ 
+                                                 
+https://github.com/aszazeroth/rustynaut                                                 
+"#;
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    println!("{BANNER}");
+
     use tracing_subscriber::{fmt::format::FmtSpan, EnvFilter};
     // Configure a `tracing` subscriber that logs traces emitted by the chat
     // server.
