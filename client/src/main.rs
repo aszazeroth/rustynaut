@@ -69,7 +69,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 .expect("error getting the contents of the clipboard");
             if current_content != previous_content {
                 let encoded = general_purpose::STANDARD.encode(&current_content);
-                println!("Clipboard changed, encoded content: {}", encoded);
+                println!("<clipboard>: {}", encoded);
                 // Send the encoded content to the channel
                 if tx.send(Bytes::from(encoded)).await.is_err() {
                     eprintln!("Failed to send encoded content");
@@ -86,12 +86,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .merge(rx.map(Result::<Bytes, io::Error>::Ok));
 
     let stdout = FramedWrite::new(io::stdout(), BytesCodec::new());
-
-    println!("stdout :: {:#?}", stdout);
-
-    // ------------------- [begin] codeiumAI suggestions
-
-    // ------------------- [end] codeiumAI suggestions
 
     if tcp {
         tcp::connect(&addr, stdin, stdout).await?;
@@ -124,7 +118,7 @@ mod tcp {
                 //BytesMut into Bytes
                 Ok(i) => {
                     // HERE IS WHERE WE CAN CHECK INCOMMING MESSAGES!!!
-                    println!("incomming bytes :: {:#?}", i.clone().freeze());
+                    println!("incomming message :: {:?}", std::str::from_utf8(&i.as_ref()));
                     future::ready(Some(i.freeze()))
                 }
                 Err(e) => {
