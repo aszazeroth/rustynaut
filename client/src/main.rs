@@ -20,8 +20,8 @@
 use tokio::io;
 use tokio::sync::mpsc;
 use tokio::time::{self, Duration};
-use tokio_util::codec::{BytesCodec, FramedRead, FramedWrite};
 use tokio_stream::StreamExt;
+use tokio_util::codec::{BytesCodec, FramedRead, FramedWrite};
 
 use std::env;
 use std::error::Error;
@@ -29,8 +29,8 @@ use std::net::SocketAddr;
 use std::process::exit;
 
 use base64::{engine::general_purpose, Engine as _};
-use crossclip::{Clipboard, SystemClipboard};
 use bytes::Bytes;
+use crossclip::{Clipboard, SystemClipboard};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -64,7 +64,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let mut interval = time::interval(Duration::from_secs(1));
         loop {
             interval.tick().await;
-            let current_content = clipboard.get_string_contents().expect("error getting the contents of the clipboard");
+            let current_content = clipboard
+                .get_string_contents()
+                .expect("error getting the contents of the clipboard");
             if current_content != previous_content {
                 let encoded = general_purpose::STANDARD.encode(&current_content);
                 println!("Clipboard changed, encoded content: {}", encoded);
@@ -80,10 +82,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // ------------------- [end] codeiumAI suggestions
 
     let stdin = FramedRead::new(io::stdin(), BytesCodec::new())
-    .map(|i| i.map(|bytes| bytes.freeze()))
-    .merge(rx.map(Result::<Bytes, io::Error>::Ok));
+        .map(|i| i.map(|bytes| bytes.freeze()))
+        .merge(rx.map(Result::<Bytes, io::Error>::Ok));
 
     let stdout = FramedWrite::new(io::stdout(), BytesCodec::new());
+
+    println!("stdout :: {:#?}", stdout);
+
+    // ------------------- [begin] codeiumAI suggestions
+
+    // ------------------- [end] codeiumAI suggestions
 
     if tcp {
         tcp::connect(&addr, stdin, stdout).await?;
@@ -114,7 +122,11 @@ mod tcp {
         let mut stream = FramedRead::new(r, BytesCodec::new())
             .filter_map(|i| match i {
                 //BytesMut into Bytes
-                Ok(i) => future::ready(Some(i.freeze())),
+                Ok(i) => {
+                    // HERE IS WHERE WE CAN CHECK INCOMMING MESSAGES!!!
+                    println!("incomming bytes :: {:#?}", i.clone().freeze());
+                    future::ready(Some(i.freeze()))
+                }
                 Err(e) => {
                     println!("failed to read from socket; error={}", e);
                     future::ready(None)
