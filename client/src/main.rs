@@ -69,9 +69,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 .expect("error getting the contents of the clipboard");
             if current_content != previous_content {
                 let encoded = general_purpose::STANDARD.encode(&current_content);
-                println!("<clipboard>: {}", encoded);
                 // Send the encoded content to the channel
-                if tx.send(Bytes::from(format!("<clipboard> {}",encoded))).await.is_err() {
+                if tx.send(Bytes::from(format!("<clipboard> {} \n",encoded))).await.is_err() { //the newline is IMPORTANT HERE!
                     eprintln!("Failed to send encoded content");
                     break;
                 }
