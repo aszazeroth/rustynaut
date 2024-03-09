@@ -6,7 +6,7 @@ Broker and client, slighty Rusty
 
 ## Introduction ## 
 
-*HEAVILY* inspired by ol' coding andventures and the Tokio chat server/client.
+*HEAVILY* inspired by ol' coding adventures and the Tokio chat server/client.
 
 ## Credits ##
 
