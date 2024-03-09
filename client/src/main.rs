@@ -32,6 +32,13 @@ use base64::{engine::general_purpose, Engine as _};
 use bytes::Bytes;
 use crossclip::{Clipboard, SystemClipboard};
 
+use lazy_static::lazy_static;
+use regex::Regex;
+
+lazy_static! {
+    static ref RE_SYSTEM_MESSAGE: Regex = Regex::new(r"(?<username>[\w\s\-_\.]+)(:\s)(?<system><\w+>)\s(?<clipboard>[\w\+=]+)").unwrap();
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     // Determine if we're going to run in TCP or UDP mode

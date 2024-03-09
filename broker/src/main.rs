@@ -210,7 +210,7 @@ async fn process(
         tokio::select! {
                     // A message was received from a peer. Send it to the current user.
                     Some(msg) = peer.rx.recv() => {
-                        println!("peer->current-user::message: {:#?}",&msg);
+                        //println!("peer->current-user::message: {:#?}",&msg);
                         peer.lines.send(&msg).await?;
                         /*
                         //println!("peer->current-user::message: {:#?}",&msg);
@@ -239,7 +239,7 @@ async fn process(
                         Some(Ok(msg)) => {
                             let mut state = state.lock().await;
                             let msg = format!("{}: {}", username, msg);
-                            println!("current-user->peers::message: {:#?}",&msg);
+                            //println!("current-user->peers::message: {:#?}",&msg);
                             state.broadcast(addr, &msg).await;
                         }
                         // An error occurred.
