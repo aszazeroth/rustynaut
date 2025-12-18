@@ -71,10 +71,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let mut previous_content = match CLIPBOARD.get_string_contents() {
             Ok(s) => s,
             Err(err) => {
-                eprintln!(
-                    "clipboard unavailable ({err}); clipboard publishing disabled for this client"
-                );
-                return;
+                // Treat "clipboard is empty" as an empty string, not an error
+                let err_str = err.to_string();
+                if err_str.contains("empty") || err_str.contains("Empty") {
+                    String::new()
+                } else {
+                    eprintln!(
+                        "clipboard unavailable ({err}); clipboard publishing disabled for this client"
+                    );
+                    return;
+                }
             }
         };
         let mut interval = time::interval(Duration::from_secs(2));
@@ -87,11 +93,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     s
                 }
                 Err(err) => {
-                    if verbose_for_clipboard && !warned {
-                        eprintln!("clipboard read failed ({err}); will retry (publishing paused)");
-                        warned = true;
+                    // Treat "clipboard is empty" as an empty string, not an error
+                    let err_str = err.to_string();
+                    if err_str.contains("empty") || err_str.contains("Empty") {
+                        warned = false;
+                        String::new()
+                    } else {
+                        if verbose_for_clipboard && !warned {
+                            eprintln!(
+                                "clipboard read failed ({err}); will retry (publishing paused)"
+                            );
+                            warned = true;
+                        }
+                        continue;
                     }
-                    continue;
                 }
             };
             if current_content != previous_content {

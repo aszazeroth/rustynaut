@@ -159,6 +159,103 @@ struct FileTransfer {
 - **Explicit for files** — `/send <path>` for arbitrary files
 
 ---
+
+## TLS Encryption with tokio-rustls
+
+### Rationale
+Running broker/client over the internet requires encrypted transport. TLS 1.3 via `tokio-rustls` provides:
+- **Transparent streaming** — no message size limits, handles large file transfers seamlessly
+- **Drop-in integration** — TLS streams implement `AsyncRead + AsyncWrite`, so `LinesCodec` works unchanged
+- **Battle-tested** — same stack as HTTPS, well-audited
+
+### Alternative Considered: Noise Protocol (snow crate)
+- Simpler key management (no certificates, just X25519 key pairs)
+- But: 65KB per-message limit requires manual chunking for large files
+- Decision: Use TLS for simplicity with large transfers; revisit Noise for peer-to-peer scenarios
+
+### Dependencies
+
+**Broker (Cargo.toml):**
+```toml
+tokio-rustls = "0.26"
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
+rustls-pemfile = "2"
+rcgen = "0.13"  # Optional: generate self-signed certs at startup
+```
+
+**Client (Cargo.toml):**
+```toml
+tokio-rustls = "0.26"
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
+rustls-pemfile = "2"
+webpki-roots = "0.26"  # Optional: system CA roots
+```
+
+### CLI Changes
+
+**Broker:**
+```
+broker [--verbose|-v] [--cert <path>] [--key <path>] [--no-tls] [addr]
+
+  --cert <path>     Path to PEM certificate chain (required unless --no-tls)
+  --key <path>      Path to PEM private key (required unless --no-tls)
+  --no-tls          Run in plaintext mode (development only)
+  --generate-cert   Auto-generate self-signed cert on startup
+```
+
+**Client:**
+```
+client [--verbose|-v] [--ca <path>] [--insecure] [--server-name <name>] <addr> [username] [room]
+
+  --ca <path>       Path to CA certificate for verification
+  --insecure        Skip certificate verification (self-signed dev certs)
+  --server-name     SNI hostname (defaults to addr hostname)
+```
+
+### Integration Points
+
+| Location | Current | With TLS |
+|----------|---------|----------|
+| Broker accept | `listener.accept()` → `Framed::new(stream, ...)` | `listener.accept()` → `acceptor.accept(stream)` → `Framed::new(tls_stream, ...)` |
+| Broker Peer struct | `Framed<TcpStream, LinesCodec>` | `Framed<TlsStream, LinesCodec>` |
+| Client connect | `TcpStream::connect()` → `stream.split()` | `TcpStream::connect()` → `connector.connect()` → `tokio::io::split(tls_stream)` |
+
+### Implementation Roadmap
+
+#### Step 1: Add Dependencies & CLI Parsing
+- [ ] Add TLS crates to both Cargo.toml files
+- [ ] Extend `parse_args()` in broker for `--cert`, `--key`, `--no-tls`, `--generate-cert`
+- [ ] Extend client CLI for `--ca`, `--insecure`, `--server-name`
+
+#### Step 2: Broker TLS Acceptor
+- [ ] Create `tls.rs` module with cert/key loading functions
+- [ ] Build `TlsAcceptor` from loaded config
+- [ ] Wrap accepted streams before passing to `process()`
+- [ ] Update `Peer` struct to use `TlsStream` type
+
+#### Step 3: Client TLS Connector
+- [ ] Create TLS config with root store (or dangerous verifier for `--insecure`)
+- [ ] Wrap `TcpStream` after connect, before split
+- [ ] Change `stream.split()` to `tokio::io::split(tls_stream)`
+
+#### Step 4: Self-Signed Certificate Generation
+- [ ] Use `rcgen` to generate cert + key on broker startup with `--generate-cert`
+- [ ] Print certificate fingerprint for client verification
+- [ ] Optionally save generated cert to disk for reuse
+
+#### Step 5: Testing & Documentation
+- [ ] Test with self-signed certs locally
+- [ ] Test `--insecure` client flag
+- [ ] Document cert generation workflow in README
+- [ ] Add example with Let's Encrypt for production
+
+### Certificate Distribution Options
+1. **Self-signed + `--insecure`** — development only
+2. **Self-signed + `--ca`** — distribute broker's cert to clients
+3. **Let's Encrypt** — production with proper domain
+4. **mTLS (future)** — client certificates for mutual authentication
+
+---
 ## Progress Tracking (Checklist)
 - [x] Remove UDP from client and CLI parsing
 - [x] Use `LinesCodec` on client TCP
