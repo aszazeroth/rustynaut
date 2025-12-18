@@ -6,6 +6,7 @@
 - Each crate is isolated; run commands from its directory (`cargo run`). Shared types live inside their respective binaries, not in a workspace crate.
 
 ## Build & Run
+- **Lint first**: `cd broker && cargo clippy` and `cd client && cargo clippy` before committing.
 - Start broker: `cd broker && cargo run --release -- 127.0.0.1:4242` (addr param optional, defaults to `127.0.0.1:4242`).
 - Start broker (verbose): `cd broker && cargo run --release -- --verbose 127.0.0.1:4242`.
 - Start client: `cd client && cargo run --release -- [--verbose|-v] 127.0.0.1:4242 [username] [room]`.

@@ -61,7 +61,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .cloned()
         .unwrap_or_else(|| "lobby".to_string());
 
-    // ------------------- [begin] codeiumAI suggestions
     let (tx, rx) = mpsc::channel::<String>(10);
     let rx = tokio_stream::wrappers::ReceiverStream::new(rx);
 
@@ -97,14 +96,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
             };
             if current_content != previous_content {
                 let encoded = general_purpose::STANDARD.encode(&current_content);
-                // Send the encoded content to the channel
-                //println!("encoded :: |{}|", encoded);
                 if tx
                     .send(format!("CLIP {room_for_clipboard} {encoded}"))
                     .await
                     .is_err()
                 {
-                    //the newline is IMPORTANT HERE!
                     eprintln!("Failed to send encoded content");
                     break;
                 }
@@ -112,7 +108,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
         }
     });
-    // ------------------- [end] codeiumAI suggestions
 
     let init = tokio_stream::iter([
         Ok::<String, LinesCodecError>(format!("USER {username}")),
@@ -151,12 +146,10 @@ fn get_current_clipboard() -> SystemClipboard {
 fn replace_clipboard_content(content: &str) -> Result<(), Box<dyn std::error::Error>> {
     let decoded = general_purpose::STANDARD.decode(content)?;
     let decoded_string = String::from_utf8(decoded)?;
-    //println!("decoded :: |{decoded_string}|");
-    let current_content = CLIPBOARD.get_string_contents().unwrap_or_default();
-    //println!("current_content :: |{current_content}| ");
+    let current_content = CLIPBOARD.get_string_contents()?;
     if current_content != decoded_string {
         CLIPBOARD.set_string_contents(decoded_string)?;
-    };
+    }
     Ok(())
 }
 

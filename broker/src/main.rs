@@ -1,33 +1,23 @@
-//! A chat server that broadcasts a message to all connections.
+//! Rustynaut Broker - A room-based chat and clipboard sync server.
 //!
-//! This example is explicitly more verbose than it has to be. This is to
-//! illustrate more concepts.
+//! Clients connect via TCP and communicate using a line-framed protocol.
+//! Each line is a command (USER, JOIN, CLIP, CMD, SAY) or response (INFO, ERR, CLIP).
 //!
-//! A chat server for telnet clients. After a telnet client connects, the first
-//! line should contain the client's name. After that, all lines sent by a
-//! client are broadcasted to all other connected clients.
+//! ## Usage
 //!
-//! Because the client is telnet, lines are delimited by "\r\n".
+//! Start the broker:
 //!
-//! You can test this out by running:
+//!     cargo run --release -- [--verbose] [addr]
 //!
-//!     cargo run --example chat
+//! Default address is 127.0.0.1:4242.
 //!
-//! And then in another terminal run:
-//!
-//!     telnet localhost 6142
-//!
-//! You can run the `telnet` command in any number of additional windows.
-//!
-//! You can run the second command in multiple windows and then chat between the
-//! two, seeing the messages from the other client as they're received. For all
-//! connected clients they'll all join the same room and see everyone else's
-//! messages.
+//! Connect clients using the rustynaut client or any line-based TCP client.
 
 #![warn(rust_2018_idioms)]
 
+use tokio::io::{self, AsyncBufReadExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{broadcast, mpsc, Mutex};
 use tokio_stream::StreamExt;
 use tokio_util::codec::{Framed, LinesCodec};
 
@@ -35,7 +25,6 @@ use futures::SinkExt;
 use std::collections::HashMap;
 use std::env;
 use std::error::Error;
-use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -85,30 +74,103 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // client connection.
     let state = Arc::new(Mutex::new(Shared::new()));
 
+    // Shutdown signal broadcast channel
+    let (shutdown_tx, _) = broadcast::channel::<()>(1);
+
     println!("broker started on : {}", &addr);
+    println!("Type /help for broker commands, /quit to shutdown");
 
     // Bind a TCP listener to the socket address.
     //
     // Note that this is the Tokio TcpListener, which is fully async.
     let listener = TcpListener::bind(&addr).await?;
 
-    tracing::info!("server running on {}", addr); //#######################################
+    tracing::info!("server running on {}", addr);
+
+    // Spawn stdin reader for broker commands
+    let stdin_state = Arc::clone(&state);
+    let stdin_shutdown = shutdown_tx.clone();
+    tokio::spawn(async move {
+        let stdin = BufReader::new(io::stdin());
+        let mut lines = stdin.lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let trimmed = line.trim();
+            match trimmed {
+                "/quit" | "/exit" | "/shutdown" => {
+                    println!("Shutting down broker...");
+                    {
+                        let state = stdin_state.lock().await;
+                        for peer in state.peers.values() {
+                            let _ = peer.tx.send("INFO broker shutting down".to_string());
+                        }
+                    }
+                    let _ = stdin_shutdown.send(());
+                    break;
+                }
+                "/status" => {
+                    let state = stdin_state.lock().await;
+                    let peer_count = state.peers.len();
+                    let mut rooms: Vec<_> = state.peers.values().map(|p| p.room.as_str()).collect();
+                    rooms.sort_unstable();
+                    rooms.dedup();
+                    println!("Connected clients: {}", peer_count);
+                    println!("Active rooms: {}", rooms.join(", "));
+                }
+                "/help" => {
+                    println!("Broker commands:");
+                    println!("  /status   - Show connected clients and rooms");
+                    println!("  /quit     - Gracefully shutdown the broker");
+                }
+                "" => {}
+                _ => {
+                    println!("Unknown command: {trimmed}. Type /help for commands.");
+                }
+            }
+        }
+    });
+
+    // Set up signal handler for Ctrl+C
+    let signal_state = Arc::clone(&state);
+    let signal_shutdown = shutdown_tx.clone();
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            println!("\nReceived Ctrl+C, shutting down...");
+            {
+                let state = signal_state.lock().await;
+                for peer in state.peers.values() {
+                    let _ = peer.tx.send("INFO broker shutting down".to_string());
+                }
+            }
+            let _ = signal_shutdown.send(());
+        }
+    });
+
+    let mut shutdown_rx = shutdown_tx.subscribe();
 
     loop {
-        // Asynchronously wait for an inbound TcpStream.
-        let (stream, addr) = listener.accept().await?;
+        tokio::select! {
+            result = listener.accept() => {
+                let (stream, addr) = result?;
 
-        // Clone a handle to the `Shared` state for the new connection.
-        let state = Arc::clone(&state);
+                // Clone a handle to the `Shared` state for the new connection.
+                let state = Arc::clone(&state);
 
-        // Spawn our handler to be run asynchronously.
-        tokio::spawn(async move {
-            tracing::debug!("accepted connection");
-            if let Err(e) = process(state, stream, addr).await {
-                tracing::info!("an error occurred; error = {:?}", e);
+                // Spawn our handler to be run asynchronously.
+                tokio::spawn(async move {
+                    tracing::debug!("accepted connection");
+                    if let Err(e) = process(state, stream, addr).await {
+                        tracing::info!("an error occurred; error = {:?}", e);
+                    }
+                });
             }
-        });
+            _ = shutdown_rx.recv() => {
+                println!("Broker shutdown complete.");
+                break;
+            }
+        }
     }
+
+    Ok(())
 }
 
 fn parse_args(args: impl IntoIterator<Item = String>) -> Result<(bool, String), Box<dyn Error>> {
@@ -248,6 +310,15 @@ fn parse_join(line: &str) -> Option<&str> {
         .filter(|s| !s.is_empty())
 }
 
+/// Validate a username or room name.
+/// Allowed: alphanumeric, underscore, hyphen. Max 32 chars.
+fn is_valid_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 32
+        && s.chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+}
+
 fn parse_clip(line: &str) -> Option<(&str, &str)> {
     let mut parts = line.splitn(4, ' ');
     match (parts.next()?, parts.next()?, parts.next()?) {
@@ -299,6 +370,12 @@ async fn process(
         lines.send("ERR missing username").await?;
         return Ok(());
     }
+    if !is_valid_name(&username) {
+        lines
+            .send("ERR invalid username (alphanumeric, _, - only, max 32 chars)")
+            .await?;
+        return Ok(());
+    }
 
     let mut room = "lobby".to_string();
 
@@ -318,28 +395,7 @@ async fn process(
         tokio::select! {
             // A message was received from a peer. Send it to the current user.
             Some(msg) = peer.rx.recv() => {
-                //println!("peer->current-user::message: {:#?}",&msg);
                 peer.lines.send(&msg).await?;
-                /*
-                //println!("peer->current-user::message: {:#?}",&msg);
-
-                if let Some(captures) = RE_MESSAGE.captures(&msg) {
-                    let username = captures.name("username").map_or("", |m| m.as_str());
-                    let message = captures.name("message").map_or("", |m| m.as_str());
-                    // Now you can use the username and message to filter out specific commands
-                    // For example, if the message is a specific command, you could handle it differently
-                    if message == "/help" {
-                        // Handle the command
-                        println!("{} command was called, by {}", message, username);
-                    } else {
-                        // Handle normal messages
-                        println!("command {} doesn't exist", message)
-                        //peer.lines.send(&msg).await?;
-                    }
-                } else {
-                    peer.lines.send(&msg).await?;
-                }
-                */
             }
             result = peer.lines.next() => match result {
                 // A message was received from the current user, we should
@@ -347,6 +403,10 @@ async fn process(
                 Some(Ok(msg)) => {
                     // JOIN <room>
                     if let Some(new_room) = parse_join(&msg) {
+                        if !is_valid_name(new_room) {
+                            peer.lines.send("ERR invalid room name (alphanumeric, _, - only, max 32 chars)").await?;
+                            continue;
+                        }
                         room = new_room.to_string();
 
                         let mut state = state.lock().await;
@@ -379,21 +439,21 @@ async fn process(
                                     .send(format!("INFO rooms: {}", rooms.join(", ")))
                                     .await?;
                             }
-                                    "/who" => {
-                                        let state = state.lock().await;
-                                        let mut users = state
-                                            .peers
-                                            .values()
-                                            .filter(|p| p.room == room)
-                                            .map(|p| p.username.as_str())
-                                            .collect::<Vec<_>>();
-                                        users.sort_unstable();
-                                        users.dedup();
+                            "/who" => {
+                                let state = state.lock().await;
+                                let mut users = state
+                                    .peers
+                                    .values()
+                                    .filter(|p| p.room == room)
+                                    .map(|p| p.username.as_str())
+                                    .collect::<Vec<_>>();
+                                users.sort_unstable();
+                                users.dedup();
 
-                                        peer.lines
-                                            .send(format!("INFO users in {room}: {}", users.join(", ")))
-                                            .await?;
-                                    }
+                                peer.lines
+                                    .send(format!("INFO users in {room}: {}", users.join(", ")))
+                                    .await?;
+                            }
                             _ => {
                                 peer.lines.send(format!("ERR unknown command: {cmd}")).await?;
                             }
@@ -403,14 +463,10 @@ async fn process(
 
                     // CLIP <room> <b64>
                     if let Some((_wire_room, b64)) = parse_clip(&msg) {
-                        let out = {
-                            let mut state = state.lock().await;
-                            state.next_clip_id += 1;
-                            let id = state.next_clip_id;
-                            format!("CLIP {room} {b64} {id}")
-                        };
-
                         let mut state = state.lock().await;
+                        state.next_clip_id += 1;
+                        let id = state.next_clip_id;
+                        let out = format!("CLIP {room} {b64} {id}");
                         state.broadcast_to_room(addr, &room, &out).await;
                         continue;
                     }
