@@ -39,13 +39,6 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use lazy_static::lazy_static;
-use regex::Regex;
-
-lazy_static! {
-    static ref RE_MESSAGE: Regex = Regex::new(r"(?<username>\w+)(:\S)(?<message>/\w+)").unwrap();
-}
-
 const BANNER: &str = r#"
 ██████  ██████   ██████  ██   ██ ███████ ██████  
 ██   ██ ██   ██ ██    ██ ██  ██  ██      ██   ██ 
@@ -60,9 +53,14 @@ https://github.com/aszazeroth/rustynaut
 async fn main() -> Result<(), Box<dyn Error>> {
     println!("{BANNER}");
 
+    // Args: broker [--verbose|-v] [addr]
+    // Flags can appear anywhere.
+    let (verbose, addr) = parse_args(env::args().skip(1))?;
+
     use tracing_subscriber::{fmt::format::FmtSpan, EnvFilter};
     // Configure a `tracing` subscriber that logs traces emitted by the chat
     // server.
+    let default_directive = if verbose { "chat=debug" } else { "chat=info" };
     tracing_subscriber::fmt()
         // Filter what traces are displayed based on the RUST_LOG environment
         // variable.
@@ -70,7 +68,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         // Traces emitted by the example code will always be displayed. You
         // can set `RUST_LOG=tokio=trace` to enable additional traces emitted by
         // Tokio itself.
-        .with_env_filter(EnvFilter::from_default_env().add_directive("chat=info".parse()?))
+        .with_env_filter(EnvFilter::from_default_env().add_directive(default_directive.parse()?))
         // Log events when `tracing` spans are created, entered, exited, or
         // closed. When Tokio's internal tracing support is enabled (as
         // described above), this can be used to track the lifecycle of spawned
@@ -87,11 +85,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // client connection.
     let state = Arc::new(Mutex::new(Shared::new()));
 
-    let addr = env::args()
-        .nth(1)
-        .unwrap_or_else(|| "127.0.0.1:4242".to_string());
-
-    println!("broker started on : {}",&addr); //
+    println!("broker started on : {}", &addr);
 
     // Bind a TCP listener to the socket address.
     //
@@ -117,6 +111,37 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 }
 
+fn parse_args(args: impl IntoIterator<Item = String>) -> Result<(bool, String), Box<dyn Error>> {
+    let mut verbose = false;
+    let mut addr: Option<String> = None;
+
+    for arg in args {
+        match arg.as_str() {
+            "--verbose" | "-v" => verbose = true,
+            "--help" | "-h" => {
+                eprintln!("usage: broker [--verbose|-v] [addr]");
+                eprintln!("  addr default: 127.0.0.1:4242");
+                std::process::exit(0);
+            }
+            _ if arg.starts_with('-') => {
+                return Err(format!("unknown flag: {arg}").into());
+            }
+            _ => {
+                if addr.is_none() {
+                    addr = Some(arg);
+                } else {
+                    return Err(format!("unexpected extra arg: {arg}").into());
+                }
+            }
+        }
+    }
+
+    Ok((
+        verbose,
+        addr.unwrap_or_else(|| "127.0.0.1:4242".to_string()),
+    ))
+}
+
 /// Shorthand for the transmit half of the message channel.
 type Tx = mpsc::UnboundedSender<String>;
 
@@ -130,7 +155,15 @@ type Rx = mpsc::UnboundedReceiver<String>;
 /// iterating over the `peers` entries and sending a copy of the message on each
 /// `Tx`.
 struct Shared {
-    peers: HashMap<SocketAddr, Tx>,
+    peers: HashMap<SocketAddr, PeerInfo>,
+    next_clip_id: u64,
+}
+
+#[derive(Clone)]
+struct PeerInfo {
+    tx: Tx,
+    username: String,
+    room: String,
 }
 
 /// The state for each connected client.
@@ -154,15 +187,25 @@ impl Shared {
     fn new() -> Self {
         Shared {
             peers: HashMap::new(),
+            next_clip_id: 0,
         }
     }
 
     /// Send a `LineCodec` encoded message to every peer, except
     /// for the sender.
     async fn broadcast(&mut self, sender: SocketAddr, message: &str) {
-        for peer in self.peers.iter_mut() {
-            if *peer.0 != sender {
-                let _ = peer.1.send(message.into());
+        for (peer_addr, peer) in self.peers.iter_mut() {
+            if *peer_addr != sender {
+                let _ = peer.tx.send(message.into());
+            }
+        }
+    }
+
+    /// Send a message to peers in a specific room, except for the sender.
+    async fn broadcast_to_room(&mut self, sender: SocketAddr, room: &str, message: &str) {
+        for (peer_addr, peer) in self.peers.iter_mut() {
+            if *peer_addr != sender && peer.room == room {
+                let _ = peer.tx.send(message.into());
             }
         }
     }
@@ -173,6 +216,8 @@ impl Peer {
     async fn new(
         state: Arc<Mutex<Shared>>,
         lines: Framed<TcpStream, LinesCodec>,
+        username: String,
+        room: String,
     ) -> io::Result<Peer> {
         // Get the client socket address
         let addr = lines.get_ref().peer_addr()?;
@@ -181,10 +226,46 @@ impl Peer {
         let (tx, rx) = mpsc::unbounded_channel();
 
         // Add an entry for this `Peer` in the shared state map.
-        state.lock().await.peers.insert(addr, tx);
+        state
+            .lock()
+            .await
+            .peers
+            .insert(addr, PeerInfo { tx, username, room });
 
         Ok(Peer { lines, rx })
     }
+}
+
+fn parse_user(line: &str) -> Option<&str> {
+    line.strip_prefix("USER ")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+fn parse_join(line: &str) -> Option<&str> {
+    line.strip_prefix("JOIN ")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+fn parse_clip(line: &str) -> Option<(&str, &str)> {
+    let mut parts = line.splitn(4, ' ');
+    match (parts.next()?, parts.next()?, parts.next()?) {
+        ("CLIP", room, b64) => Some((room, b64)),
+        _ => None,
+    }
+}
+
+fn parse_cmd(line: &str) -> Option<&str> {
+    line.strip_prefix("CMD ")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+fn parse_say(line: &str) -> Option<&str> {
+    line.strip_prefix("SAY ")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
 }
 
 /// Process an individual chat client
@@ -195,26 +276,39 @@ async fn process(
 ) -> Result<(), Box<dyn Error>> {
     let mut lines = Framed::new(stream, LinesCodec::new());
 
-    // Send a prompt to the client to enter their username.
-    lines.send("Please enter your username:").await?;
+    // Protocol note:
+    // - New clients should send: `USER <name>` then optionally `JOIN <room>`.
+    // - For legacy clients we still accept the first line as the username.
+    lines
+        .send("INFO rustynaut broker: send 'USER <name>' then 'JOIN <room>' (defaults to lobby)")
+        .await?;
 
-    // Read the first line from the `LineCodec` stream to get the username.
-    let username = match lines.next().await {
+    let first = match lines.next().await {
         Some(Ok(line)) => line,
-        // We didn't get a line so we return early here.
         _ => {
-            tracing::error!("Failed to get username from {}. Client disconnected.", addr);
+            tracing::error!(
+                "Failed to get first line from {}. Client disconnected.",
+                addr
+            );
             return Ok(());
         }
     };
 
+    let username = parse_user(&first).unwrap_or(first.trim()).to_string();
+    if username.is_empty() {
+        lines.send("ERR missing username").await?;
+        return Ok(());
+    }
+
+    let mut room = "lobby".to_string();
+
     // Register our peer with state which internally sets up some channels.
-    let mut peer = Peer::new(state.clone(), lines).await?;
+    let mut peer = Peer::new(state.clone(), lines, username.clone(), room.clone()).await?;
 
     // A client has connected, let's let everyone know.
     {
         let mut state = state.lock().await;
-        let msg = format!("{} has joined the chat", username);
+        let msg = format!("INFO {username} joined");
         tracing::info!("{}", msg);
         state.broadcast(addr, &msg).await;
     }
@@ -222,52 +316,128 @@ async fn process(
     // Process incoming messages until our stream is exhausted by a disconnect.
     loop {
         tokio::select! {
-                    // A message was received from a peer. Send it to the current user.
-                    Some(msg) = peer.rx.recv() => {
-                        //println!("peer->current-user::message: {:#?}",&msg);
-                        peer.lines.send(&msg).await?;
-                        /*
-                        //println!("peer->current-user::message: {:#?}",&msg);
+            // A message was received from a peer. Send it to the current user.
+            Some(msg) = peer.rx.recv() => {
+                //println!("peer->current-user::message: {:#?}",&msg);
+                peer.lines.send(&msg).await?;
+                /*
+                //println!("peer->current-user::message: {:#?}",&msg);
 
-                        if let Some(captures) = RE_MESSAGE.captures(&msg) {
-                            let username = captures.name("username").map_or("", |m| m.as_str());
-                            let message = captures.name("message").map_or("", |m| m.as_str());
-                            // Now you can use the username and message to filter out specific commands
-                            // For example, if the message is a specific command, you could handle it differently
-                            if message == "/help" {
-                                // Handle the command
-                                println!("{} command was called, by {}", message, username);
-                            } else {
-                                // Handle normal messages
-                                println!("command {} doesn't exist", message)
-                                //peer.lines.send(&msg).await?;
-                            }
-                        } else {
-                            peer.lines.send(&msg).await?;
-                        }
-                        */
+                if let Some(captures) = RE_MESSAGE.captures(&msg) {
+                    let username = captures.name("username").map_or("", |m| m.as_str());
+                    let message = captures.name("message").map_or("", |m| m.as_str());
+                    // Now you can use the username and message to filter out specific commands
+                    // For example, if the message is a specific command, you could handle it differently
+                    if message == "/help" {
+                        // Handle the command
+                        println!("{} command was called, by {}", message, username);
+                    } else {
+                        // Handle normal messages
+                        println!("command {} doesn't exist", message)
+                        //peer.lines.send(&msg).await?;
                     }
-                    result = peer.lines.next() => match result {
-                        // A message was received from the current user, we should
-                        // broadcast this message to the other users.
-                        Some(Ok(msg)) => {
-                            let mut state = state.lock().await;
-                            let msg = format!("{}: {}", username, msg);
-                            //println!("current-user->peers::message: {:#?}",&msg);
-                            state.broadcast(addr, &msg).await;
-                        }
-                        // An error occurred.
-                        Some(Err(e)) => {
-                            tracing::error!(
-                                "an error occurred while processing messages for {}; error = {:?}",
-                                username,
-                                e
-                            );
-                        }
-                        // The stream has been exhausted.
-                        None => break,
-                    },
+                } else {
+                    peer.lines.send(&msg).await?;
                 }
+                */
+            }
+            result = peer.lines.next() => match result {
+                // A message was received from the current user, we should
+                // broadcast this message to the other users.
+                Some(Ok(msg)) => {
+                    // JOIN <room>
+                    if let Some(new_room) = parse_join(&msg) {
+                        room = new_room.to_string();
+
+                        let mut state = state.lock().await;
+                        if let Some(peer_info) = state.peers.get_mut(&addr) {
+                            peer_info.room = room.clone();
+                        }
+
+                        peer.lines.send(format!("INFO joined {room}")).await?;
+                        continue;
+                    }
+
+                    // CMD /...
+                    if let Some(cmd) = parse_cmd(&msg) {
+                        match cmd {
+                            "/help" => {
+                                        peer.lines
+                                            .send("INFO commands: /help /rooms /who".to_string())
+                                            .await?;
+                            }
+                            "/rooms" => {
+                                let state = state.lock().await;
+                                let mut rooms = state
+                                    .peers
+                                    .values()
+                                    .map(|p| p.room.as_str())
+                                    .collect::<Vec<_>>();
+                                rooms.sort_unstable();
+                                rooms.dedup();
+                                peer.lines
+                                    .send(format!("INFO rooms: {}", rooms.join(", ")))
+                                    .await?;
+                            }
+                                    "/who" => {
+                                        let state = state.lock().await;
+                                        let mut users = state
+                                            .peers
+                                            .values()
+                                            .filter(|p| p.room == room)
+                                            .map(|p| p.username.as_str())
+                                            .collect::<Vec<_>>();
+                                        users.sort_unstable();
+                                        users.dedup();
+
+                                        peer.lines
+                                            .send(format!("INFO users in {room}: {}", users.join(", ")))
+                                            .await?;
+                                    }
+                            _ => {
+                                peer.lines.send(format!("ERR unknown command: {cmd}")).await?;
+                            }
+                        }
+                        continue;
+                    }
+
+                    // CLIP <room> <b64>
+                    if let Some((_wire_room, b64)) = parse_clip(&msg) {
+                        let out = {
+                            let mut state = state.lock().await;
+                            state.next_clip_id += 1;
+                            let id = state.next_clip_id;
+                            format!("CLIP {room} {b64} {id}")
+                        };
+
+                        let mut state = state.lock().await;
+                        state.broadcast_to_room(addr, &room, &out).await;
+                        continue;
+                    }
+
+                    // SAY <text>
+                    let out = if let Some(text) = parse_say(&msg) {
+                        format!("SAY {username} {text}")
+                    } else {
+                        // Legacy: treat the whole line as a chat message.
+                        format!("SAY {username} {msg}")
+                    };
+
+                    let mut state = state.lock().await;
+                    state.broadcast_to_room(addr, &room, &out).await;
+                }
+                // An error occurred.
+                Some(Err(e)) => {
+                    tracing::error!(
+                        "an error occurred while processing messages for {}; error = {:?}",
+                        username,
+                        e
+                    );
+                }
+                // The stream has been exhausted.
+                None => break,
+            },
+        }
     }
 
     // If this section is reached it means that the client was disconnected!
@@ -276,7 +446,7 @@ async fn process(
         let mut state = state.lock().await;
         state.peers.remove(&addr);
 
-        let msg = format!("{} has left the chat", username);
+        let msg = format!("INFO {username} left");
         tracing::info!("{}", msg);
         state.broadcast(addr, &msg).await;
     }

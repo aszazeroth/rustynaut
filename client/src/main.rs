@@ -1,27 +1,15 @@
-//! An example of hooking up stdin/stdout to either a TCP or UDP stream.
+//! Clipboard sync client for the Rustynaut broker.
 //!
-//! This example will connect to a socket address specified in the argument list
-//! and then forward all data read on stdin to the server, printing out all data
-//! received on stdout. An optional `--udp` argument can be passed to specify
-//! that the connection should be made over UDP instead of TCP, translating each
-//! line entered on stdin to a UDP packet to be sent to the remote address.
-//!
-//! Note that this is not currently optimized for performance, especially
-//! around buffer management. Rather it's intended to show an example of
-//! working with a client.
-//!
-//! This example can be quite useful when interacting with the other examples in
-//! this repository! Many of them recommend running this as a simple "hook up
-//! stdin/stdout to a server" to get up and running.
+//! Transport is TCP only and line-framed (`LinesCodec`). Clipboard updates are
+//! sent as base64 to keep payloads binary-safe.
 
 #![warn(rust_2018_idioms)]
 
-//use futures::StreamExt;
 use tokio::io;
 use tokio::sync::mpsc;
 use tokio::time::{self, Duration};
 use tokio_stream::StreamExt;
-use tokio_util::codec::{BytesCodec, FramedRead, FramedWrite};
+use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec, LinesCodecError};
 
 use std::env;
 use std::error::Error;
@@ -29,16 +17,11 @@ use std::net::SocketAddr;
 use std::process::exit;
 
 use base64::{engine::general_purpose, Engine as _};
-use bytes::Bytes;
 use crossclip::{Clipboard, SystemClipboard};
 
 use lazy_static::lazy_static;
-use regex::Regex;
 
 lazy_static! {
-    static ref RE_SYSTEM_MESSAGE: Regex =
-        Regex::new(r"(?<username>[\w\s\-_\.]+)(:\s)(?<system><\w+>)\s\|(?<clipboard>[\w+=]+)\|")
-            .unwrap();
     static ref CLIPBOARD: SystemClipboard = get_current_clipboard();
 }
 
@@ -55,43 +38,69 @@ https://github.com/aszazeroth/rustynaut
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     println!("{BANNER}");
-    // Determine if we're going to run in TCP or UDP mode
-    let mut args = env::args().skip(1).collect::<Vec<_>>();
-    let tcp = match args.iter().position(|a| a == "--udp") {
-        Some(i) => {
-            args.remove(i);
-            false
-        }
-        None => true,
-    };
 
-    // Parse what address we're going to connect to
-    let addr = args
+    // Args: client [--verbose|-v] <addr> [username] [room]
+    // Flags can appear anywhere.
+    let mut verbose = false;
+    let mut positional = Vec::new();
+    for arg in env::args().skip(1) {
+        match arg.as_str() {
+            "--verbose" | "-v" => verbose = true,
+            _ => positional.push(arg),
+        }
+    }
+
+    let addr = positional
         .first()
-        .ok_or("this program requires at least one argument")?;
-    let addr = addr.parse::<SocketAddr>()?;
+        .ok_or("usage: client [--verbose|-v] <addr> [username] [room]")?
+        .parse::<SocketAddr>()?;
+
+    let username = positional.get(1).cloned().unwrap_or_else(default_username);
+    let room = positional
+        .get(2)
+        .cloned()
+        .unwrap_or_else(|| "lobby".to_string());
 
     // ------------------- [begin] codeiumAI suggestions
-    let (tx, rx) = mpsc::channel::<Bytes>(10);
+    let (tx, rx) = mpsc::channel::<String>(10);
     let rx = tokio_stream::wrappers::ReceiverStream::new(rx);
 
-    let _ = CLIPBOARD.set_string_contents("".to_string()); //UGLY shit
-
     // Spawn a task to monitor clipboard changes
+    let room_for_clipboard = room.clone();
+    let verbose_for_clipboard = verbose;
     tokio::spawn(async move {
-        let mut previous_content = CLIPBOARD.get_string_contents().unwrap_or_default();
-        let mut interval = time::interval(Duration::from_secs(5));
+        let mut previous_content = match CLIPBOARD.get_string_contents() {
+            Ok(s) => s,
+            Err(err) => {
+                eprintln!(
+                    "clipboard unavailable ({err}); clipboard publishing disabled for this client"
+                );
+                return;
+            }
+        };
+        let mut interval = time::interval(Duration::from_secs(2));
+        let mut warned = false;
         loop {
             interval.tick().await;
-            let current_content = CLIPBOARD
-                .get_string_contents()
-                .expect("error getting the contents of the clipboard");
+            let current_content = match CLIPBOARD.get_string_contents() {
+                Ok(s) => {
+                    warned = false;
+                    s
+                }
+                Err(err) => {
+                    if verbose_for_clipboard && !warned {
+                        eprintln!("clipboard read failed ({err}); will retry (publishing paused)");
+                        warned = true;
+                    }
+                    continue;
+                }
+            };
             if current_content != previous_content {
                 let encoded = general_purpose::STANDARD.encode(&current_content);
                 // Send the encoded content to the channel
                 //println!("encoded :: |{}|", encoded);
                 if tx
-                    .send(Bytes::from(format!("<clipboard> |{}|\n", encoded)))
+                    .send(format!("CLIP {room_for_clipboard} {encoded}"))
                     .await
                     .is_err()
                 {
@@ -105,17 +114,28 @@ async fn main() -> Result<(), Box<dyn Error>> {
     });
     // ------------------- [end] codeiumAI suggestions
 
-    let stdin = FramedRead::new(io::stdin(), BytesCodec::new())
-        .map(|i| i.map(|bytes| bytes.freeze()))
-        .merge(rx.map(Result::<Bytes, io::Error>::Ok));
+    let init = tokio_stream::iter([
+        Ok::<String, LinesCodecError>(format!("USER {username}")),
+        Ok::<String, LinesCodecError>(format!("JOIN {room}")),
+    ]);
 
-    let stdout = FramedWrite::new(io::stdout(), BytesCodec::new());
+    let stdin = FramedRead::new(io::stdin(), LinesCodec::new()).map(|i| {
+        i.map(|line| {
+            if line.starts_with('/') {
+                format!("CMD {line}")
+            } else {
+                format!("SAY {line}")
+            }
+        })
+    });
 
-    if tcp {
-        tcp::connect(&addr, stdin, stdout).await?;
-    } else {
-        udp::connect(&addr, stdin, stdout).await?;
-    }
+    let stdin = init
+        .merge(stdin)
+        .merge(rx.map(Result::<String, LinesCodecError>::Ok));
+
+    let stdout = FramedWrite::new(io::stdout(), LinesCodec::new());
+
+    tcp::connect(&addr, stdin, stdout, verbose).await?;
 
     Ok(())
 }
@@ -132,9 +152,7 @@ fn replace_clipboard_content(content: &str) -> Result<(), Box<dyn std::error::Er
     let decoded = general_purpose::STANDARD.decode(content)?;
     let decoded_string = String::from_utf8(decoded)?;
     //println!("decoded :: |{decoded_string}|");
-    let current_content = CLIPBOARD
-        .get_string_contents()
-        .expect("error getting the contents of the clipboard");
+    let current_content = CLIPBOARD.get_string_contents().unwrap_or_default();
     //println!("current_content :: |{current_content}| ");
     if current_content != decoded_string {
         CLIPBOARD.set_string_contents(decoded_string)?;
@@ -142,126 +160,64 @@ fn replace_clipboard_content(content: &str) -> Result<(), Box<dyn std::error::Er
     Ok(())
 }
 
+fn default_username() -> String {
+    env::var("USER")
+        .or_else(|_| env::var("USERNAME"))
+        .unwrap_or_else(|_| "anon".to_string())
+}
+
+fn parse_clip_fields(line: &str) -> Option<(&str, &str, Option<&str>)> {
+    let mut parts = line.splitn(4, ' ');
+    match (parts.next()?, parts.next()?, parts.next()?) {
+        ("CLIP", room, b64) => Some((room, b64, parts.next())),
+        _ => None,
+    }
+}
+
 mod tcp {
-    use bytes::Bytes;
     use futures::{future, Sink, SinkExt, Stream, StreamExt};
-    use std::{error::Error, io, net::SocketAddr};
+    use std::{error::Error, net::SocketAddr};
     use tokio::net::TcpStream;
-    use tokio_util::codec::{BytesCodec, FramedRead, FramedWrite};
+    use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec, LinesCodecError};
 
     pub async fn connect(
         addr: &SocketAddr,
-        mut stdin: impl Stream<Item = Result<Bytes, io::Error>> + Unpin,
-        mut stdout: impl Sink<Bytes, Error = io::Error> + Unpin,
+        mut stdin: impl Stream<Item = Result<String, LinesCodecError>> + Unpin,
+        mut stdout: impl Sink<String, Error = LinesCodecError> + Unpin,
+        verbose: bool,
     ) -> Result<(), Box<dyn Error>> {
         let mut stream = TcpStream::connect(addr).await?;
         let (r, w) = stream.split();
-        let mut sink = FramedWrite::new(w, BytesCodec::new());
-        // filter map Result<BytesMut, Error> stream into just a Bytes stream to match stdout Sink
-        // on the event of an Error, log the error and end the stream
-        let mut stream = FramedRead::new(r, BytesCodec::new())
-            .filter_map(|i| match i {
-                //BytesMut into Bytes
-                Ok(i) => {
-                    // HERE IS WHERE WE CAN CHECK INCOMMING MESSAGES!!!
-                    //println!("incomming message :: {:?}", std::str::from_utf8(&i.as_ref()));
-
-                    if let Ok(message) = std::str::from_utf8(&i.as_ref()) {
-                        if let Some(captures) = crate::RE_SYSTEM_MESSAGE.captures(message) {
-                            //println!("message :: {}",&message);
-                            //let username = captures.name("username").map_or("", |m| m.as_str());
-                            let system = captures.name("system").map_or("", |m| m.as_str());
-                            let clipboard = captures.name("clipboard").map_or("", |m| m.as_str());
-                            // Filter stuff here
-                            if system == "<clipboard>" {
-                                //println!("replace |{clipboard}|");
-                                match crate::replace_clipboard_content(clipboard) {
-                                    Ok(_) => (),
-                                    Err(err) => {
-                                        eprintln!(
-                                            "could not replace the clipboard content, {}",
-                                            err
-                                        )
-                                    }
-                                }
-                            } else {
-                                // Handle normal messages
-                                println!("command {} doesn't exist", message)
-                                //peer.lines.send(&msg).await?;
-                            }
-                        }
-                    } else {
-                        eprintln!("message was not UTF8")
+        let mut sink = FramedWrite::new(w, LinesCodec::new());
+        let mut stream = FramedRead::new(r, LinesCodec::new()).filter_map(|i| match i {
+            Ok(message) => {
+                // Apply clipboard updates silently (avoid printing base64 payloads).
+                if let Some((room, clipboard_b64, id)) = crate::parse_clip_fields(&message) {
+                    if let Err(err) = crate::replace_clipboard_content(clipboard_b64) {
+                        eprintln!("could not replace the clipboard content, {}", err)
                     }
 
-                    future::ready(Some(i.freeze()))
+                    if verbose {
+                        let id_str = id.unwrap_or("?");
+                        eprintln!(
+                            "clip applied: room={room} id={id_str} (b64_len={})",
+                            clipboard_b64.len()
+                        );
+                    }
+                    return future::ready(None);
                 }
-                Err(e) => {
-                    eprintln!("failed to read from socket; error={}", e);
-                    future::ready(None)
-                }
-            })
-            .map(Ok);
+
+                future::ready(Some(Ok(message)))
+            }
+            Err(e) => {
+                eprintln!("failed to read from socket; error={}", e);
+                future::ready(None)
+            }
+        });
 
         match future::join(sink.send_all(&mut stdin), stdout.send_all(&mut stream)).await {
             (Err(e), _) | (_, Err(e)) => Err(e.into()),
             _ => Ok(()),
-        }
-    }
-}
-
-mod udp {
-    use bytes::Bytes;
-    use futures::{Sink, SinkExt, Stream, StreamExt};
-    use std::error::Error;
-    use std::io;
-    use std::net::SocketAddr;
-    use tokio::net::UdpSocket;
-
-    pub async fn connect(
-        addr: &SocketAddr,
-        stdin: impl Stream<Item = Result<Bytes, io::Error>> + Unpin,
-        stdout: impl Sink<Bytes, Error = io::Error> + Unpin,
-    ) -> Result<(), Box<dyn Error>> {
-        // We'll bind our UDP socket to a local IP/port, but for now we
-        // basically let the OS pick both of those.
-        let bind_addr = if addr.ip().is_ipv4() {
-            "0.0.0.0:0"
-        } else {
-            "[::]:0"
-        };
-
-        let socket = UdpSocket::bind(&bind_addr).await?;
-        socket.connect(addr).await?;
-
-        tokio::try_join!(send(stdin, &socket), recv(stdout, &socket))?;
-
-        Ok(())
-    }
-
-    async fn send(
-        mut stdin: impl Stream<Item = Result<Bytes, io::Error>> + Unpin,
-        writer: &UdpSocket,
-    ) -> Result<(), io::Error> {
-        while let Some(item) = stdin.next().await {
-            let buf = item?;
-            writer.send(&buf[..]).await?;
-        }
-
-        Ok(())
-    }
-
-    async fn recv(
-        mut stdout: impl Sink<Bytes, Error = io::Error> + Unpin,
-        reader: &UdpSocket,
-    ) -> Result<(), io::Error> {
-        loop {
-            let mut buf = vec![0; 1024];
-            let n = reader.recv(&mut buf[..]).await?;
-
-            if n > 0 {
-                stdout.send(Bytes::from(buf)).await?;
-            }
         }
     }
 }
