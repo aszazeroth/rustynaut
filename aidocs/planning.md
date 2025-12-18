@@ -63,7 +63,102 @@ Notes:
 - Keep a stable “client id” concept server-side so auth tokens can bind to identities later.
 - Keep protocol as line-based so it can run over TLS without changes.
 - Plan for an `AUTH <token>` message in the future (no enforcement in MVP).
+---
 
+## Large Clipboard / File Transfer (Sideband Channel)
+
+### Problem Statement
+- Current `CLIP` protocol uses base64 over line-framed TCP (~8KB default limit)
+- Real-world use cases: screenshots (PNG, 100KB–5MB), config files, logs
+- Base64 adds 33% overhead; large payloads block the message stream
+
+### Chosen Approach: Broker-Mediated Sideband Transfer
+
+The broker acts as a relay for file transfers (no P2P), avoiding NAT/firewall issues since clients already have a connection to the broker.
+
+### Wire Protocol Extension
+
+**Phase 1: Offer & Accept**
+```
+Client → Broker:  FILE_OFFER <room> <filename> <size_bytes> <sha256>
+Broker → Room:    FILE_AVAIL <from_user> <transfer_id> <filename> <size_bytes> <sha256>
+Client → Broker:  FILE_ACCEPT <transfer_id>
+Broker → Sender:  FILE_START <transfer_id> <port>
+```
+
+**Phase 2: Binary Transfer (separate TCP connection)**
+- Sender connects to `broker:<port>` and streams raw bytes
+- Broker relays to all acceptors in real-time (or buffers if acceptor is slow)
+- Broker closes connection when `size_bytes` received
+
+**Phase 3: Completion**
+```
+Broker → Acceptor: FILE_DONE <transfer_id> <sha256_verified: true|false>
+Broker → Sender:   FILE_SENT <transfer_id> <acceptor_count>
+```
+
+### Implementation Roadmap
+
+#### Step 1: Protocol Messages (No Transfer Yet)
+- [ ] Add `FILE_OFFER` / `FILE_AVAIL` / `FILE_ACCEPT` parsing to broker
+- [ ] Add `FILE_CANCEL <transfer_id>` for cleanup
+- [ ] Track pending transfers in broker state: `HashMap<TransferId, FileTransfer>`
+- [ ] Broadcast `FILE_AVAIL` to room (excluding sender)
+
+#### Step 2: Sideband Listener on Broker
+- [ ] On `FILE_ACCEPT`, broker opens ephemeral TCP port (or reuses a pool)
+- [ ] Send `FILE_START <transfer_id> <port>` to sender
+- [ ] Sender connects and streams; broker validates size + computes SHA256
+
+#### Step 3: Relay to Acceptors
+- [ ] Broker pushes bytes to each acceptor's sideband connection
+- [ ] Handle backpressure (slow acceptor shouldn't block others)
+- [ ] On completion, send `FILE_DONE` with checksum verification result
+
+#### Step 4: Client Integration
+- [ ] Detect large clipboard (>64KB threshold) → trigger `FILE_OFFER` instead of `CLIP`
+- [ ] Auto-accept files from same room (configurable)
+- [ ] Save received files to temp dir, optionally copy to clipboard as file reference
+- [ ] Show progress bar in verbose mode
+
+#### Step 5: Robustness
+- [ ] Transfer timeout (configurable, default 60s)
+- [ ] Resume support (future): `FILE_RESUME <transfer_id> <offset>`
+- [ ] Rate limiting per client
+- [ ] Max concurrent transfers per room
+
+### Size Thresholds (Configurable)
+| Content Size | Strategy |
+|--------------|----------|
+| < 64 KB      | `CLIP` (base64, inline) |
+| 64 KB – 50 MB| `FILE_OFFER` (sideband) |
+| > 50 MB      | Reject with `ERR file too large` |
+
+### State Structures (Broker)
+
+```rust
+struct FileTransfer {
+    id: TransferId,
+    sender: SocketAddr,
+    room: String,
+    filename: String,
+    size: u64,
+    sha256_expected: String,
+    acceptors: HashSet<SocketAddr>,
+    state: TransferState, // Offered | Accepted | Transferring | Done | Failed
+    created_at: Instant,
+}
+```
+
+### Design Decisions
+- **Broker-mediated** (not P2P) — simpler, works through NAT
+- **Streaming only** — no broker storage, just relay (no persistence)
+- **SHA256 verification** — integrity check built-in
+- **Threshold-based** — small clipboards stay fast, large ones use sideband
+- **Auto for clipboard** — large clipboard auto-triggers file transfer
+- **Explicit for files** — `/send <path>` for arbitrary files
+
+---
 ## Progress Tracking (Checklist)
 - [x] Remove UDP from client and CLI parsing
 - [x] Use `LinesCodec` on client TCP

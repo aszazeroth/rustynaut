@@ -509,3 +509,207 @@ async fn process(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ==================== parse_user tests ====================
+
+    #[test]
+    fn test_parse_user_valid() {
+        assert_eq!(parse_user("USER alice"), Some("alice"));
+        assert_eq!(parse_user("USER bob_123"), Some("bob_123"));
+    }
+
+    #[test]
+    fn test_parse_user_with_whitespace() {
+        assert_eq!(parse_user("USER   alice  "), Some("alice"));
+    }
+
+    #[test]
+    fn test_parse_user_empty() {
+        assert_eq!(parse_user("USER "), None);
+        assert_eq!(parse_user("USER"), None);
+    }
+
+    #[test]
+    fn test_parse_user_wrong_prefix() {
+        assert_eq!(parse_user("JOIN alice"), None);
+        assert_eq!(parse_user("alice"), None);
+    }
+
+    // ==================== parse_join tests ====================
+
+    #[test]
+    fn test_parse_join_valid() {
+        assert_eq!(parse_join("JOIN lobby"), Some("lobby"));
+        assert_eq!(parse_join("JOIN room-1"), Some("room-1"));
+    }
+
+    #[test]
+    fn test_parse_join_with_whitespace() {
+        assert_eq!(parse_join("JOIN   lobby  "), Some("lobby"));
+    }
+
+    #[test]
+    fn test_parse_join_empty() {
+        assert_eq!(parse_join("JOIN "), None);
+        assert_eq!(parse_join("JOIN"), None);
+    }
+
+    #[test]
+    fn test_parse_join_wrong_prefix() {
+        assert_eq!(parse_join("USER lobby"), None);
+    }
+
+    // ==================== is_valid_name tests ====================
+
+    #[test]
+    fn test_is_valid_name_valid() {
+        assert!(is_valid_name("alice"));
+        assert!(is_valid_name("Bob_123"));
+        assert!(is_valid_name("room-1"));
+        assert!(is_valid_name("a"));
+        assert!(is_valid_name("12345678901234567890123456789012")); // 32 chars
+    }
+
+    #[test]
+    fn test_is_valid_name_invalid() {
+        assert!(!is_valid_name("")); // empty
+        assert!(!is_valid_name("alice bob")); // space
+        assert!(!is_valid_name("alice@host")); // special char
+        assert!(!is_valid_name("room/lobby")); // slash
+        assert!(!is_valid_name("123456789012345678901234567890123")); // 33 chars
+    }
+
+    // ==================== parse_clip tests ====================
+
+    #[test]
+    fn test_parse_clip_valid() {
+        assert_eq!(
+            parse_clip("CLIP lobby SGVsbG8="),
+            Some(("lobby", "SGVsbG8="))
+        );
+        assert_eq!(
+            parse_clip("CLIP room-1 dGVzdA=="),
+            Some(("room-1", "dGVzdA=="))
+        );
+    }
+
+    #[test]
+    fn test_parse_clip_with_extra_spaces_in_payload() {
+        // The b64 part might have trailing content (like id) - we only take first 3 parts
+        let result = parse_clip("CLIP lobby SGVsbG8= extra");
+        assert_eq!(result, Some(("lobby", "SGVsbG8=")));
+    }
+
+    #[test]
+    fn test_parse_clip_missing_parts() {
+        assert_eq!(parse_clip("CLIP lobby"), None);
+        assert_eq!(parse_clip("CLIP"), None);
+    }
+
+    #[test]
+    fn test_parse_clip_wrong_prefix() {
+        assert_eq!(parse_clip("JOIN lobby SGVsbG8="), None);
+    }
+
+    // ==================== parse_cmd tests ====================
+
+    #[test]
+    fn test_parse_cmd_valid() {
+        assert_eq!(parse_cmd("CMD /help"), Some("/help"));
+        assert_eq!(parse_cmd("CMD /rooms"), Some("/rooms"));
+        assert_eq!(parse_cmd("CMD /who"), Some("/who"));
+    }
+
+    #[test]
+    fn test_parse_cmd_with_args() {
+        assert_eq!(parse_cmd("CMD /join lobby"), Some("/join lobby"));
+    }
+
+    #[test]
+    fn test_parse_cmd_empty() {
+        assert_eq!(parse_cmd("CMD "), None);
+        assert_eq!(parse_cmd("CMD"), None);
+    }
+
+    #[test]
+    fn test_parse_cmd_wrong_prefix() {
+        assert_eq!(parse_cmd("/help"), None);
+    }
+
+    // ==================== parse_say tests ====================
+
+    #[test]
+    fn test_parse_say_valid() {
+        assert_eq!(parse_say("SAY hello world"), Some("hello world"));
+        assert_eq!(parse_say("SAY hi"), Some("hi"));
+    }
+
+    #[test]
+    fn test_parse_say_empty() {
+        assert_eq!(parse_say("SAY "), None);
+        assert_eq!(parse_say("SAY"), None);
+    }
+
+    #[test]
+    fn test_parse_say_wrong_prefix() {
+        assert_eq!(parse_say("CMD hello"), None);
+    }
+
+    // ==================== parse_args tests ====================
+
+    #[test]
+    fn test_parse_args_defaults() {
+        let args: Vec<String> = vec![];
+        let (verbose, addr) = parse_args(args).unwrap();
+        assert!(!verbose);
+        assert_eq!(addr, "127.0.0.1:4242");
+    }
+
+    #[test]
+    fn test_parse_args_with_address() {
+        let args = vec!["0.0.0.0:8080".to_string()];
+        let (verbose, addr) = parse_args(args).unwrap();
+        assert!(!verbose);
+        assert_eq!(addr, "0.0.0.0:8080");
+    }
+
+    #[test]
+    fn test_parse_args_verbose_short() {
+        let args = vec!["-v".to_string()];
+        let (verbose, addr) = parse_args(args).unwrap();
+        assert!(verbose);
+        assert_eq!(addr, "127.0.0.1:4242");
+    }
+
+    #[test]
+    fn test_parse_args_verbose_long() {
+        let args = vec!["--verbose".to_string(), "0.0.0.0:9000".to_string()];
+        let (verbose, addr) = parse_args(args).unwrap();
+        assert!(verbose);
+        assert_eq!(addr, "0.0.0.0:9000");
+    }
+
+    #[test]
+    fn test_parse_args_flags_anywhere() {
+        let args = vec!["0.0.0.0:9000".to_string(), "-v".to_string()];
+        let (verbose, addr) = parse_args(args).unwrap();
+        assert!(verbose);
+        assert_eq!(addr, "0.0.0.0:9000");
+    }
+
+    #[test]
+    fn test_parse_args_unknown_flag() {
+        let args = vec!["--unknown".to_string()];
+        assert!(parse_args(args).is_err());
+    }
+
+    #[test]
+    fn test_parse_args_extra_arg() {
+        let args = vec!["addr1".to_string(), "addr2".to_string()];
+        assert!(parse_args(args).is_err());
+    }
+}

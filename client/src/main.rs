@@ -214,3 +214,67 @@ mod tcp {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ==================== parse_clip_fields tests ====================
+
+    #[test]
+    fn test_parse_clip_fields_with_id() {
+        let result = parse_clip_fields("CLIP lobby SGVsbG8= 42");
+        assert_eq!(result, Some(("lobby", "SGVsbG8=", Some("42"))));
+    }
+
+    #[test]
+    fn test_parse_clip_fields_without_id() {
+        let result = parse_clip_fields("CLIP lobby SGVsbG8=");
+        assert_eq!(result, Some(("lobby", "SGVsbG8=", None)));
+    }
+
+    #[test]
+    fn test_parse_clip_fields_different_room() {
+        let result = parse_clip_fields("CLIP room-1 dGVzdA== 123");
+        assert_eq!(result, Some(("room-1", "dGVzdA==", Some("123"))));
+    }
+
+    #[test]
+    fn test_parse_clip_fields_missing_parts() {
+        assert_eq!(parse_clip_fields("CLIP lobby"), None);
+        assert_eq!(parse_clip_fields("CLIP"), None);
+        assert_eq!(parse_clip_fields(""), None);
+    }
+
+    #[test]
+    fn test_parse_clip_fields_wrong_prefix() {
+        assert_eq!(parse_clip_fields("JOIN lobby SGVsbG8="), None);
+        assert_eq!(parse_clip_fields("INFO some text"), None);
+    }
+
+    // ==================== base64 roundtrip test ====================
+
+    #[test]
+    fn test_base64_roundtrip() {
+        use base64::{engine::general_purpose, Engine as _};
+
+        let original = "Hello, World!\nLine 2";
+        let encoded = general_purpose::STANDARD.encode(original);
+        let decoded_bytes = general_purpose::STANDARD.decode(&encoded).unwrap();
+        let decoded = String::from_utf8(decoded_bytes).unwrap();
+
+        assert_eq!(original, decoded);
+    }
+
+    #[test]
+    fn test_base64_with_special_chars() {
+        use base64::{engine::general_purpose, Engine as _};
+
+        let original = "{\n  \"name\": \"test\",\n  \"value\": 123\n}";
+        let encoded = general_purpose::STANDARD.encode(original);
+        let decoded_bytes = general_purpose::STANDARD.decode(&encoded).unwrap();
+        let decoded = String::from_utf8(decoded_bytes).unwrap();
+
+        assert_eq!(original, decoded);
+    }
+}
