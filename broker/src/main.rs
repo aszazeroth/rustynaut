@@ -7,7 +7,7 @@
 //!
 //! Start the broker:
 //!
-//!     cargo run --release -- [--verbose] [addr]
+//!     cargo run --release -- [--verbose] [--tls] [addr]
 //!
 //! Default address is 127.0.0.1:4242.
 //!
@@ -15,7 +15,9 @@
 
 #![warn(rust_2018_idioms)]
 
-use tokio::io::{self, AsyncBufReadExt, BufReader};
+mod tls;
+
+use tokio::io::{self, AsyncBufReadExt, AsyncRead, AsyncWrite, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc, Mutex};
 use tokio_stream::StreamExt;
@@ -26,6 +28,7 @@ use std::collections::HashMap;
 use std::env;
 use std::error::Error;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 const BANNER: &str = r#"
@@ -38,18 +41,30 @@ const BANNER: &str = r#"
 https://github.com/aszazeroth/rustynaut                                                 
 "#;
 
+/// Parsed command-line arguments
+struct Args {
+    verbose: bool,
+    addr: String,
+    tls_disabled: bool,
+    cert_dir: PathBuf,
+    regenerate_token: bool,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     println!("{BANNER}");
 
-    // Args: broker [--verbose|-v] [addr]
-    // Flags can appear anywhere.
-    let (verbose, addr) = parse_args(env::args().skip(1))?;
+    // Args: broker [--verbose|-v] [--no-tls] [--cert-dir <path>] [--regenerate-token] [addr]
+    let args = parse_args(env::args().skip(1))?;
 
     use tracing_subscriber::{fmt::format::FmtSpan, EnvFilter};
     // Configure a `tracing` subscriber that logs traces emitted by the chat
     // server.
-    let default_directive = if verbose { "chat=debug" } else { "chat=info" };
+    let default_directive = if args.verbose {
+        "chat=debug"
+    } else {
+        "chat=info"
+    };
     tracing_subscriber::fmt()
         // Filter what traces are displayed based on the RUST_LOG environment
         // variable.
@@ -67,6 +82,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
         // the program.
         .init();
 
+    // Initialize TLS (enabled by default)
+    let tls_config = if !args.tls_disabled {
+        // Extract hostname/IP from addr for certificate SANs
+        let server_names = extract_server_names(&args.addr);
+        Some(Arc::new(
+            tls::init_tls(&args.cert_dir, &server_names, args.regenerate_token)
+                .map_err(|e| -> Box<dyn Error> { e })?,
+        ))
+    } else {
+        eprintln!("WARNING: TLS disabled, connections will not be encrypted!");
+        None
+    };
+
     // Create the shared state. This is how all the peers communicate.
     //
     // The server task will hold a handle to this. For every new client, the
@@ -77,15 +105,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // Shutdown signal broadcast channel
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
 
-    println!("broker started on : {}", &addr);
+    println!("broker started on : {}", &args.addr);
+    if !args.tls_disabled {
+        println!("TLS enabled");
+    }
     println!("Type /help for broker commands, /quit to shutdown");
 
     // Bind a TCP listener to the socket address.
     //
     // Note that this is the Tokio TcpListener, which is fully async.
-    let listener = TcpListener::bind(&addr).await?;
+    let listener = TcpListener::bind(&args.addr).await?;
 
-    tracing::info!("server running on {}", addr);
+    tracing::info!("server running on {}", args.addr);
 
     // Spawn stdin reader for broker commands
     let stdin_state = Arc::clone(&state);
@@ -154,11 +185,27 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
                 // Clone a handle to the `Shared` state for the new connection.
                 let state = Arc::clone(&state);
+                let tls_config = tls_config.clone();
 
                 // Spawn our handler to be run asynchronously.
                 tokio::spawn(async move {
                     tracing::debug!("accepted connection");
-                    if let Err(e) = process(state, stream, addr).await {
+                    let result = if let Some(ref tls_cfg) = tls_config {
+                        // TLS connection
+                        match tls_cfg.acceptor.accept(stream).await {
+                            Ok(tls_stream) => {
+                                process_tls(state, tls_stream, addr, tls_cfg.clone()).await
+                            }
+                            Err(e) => {
+                                tracing::warn!("TLS handshake failed: {:?}", e);
+                                Ok(())
+                            }
+                        }
+                    } else {
+                        // Plain TCP connection
+                        process(state, stream, addr, None).await
+                    };
+                    if let Err(e) = result {
                         tracing::info!("an error occurred; error = {:?}", e);
                     }
                 });
@@ -173,15 +220,38 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn parse_args(args: impl IntoIterator<Item = String>) -> Result<(bool, String), Box<dyn Error>> {
+fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, Box<dyn Error>> {
     let mut verbose = false;
     let mut addr: Option<String> = None;
+    let mut tls_disabled = false;
+    let mut cert_dir: Option<PathBuf> = None;
+    let mut regenerate_token = false;
 
-    for arg in args {
+    let mut args_iter = args.into_iter().peekable();
+
+    while let Some(arg) = args_iter.next() {
         match arg.as_str() {
             "--verbose" | "-v" => verbose = true,
+            "--no-tls" => tls_disabled = true,
+            "--regenerate-token" => regenerate_token = true,
+            "--cert-dir" => {
+                cert_dir = Some(PathBuf::from(
+                    args_iter
+                        .next()
+                        .ok_or("--cert-dir requires a path argument")?,
+                ));
+            }
             "--help" | "-h" => {
-                eprintln!("usage: broker [--verbose|-v] [addr]");
+                eprintln!("usage: broker [OPTIONS] [addr]");
+                eprintln!();
+                eprintln!("Options:");
+                eprintln!("  --verbose, -v       Enable verbose logging");
+                eprintln!("  --no-tls            Disable TLS (insecure, for testing)");
+                eprintln!(
+                    "  --cert-dir <PATH>   Certificate directory (default: ~/.config/rustynaut)"
+                );
+                eprintln!("  --regenerate-token  Generate new enrollment token");
+                eprintln!();
                 eprintln!("  addr default: 127.0.0.1:4242");
                 std::process::exit(0);
             }
@@ -198,10 +268,32 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<(bool, String), 
         }
     }
 
-    Ok((
+    Ok(Args {
         verbose,
-        addr.unwrap_or_else(|| "127.0.0.1:4242".to_string()),
-    ))
+        addr: addr.unwrap_or_else(|| "127.0.0.1:4242".to_string()),
+        tls_disabled,
+        cert_dir: cert_dir.unwrap_or_else(tls::default_cert_dir),
+        regenerate_token,
+    })
+}
+
+/// Extract hostnames/IPs from the bind address for certificate SANs
+fn extract_server_names(addr: &str) -> Vec<String> {
+    let mut names = vec!["localhost".to_string()];
+
+    // Parse the address to extract host part
+    if let Some(host) = addr.split(':').next() {
+        if host != "0.0.0.0" && host != "::" && !names.contains(&host.to_string()) {
+            names.push(host.to_string());
+        }
+    }
+
+    // Always include common local addresses
+    if !names.contains(&"127.0.0.1".to_string()) {
+        names.push("127.0.0.1".to_string());
+    }
+
+    names
 }
 
 /// Shorthand for the transmit half of the message channel.
@@ -229,13 +321,16 @@ struct PeerInfo {
 }
 
 /// The state for each connected client.
-struct Peer {
+struct Peer<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     /// The TCP socket wrapped with the `Lines` codec, defined below.
     ///
     /// This handles sending and receiving data on the socket. When using
     /// `Lines`, we can work at the line level instead of having to manage the
     /// raw byte operations.
-    lines: Framed<TcpStream, LinesCodec>,
+    lines: Framed<S, LinesCodec>,
 
     /// Receive half of the message channel.
     ///
@@ -273,17 +368,18 @@ impl Shared {
     }
 }
 
-impl Peer {
+impl<S> Peer<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     /// Create a new instance of `Peer`.
     async fn new(
         state: Arc<Mutex<Shared>>,
-        lines: Framed<TcpStream, LinesCodec>,
+        lines: Framed<S, LinesCodec>,
+        addr: SocketAddr,
         username: String,
         room: String,
-    ) -> io::Result<Peer> {
-        // Get the client socket address
-        let addr = lines.get_ref().peer_addr()?;
-
+    ) -> io::Result<Peer<S>> {
         // Create a channel for this peer
         let (tx, rx) = mpsc::unbounded_channel();
 
@@ -339,20 +435,55 @@ fn parse_say(line: &str) -> Option<&str> {
         .filter(|s| !s.is_empty())
 }
 
-/// Process an individual chat client
-async fn process(
+/// Parse ENROLL command: ENROLL <token> <username>
+fn parse_enroll(line: &str) -> Option<(&str, &str)> {
+    let rest = line.strip_prefix("ENROLL ")?;
+    let mut parts = rest.splitn(2, ' ');
+    let token = parts.next()?.trim();
+    let username = parts.next()?.trim();
+    if token.is_empty() || username.is_empty() {
+        return None;
+    }
+    Some((token, username))
+}
+
+/// Process a TLS connection
+async fn process_tls(
     state: Arc<Mutex<Shared>>,
-    stream: TcpStream,
+    stream: tokio_rustls::server::TlsStream<TcpStream>,
     addr: SocketAddr,
-) -> Result<(), Box<dyn Error>> {
+    tls_config: Arc<tls::TlsConfig>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    process(state, stream, addr, Some(tls_config)).await
+}
+
+/// Process an individual chat client
+async fn process<S>(
+    state: Arc<Mutex<Shared>>,
+    stream: S,
+    addr: SocketAddr,
+    tls_config: Option<Arc<tls::TlsConfig>>,
+) -> Result<(), Box<dyn Error + Send + Sync>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let mut lines = Framed::new(stream, LinesCodec::new());
 
     // Protocol note:
     // - New clients should send: `USER <name>` then optionally `JOIN <room>`.
     // - For legacy clients we still accept the first line as the username.
-    lines
-        .send("INFO rustynaut broker: send 'USER <name>' then 'JOIN <room>' (defaults to lobby)")
-        .await?;
+    // - For TLS enrollment: `ENROLL <token> <username>`
+    if tls_config.is_some() {
+        lines
+            .send("INFO rustynaut broker (TLS): send 'ENROLL <token> <username>' or 'USER <name>' then 'JOIN <room>'")
+            .await?;
+    } else {
+        lines
+            .send(
+                "INFO rustynaut broker: send 'USER <name>' then 'JOIN <room>' (defaults to lobby)",
+            )
+            .await?;
+    }
 
     let first = match lines.next().await {
         Some(Ok(line)) => line,
@@ -364,6 +495,52 @@ async fn process(
             return Ok(());
         }
     };
+
+    // Handle ENROLL command for TLS enrollment
+    if let Some((token, enroll_username)) = parse_enroll(&first) {
+        if let Some(ref tls_cfg) = tls_config {
+            if token == tls_cfg.enrollment_token {
+                if !is_valid_name(enroll_username) {
+                    lines
+                        .send("ERR enrollment failed: invalid username (alphanumeric, _, - only, max 32 chars)")
+                        .await?;
+                    return Ok(());
+                }
+
+                tracing::info!("Enrolling client '{}' from {}", enroll_username, addr);
+
+                // Generate client certificate
+                match tls::generate_client_cert(
+                    &tls_cfg.ca_cert_pem,
+                    &tls_cfg.ca_key,
+                    enroll_username,
+                ) {
+                    Ok(bundle) => {
+                        let response = tls::encode_enrolled_response(&bundle);
+                        lines.send(&response).await?;
+                        tracing::info!(
+                            "Enrolled '{}' - client should reconnect with certificate",
+                            enroll_username
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to generate client certificate: {:?}", e);
+                        lines
+                            .send("ERR enrollment failed: certificate generation error")
+                            .await?;
+                    }
+                }
+            } else {
+                tracing::warn!("Invalid enrollment token from {}", addr);
+                lines.send("ERR enrollment failed: invalid token").await?;
+            }
+        } else {
+            lines
+                .send("ERR enrollment not available (TLS not enabled)")
+                .await?;
+        }
+        return Ok(());
+    }
 
     let username = parse_user(&first).unwrap_or(first.trim()).to_string();
     if username.is_empty() {
@@ -380,7 +557,7 @@ async fn process(
     let mut room = "lobby".to_string();
 
     // Register our peer with state which internally sets up some channels.
-    let mut peer = Peer::new(state.clone(), lines, username.clone(), room.clone()).await?;
+    let mut peer = Peer::new(state.clone(), lines, addr, username.clone(), room.clone()).await?;
 
     // A client has connected, let's let everyone know.
     {
@@ -664,41 +841,42 @@ mod tests {
     #[test]
     fn test_parse_args_defaults() {
         let args: Vec<String> = vec![];
-        let (verbose, addr) = parse_args(args).unwrap();
-        assert!(!verbose);
-        assert_eq!(addr, "127.0.0.1:4242");
+        let result = parse_args(args).unwrap();
+        assert!(!result.verbose);
+        assert_eq!(result.addr, "127.0.0.1:4242");
+        assert!(!result.tls_disabled); // TLS enabled by default
     }
 
     #[test]
     fn test_parse_args_with_address() {
         let args = vec!["0.0.0.0:8080".to_string()];
-        let (verbose, addr) = parse_args(args).unwrap();
-        assert!(!verbose);
-        assert_eq!(addr, "0.0.0.0:8080");
+        let result = parse_args(args).unwrap();
+        assert!(!result.verbose);
+        assert_eq!(result.addr, "0.0.0.0:8080");
     }
 
     #[test]
     fn test_parse_args_verbose_short() {
         let args = vec!["-v".to_string()];
-        let (verbose, addr) = parse_args(args).unwrap();
-        assert!(verbose);
-        assert_eq!(addr, "127.0.0.1:4242");
+        let result = parse_args(args).unwrap();
+        assert!(result.verbose);
+        assert_eq!(result.addr, "127.0.0.1:4242");
     }
 
     #[test]
     fn test_parse_args_verbose_long() {
         let args = vec!["--verbose".to_string(), "0.0.0.0:9000".to_string()];
-        let (verbose, addr) = parse_args(args).unwrap();
-        assert!(verbose);
-        assert_eq!(addr, "0.0.0.0:9000");
+        let result = parse_args(args).unwrap();
+        assert!(result.verbose);
+        assert_eq!(result.addr, "0.0.0.0:9000");
     }
 
     #[test]
     fn test_parse_args_flags_anywhere() {
         let args = vec!["0.0.0.0:9000".to_string(), "-v".to_string()];
-        let (verbose, addr) = parse_args(args).unwrap();
-        assert!(verbose);
-        assert_eq!(addr, "0.0.0.0:9000");
+        let result = parse_args(args).unwrap();
+        assert!(result.verbose);
+        assert_eq!(result.addr, "0.0.0.0:9000");
     }
 
     #[test]
@@ -711,5 +889,21 @@ mod tests {
     fn test_parse_args_extra_arg() {
         let args = vec!["addr1".to_string(), "addr2".to_string()];
         assert!(parse_args(args).is_err());
+    }
+
+    #[test]
+    fn test_parse_args_no_tls() {
+        let args = vec!["--no-tls".to_string()];
+        let result = parse_args(args).unwrap();
+        assert!(result.tls_disabled);
+        assert_eq!(result.addr, "127.0.0.1:4242");
+    }
+
+    #[test]
+    fn test_parse_args_with_cert_dir() {
+        let args = vec!["--cert-dir".to_string(), "/tmp/certs".to_string()];
+        let result = parse_args(args).unwrap();
+        assert!(!result.tls_disabled); // TLS still enabled by default
+        assert_eq!(result.cert_dir, std::path::PathBuf::from("/tmp/certs"));
     }
 }

@@ -1,9 +1,11 @@
 //! Clipboard sync client for the Rustynaut broker.
 //!
-//! Transport is TCP only and line-framed (`LinesCodec`). Clipboard updates are
+//! Transport is TCP or TLS and line-framed (`LinesCodec`). Clipboard updates are
 //! sent as base64 to keep payloads binary-safe.
 
 #![warn(rust_2018_idioms)]
+
+mod tls;
 
 use tokio::io;
 use tokio::sync::mpsc;
@@ -14,6 +16,7 @@ use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec, LinesCodecError};
 use std::env;
 use std::error::Error;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::process::exit;
 
 use base64::{engine::general_purpose, Engine as _};
@@ -35,24 +38,65 @@ const BANNER: &str = r#"
 https://github.com/aszazeroth/rustynaut                                                
 "#;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
-    println!("{BANNER}");
+/// Parsed command-line arguments
+struct Args {
+    verbose: bool,
+    addr: SocketAddr,
+    username: String,
+    room: String,
+    tls_disabled: bool,
+    enroll_token: Option<String>,
+    cert_dir: PathBuf,
+}
 
-    // Args: client [--verbose|-v] <addr> [username] [room]
-    // Flags can appear anywhere.
+fn parse_args() -> Result<Args, Box<dyn Error>> {
     let mut verbose = false;
+    let mut tls_disabled = false;
+    let mut enroll_token: Option<String> = None;
+    let mut cert_dir: Option<PathBuf> = None;
     let mut positional = Vec::new();
-    for arg in env::args().skip(1) {
+
+    let mut args_iter = env::args().skip(1).peekable();
+
+    while let Some(arg) = args_iter.next() {
         match arg.as_str() {
             "--verbose" | "-v" => verbose = true,
+            "--no-tls" => tls_disabled = true,
+            "--enroll" => {
+                enroll_token = Some(
+                    args_iter
+                        .next()
+                        .ok_or("--enroll requires a token argument")?,
+                );
+            }
+            "--cert-dir" => {
+                cert_dir = Some(PathBuf::from(
+                    args_iter
+                        .next()
+                        .ok_or("--cert-dir requires a path argument")?,
+                ));
+            }
+            "--help" | "-h" => {
+                eprintln!("usage: client [OPTIONS] <addr> [username] [room]");
+                eprintln!();
+                eprintln!("Options:");
+                eprintln!("  --verbose, -v           Enable verbose logging");
+                eprintln!("  --no-tls                Disable TLS (insecure, for testing)");
+                eprintln!("  --enroll <TOKEN>        Enroll with broker using token");
+                eprintln!("  --cert-dir <PATH>       Certificate directory");
+                eprintln!("                          (default: ~/.config/rustynaut/client)");
+                std::process::exit(0);
+            }
+            _ if arg.starts_with('-') => {
+                return Err(format!("unknown flag: {arg}").into());
+            }
             _ => positional.push(arg),
         }
     }
 
     let addr = positional
         .first()
-        .ok_or("usage: client [--verbose|-v] <addr> [username] [room]")?
+        .ok_or("usage: client [OPTIONS] <addr> [username] [room]")?
         .parse::<SocketAddr>()?;
 
     let username = positional.get(1).cloned().unwrap_or_else(default_username);
@@ -61,12 +105,45 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .cloned()
         .unwrap_or_else(|| "lobby".to_string());
 
+    Ok(Args {
+        verbose,
+        addr,
+        username,
+        room,
+        tls_disabled,
+        enroll_token,
+        cert_dir: cert_dir.unwrap_or_else(tls::default_cert_dir),
+    })
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
+    println!("{BANNER}");
+
+    let args = parse_args()?;
+
+    // Handle enrollment if requested
+    if let Some(ref token) = args.enroll_token {
+        enroll(&args.addr, token, &args.username, &args.cert_dir).await?;
+        // After successful enrollment, continue to connect with TLS
+        println!("Auto-connecting with TLS...\n");
+    }
+
+    // Check if we need TLS and have certificates
+    let tls_enabled = !args.tls_disabled;
+    if tls_enabled && !tls::is_enrolled(&args.cert_dir) {
+        eprintln!("TLS is enabled by default but you are not enrolled.");
+        eprintln!("Use --enroll <token> to enroll first, or --no-tls for insecure mode.");
+        eprintln!("Certificates should be in: {:?}", args.cert_dir);
+        return Err("Not enrolled for TLS".into());
+    }
+
     let (tx, rx) = mpsc::channel::<String>(10);
     let rx = tokio_stream::wrappers::ReceiverStream::new(rx);
 
     // Spawn a task to monitor clipboard changes
-    let room_for_clipboard = room.clone();
-    let verbose_for_clipboard = verbose;
+    let room_for_clipboard = args.room.clone();
+    let verbose_for_clipboard = args.verbose;
     tokio::spawn(async move {
         let mut previous_content = match CLIPBOARD.get_string_contents() {
             Ok(s) => s,
@@ -125,18 +202,26 @@ async fn main() -> Result<(), Box<dyn Error>> {
     });
 
     let init = tokio_stream::iter([
-        Ok::<String, LinesCodecError>(format!("USER {username}")),
-        Ok::<String, LinesCodecError>(format!("JOIN {room}")),
+        Ok::<String, LinesCodecError>(format!("USER {}", args.username)),
+        Ok::<String, LinesCodecError>(format!("JOIN {}", args.room)),
     ]);
 
-    let stdin = FramedRead::new(io::stdin(), LinesCodec::new()).map(|i| {
-        i.map(|line| {
-            if line.starts_with('/') {
-                format!("CMD {line}")
-            } else {
-                format!("SAY {line}")
+    let stdin = FramedRead::new(io::stdin(), LinesCodec::new()).filter_map(|i| {
+        match i {
+            Ok(line) => {
+                // Handle local quit commands
+                if line == "/quit" || line == "/exit" {
+                    println!("Goodbye!");
+                    std::process::exit(0);
+                }
+                if line.starts_with('/') {
+                    Some(Ok(format!("CMD {line}")))
+                } else {
+                    Some(Ok(format!("SAY {line}")))
+                }
             }
-        })
+            Err(e) => Some(Err(e)),
+        }
     });
 
     let stdin = init
@@ -145,9 +230,73 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let stdout = FramedWrite::new(io::stdout(), LinesCodec::new());
 
-    tcp::connect(&addr, stdin, stdout, verbose).await?;
+    if tls_enabled {
+        // TLS connection
+        let tls_config =
+            tls::init_tls_with_client_cert(&args.cert_dir).map_err(|e| -> Box<dyn Error> { e })?;
+        tls_transport::connect(&args.addr, &tls_config, stdin, stdout, args.verbose).await?;
+    } else {
+        // Plain TCP (insecure) connection
+        eprintln!("WARNING: TLS disabled, connection is not encrypted!");
+        tcp::connect(&args.addr, stdin, stdout, args.verbose).await?;
+    }
 
     Ok(())
+}
+
+/// Enroll with the broker to obtain client certificates
+async fn enroll(
+    addr: &SocketAddr,
+    token: &str,
+    username: &str,
+    cert_dir: &std::path::Path,
+) -> Result<(), Box<dyn Error>> {
+    use futures::SinkExt;
+    use tokio::net::TcpStream;
+    use tokio_util::codec::{Framed, LinesCodec};
+
+    println!("Enrolling with broker at {addr}...");
+
+    // Connect with TLS in insecure mode (for enrollment)
+    let tls_config = tls::init_tls_for_enrollment().map_err(|e| -> Box<dyn Error> { e })?;
+
+    let stream = TcpStream::connect(addr).await?;
+
+    // Extract host for TLS SNI
+    let host = addr.ip().to_string();
+    let tls_stream = tls::connect_tls(&tls_config.connector, stream, &host)
+        .await
+        .map_err(|e| -> Box<dyn Error> { e })?;
+
+    let mut framed = Framed::new(tls_stream, LinesCodec::new());
+
+    // Read the welcome message
+    if let Some(Ok(line)) = framed.next().await {
+        println!("Broker: {}", line);
+    }
+
+    // Send enrollment request
+    let enroll_cmd = format!("ENROLL {token} {username}");
+    framed.send(&enroll_cmd).await?;
+
+    // Wait for response
+    if let Some(Ok(line)) = framed.next().await {
+        if line.starts_with("ENROLLED ") {
+            let bundle =
+                tls::parse_enrolled_response(&line).map_err(|e| -> Box<dyn Error> { e })?;
+            tls::save_enrolled_certs(cert_dir, &bundle).map_err(|e| -> Box<dyn Error> { e })?;
+
+            println!("Enrollment successful!");
+            println!("Certificates saved to: {:?}", cert_dir);
+            return Ok(());
+        } else if let Some(err_msg) = line.strip_prefix("ERR ") {
+            return Err(format!("Enrollment failed: {}", err_msg).into());
+        } else {
+            println!("Unexpected response: {}", line);
+        }
+    }
+
+    Err("Enrollment failed: no response from broker".into())
 }
 
 fn get_current_clipboard() -> SystemClipboard {
@@ -196,6 +345,62 @@ mod tcp {
     ) -> Result<(), Box<dyn Error>> {
         let mut stream = TcpStream::connect(addr).await?;
         let (r, w) = stream.split();
+        let mut sink = FramedWrite::new(w, LinesCodec::new());
+        let mut stream = FramedRead::new(r, LinesCodec::new()).filter_map(|i| match i {
+            Ok(message) => {
+                // Apply clipboard updates silently (avoid printing base64 payloads).
+                if let Some((room, clipboard_b64, id)) = crate::parse_clip_fields(&message) {
+                    if let Err(err) = crate::replace_clipboard_content(clipboard_b64) {
+                        eprintln!("could not replace the clipboard content, {}", err)
+                    }
+
+                    if verbose {
+                        let id_str = id.unwrap_or("?");
+                        eprintln!(
+                            "clip applied: room={room} id={id_str} (b64_len={})",
+                            clipboard_b64.len()
+                        );
+                    }
+                    return future::ready(None);
+                }
+
+                future::ready(Some(Ok(message)))
+            }
+            Err(e) => {
+                eprintln!("failed to read from socket; error={}", e);
+                future::ready(None)
+            }
+        });
+
+        match future::join(sink.send_all(&mut stdin), stdout.send_all(&mut stream)).await {
+            (Err(e), _) | (_, Err(e)) => Err(e.into()),
+            _ => Ok(()),
+        }
+    }
+}
+
+mod tls_transport {
+    use futures::{future, Sink, SinkExt, Stream, StreamExt};
+    use std::{error::Error, net::SocketAddr};
+    use tokio::net::TcpStream;
+    use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec, LinesCodecError};
+
+    pub async fn connect(
+        addr: &SocketAddr,
+        tls_config: &crate::tls::TlsClientConfig,
+        mut stdin: impl Stream<Item = Result<String, LinesCodecError>> + Unpin,
+        mut stdout: impl Sink<String, Error = LinesCodecError> + Unpin,
+        verbose: bool,
+    ) -> Result<(), Box<dyn Error>> {
+        let tcp_stream = TcpStream::connect(addr).await?;
+
+        // Extract host for TLS SNI
+        let host = addr.ip().to_string();
+        let tls_stream = crate::tls::connect_tls(&tls_config.connector, tcp_stream, &host)
+            .await
+            .map_err(|e| -> Box<dyn Error> { e })?;
+
+        let (r, w) = tokio::io::split(tls_stream);
         let mut sink = FramedWrite::new(w, LinesCodec::new());
         let mut stream = FramedRead::new(r, LinesCodec::new()).filter_map(|i| match i {
             Ok(message) => {

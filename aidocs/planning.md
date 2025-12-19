@@ -362,12 +362,19 @@ Broker → Client:  ERR enrollment failed: rate limited
 | **One-time use** | Optional: `--single-use-token` invalidates after one enrollment |
 | **Disable** | `--no-enrollment` disables enrollment, requires pre-generated certs |
 
-### Additional Protection Options
+### Additional Protection Options (Future)
 
-1. **IP allowlist:** `--enroll-from 192.168.1.0/24` restricts enrollment source IPs
-2. **Rate limiting:** Max 5 enrollment attempts per minute per IP
-3. **Username binding:** Certificate CN must match USER command username
-4. **Audit log:** Log all enrollment attempts with IP, username, success/failure
+| Feature | CLI Flag | Description | Status |
+|---------|----------|-------------|--------|
+| IP allowlist | `--enroll-from 192.168.1.0/24` | Restrict enrollment source IPs | Planned |
+| Rate limiting | N/A (automatic) | Max 5 enrollment attempts per minute per IP | Planned |
+| Username binding | `--bind-cn-to-user` | Certificate CN must match USER command | Planned |
+| Audit log | `--audit-log <path>` | Log all enrollment attempts with IP, username, success/failure | Planned |
+| Require mTLS | `--mtls` | Require client certificates, no enrollment fallback | Planned |
+| Enrollment window | `--enrollment-window 24h` | Only allow enrollment for N hours after startup | Planned |
+| Single-use token | `--single-use-token` | Token becomes invalid after one successful enrollment | Planned |
+| Offline cert gen | `--generate-client <NAME>` | Generate client cert bundle without enrollment | Planned |
+| Private key perms | N/A (automatic) | Set 0600 permissions on private key files (Linux) | Planned |
 
 ### Dependencies (additional)
 
@@ -381,32 +388,52 @@ uuid = { version = "1", features = ["v4"] }           # Enrollment token generat
 
 ### CLI Changes
 
-**Broker (additional flags):**
+**Broker (current implementation):**
 ```
-broker [existing flags...] [mTLS flags...]
+broker [--verbose|-v] [--no-tls] [--cert-dir <PATH>] [--regenerate-token] [addr]
 
-mTLS Options:
-  --tls                     Enable TLS (auto-generates CA/certs on first run)
-  --mtls                    Require client certificates (implies --tls)
-  --cert-dir <PATH>         Certificate directory (default: ~/.config/rustynaut)
-  --enrollment-token <TOKEN> Use specific enrollment token (default: auto-generate)
-  --regenerate-token        Generate new enrollment token
+Options:
+  --verbose, -v         Enable verbose logging
+  --no-tls              Disable TLS (insecure, for testing only)
+  --cert-dir <PATH>     Certificate directory (default: ~/.config/rustynaut)
+  --regenerate-token    Generate new enrollment token
+
+Default address: 127.0.0.1:4242
+TLS is enabled by default with auto-generated certificates.
+```
+
+**Client (current implementation):**
+```
+client [--verbose|-v] [--no-tls] [--enroll <TOKEN>] [--cert-dir <PATH>] <addr> [username] [room]
+
+Options:
+  --verbose, -v         Enable verbose logging
+  --no-tls              Disable TLS (insecure, for testing only)
+  --enroll <TOKEN>      Enroll with broker using token (auto-connects after)
+  --cert-dir <PATH>     Certificate directory (default: ~/.config/rustynaut/client)
+
+Default username: $USER or "anon"
+Default room: "lobby"
+TLS is enabled by default; requires enrollment first.
+```
+
+**Future CLI additions:**
+```
+Broker (planned):
+  --mtls                    Require client certificates (no enrollment fallback)
+  --enrollment-token <TOKEN> Use specific enrollment token (instead of auto-generate)
   --no-enrollment           Disable enrollment, require pre-generated certs
   --enrollment-window <DUR> Enrollment allowed for duration after startup (e.g., 24h)
+  --single-use-token        Invalidate token after one successful enrollment
+  --enroll-from <CIDR>      Restrict enrollment to specific IP ranges
   --generate-client <NAME>  Generate client cert bundle (offline enrollment)
-```
+  --audit-log <PATH>        Log enrollment attempts
 
-**Client (additional flags):**
-```
-client [existing flags...] [mTLS flags...]
-
-mTLS Options:
-  --tls                     Enable TLS connection
-  --mtls                    Use client certificate (auto-enroll if missing)
-  --ca-cert <PATH>          CA certificate to trust
-  --client-cert <PATH>      Client certificate PEM file
-  --client-key <PATH>       Client private key PEM file
-  --enroll <TOKEN>          Enrollment token for first-time setup
+Client (planned):
+  --mtls                    Require mTLS (fail if no client cert)
+  --ca-cert <PATH>          CA certificate to trust (override auto-discovered)
+  --client-cert <PATH>      Client certificate PEM file (override auto-discovered)
+  --client-key <PATH>       Client private key PEM file (override auto-discovered)
   --cert-dir <PATH>         Certificate storage directory
 ```
 
@@ -488,3 +515,28 @@ Log SHA256 fingerprints at key moments for debugging:
 - [ ] Implement client echo suppression using `<id>`
 - [ ] Manual test: start broker, connect 1 client, run `/rooms` and `/who`
 - [ ] Manual test: 2 clients in same room sync; different rooms do not
+
+### TLS Implementation Status
+- [x] Add TLS dependencies to broker (tokio-rustls, rustls, rcgen, etc.)
+- [x] Add TLS dependencies to client
+- [x] Create broker tls.rs module (CA/cert generation, TLS acceptor)
+- [x] Create client tls.rs module (cert storage, enrollment handling)
+- [x] Implement CLI flags: broker --no-tls, --cert-dir, --regenerate-token
+- [x] Implement CLI flags: client --no-tls, --enroll, --cert-dir
+- [x] Implement ENROLL command parsing and handling on broker
+- [x] Implement enrollment flow on client
+- [x] Generic Peer<S> struct for TCP and TLS stream abstraction
+- [x] Clock skew tolerance (certificates backdated 1 hour)
+- [x] Fingerprint logging for CA, server, and client certs
+- [x] TLS enabled by default (--no-tls to disable)
+- [x] Auto-connect after enrollment
+- [x] Client /quit and /exit commands for graceful disconnect
+- [x] Cross-platform certificate storage (dirs crate)
+- [x] Update README with TLS documentation
+- [x] Update copilot-instructions.md with TLS documentation
+- [x] Manual test: full enrollment and mTLS connection flow
+- [ ] Add --mtls flag to require client certificates (no enrollment fallback)
+- [ ] Optional: Certificate CN binding to USER command
+- [ ] Set proper file permissions (0600) on private keys
+- [ ] Rate limiting for enrollment attempts
+- [ ] Enrollment audit logging
