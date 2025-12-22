@@ -64,5 +64,6 @@
 - No shared library crate: duplicate helpers only if semantics differ per binary. Otherwise, consider extracting modules within each crate.
 - System/command messages always use human-readable prefix plus machine-parsable segment; update both broker + client when changing formats.
 - Tests are currently manual (run broker + multiple clients). When adding automated tests, use `tokio::test` and mock transports; avoid blocking on stdin/stdout.
+- **AVOID OS commands and binaries** (e.g., `ifconfig`, `ip`, `netstat`, shell commands via `std::process::Command`). These break cross-platform compatibility. Use pure Rust crates instead (e.g., `if-addrs` for network interfaces, `dirs` for config paths).
 
 Please let me know if any section feels incomplete or if additional workflows should be documented.

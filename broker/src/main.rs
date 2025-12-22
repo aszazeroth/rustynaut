@@ -277,6 +277,34 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, Box<dyn Er
     })
 }
 
+/// Detect local IP addresses from network interfaces using pure Rust
+fn detect_local_ips() -> Vec<String> {
+    let mut ips = Vec::new();
+
+    // Use if-addrs crate for cross-platform network interface detection
+    if let Ok(interfaces) = if_addrs::get_if_addrs() {
+        for iface in interfaces {
+            // Skip loopback interfaces
+            if iface.is_loopback() {
+                continue;
+            }
+
+            // Get the IP address
+            let ip = iface.addr.ip();
+
+            // Only include IPv4 addresses for now
+            if ip.is_ipv4() {
+                let ip_str = ip.to_string();
+                if !ips.contains(&ip_str) {
+                    ips.push(ip_str);
+                }
+            }
+        }
+    }
+
+    ips
+}
+
 /// Extract hostnames/IPs from the bind address for certificate SANs
 fn extract_server_names(addr: &str) -> Vec<String> {
     let mut names = vec!["localhost".to_string()];
@@ -292,6 +320,15 @@ fn extract_server_names(addr: &str) -> Vec<String> {
     if !names.contains(&"127.0.0.1".to_string()) {
         names.push("127.0.0.1".to_string());
     }
+
+    // Auto-detect local IPs from network interfaces
+    for ip in detect_local_ips() {
+        if !names.contains(&ip) {
+            names.push(ip);
+        }
+    }
+
+    eprintln!("Certificate SANs: {:?}", names);
 
     names
 }
