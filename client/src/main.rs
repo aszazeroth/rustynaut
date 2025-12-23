@@ -5,7 +5,12 @@
 
 #![warn(rust_2018_idioms)]
 
+mod clipboard_files;
 mod tls;
+
+/// Maximum line length for the wire protocol (2MB to handle large base64 clipboard payloads)
+/// For files larger than ~1.5MB raw, use the sideband FILE_OFFER protocol instead.
+const MAX_LINE_LENGTH: usize = 2 * 1024 * 1024;
 
 use tokio::io;
 use tokio::sync::mpsc;
@@ -20,12 +25,81 @@ use std::path::PathBuf;
 use std::process::exit;
 
 use base64::{engine::general_purpose, Engine as _};
-use crossclip::{Clipboard, SystemClipboard};
+
+use std::path::Path;
+use std::sync::Mutex;
 
 use lazy_static::lazy_static;
 
 lazy_static! {
-    static ref CLIPBOARD: SystemClipboard = get_current_clipboard();
+    static ref CLIPBOARD: Mutex<arboard::Clipboard> = Mutex::new(get_current_clipboard());
+    /// Tracks the last clipboard content we applied from the network (for echo suppression)
+    static ref LAST_APPLIED_CLIP: Mutex<String> = Mutex::new(String::new());
+}
+
+/// Helper trait to get string contents from the global clipboard
+trait ClipboardExt {
+    fn get_string_contents(&self) -> Result<String, String>;
+}
+
+impl ClipboardExt for Mutex<arboard::Clipboard> {
+    fn get_string_contents(&self) -> Result<String, String> {
+        let mut clipboard = self.lock().map_err(|e| format!("clipboard lock: {e}"))?;
+        clipboard.get_text().map_err(|e| e.to_string())
+    }
+}
+
+/// Threshold for triggering FILE_OFFER instead of CLIP (64 KB)
+const FILE_OFFER_THRESHOLD: u64 = 64 * 1024;
+
+/// Check if a string looks like a file path and return file info if it exists.
+/// Works cross-platform (Linux, macOS, Windows).
+/// Returns Some((path, size, is_file)) if valid file, None otherwise.
+fn detect_file_path(content: &str) -> Option<(std::path::PathBuf, u64, bool)> {
+    let trimmed = content.trim();
+
+    // Skip empty or very long strings (unlikely to be file paths)
+    if trimmed.is_empty() || trimmed.len() > 4096 {
+        return None;
+    }
+
+    // Skip if content has multiple lines (likely text, not a path)
+    if trimmed.lines().count() > 1 {
+        return None;
+    }
+
+    // Handle file:// URLs (common on macOS/Linux when copying files)
+    let path_str = if let Some(stripped) = trimmed.strip_prefix("file://") {
+        // URL decode common sequences
+        stripped
+            .replace("%20", " ")
+            .replace("%23", "#")
+            .replace("%25", "%")
+    } else {
+        trimmed.to_string()
+    };
+
+    let path = Path::new(&path_str);
+
+    // Check if it looks like an absolute path
+    // - Unix: starts with /
+    // - Windows: starts with drive letter (C:\) or UNC path (\\)
+    let looks_like_path = path.is_absolute()
+        || (cfg!(windows) && path_str.len() >= 3 && path_str.chars().nth(1) == Some(':'));
+
+    if !looks_like_path {
+        return None;
+    }
+
+    // Check if the file actually exists
+    match std::fs::metadata(path) {
+        Ok(metadata) => {
+            let size = metadata.len();
+            let is_file = metadata.is_file();
+            Some((path.to_path_buf(), size, is_file))
+        }
+        Err(_) => None,
+    }
 }
 
 const BANNER: &str = r#"
@@ -160,10 +234,50 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 }
             }
         };
+        let mut previous_files: Option<Vec<std::path::PathBuf>> = None;
         let mut interval = time::interval(Duration::from_secs(2));
         let mut warned = false;
         loop {
             interval.tick().await;
+
+            // First, check for native file clipboard (Finder/Explorer copy)
+            if let Some(files) = clipboard_files::get_clipboard_files() {
+                // Check if files changed
+                let files_changed = previous_files.as_ref() != Some(&files);
+                if files_changed {
+                    for path in &files {
+                        if let Ok(metadata) = std::fs::metadata(path) {
+                            if metadata.is_file() {
+                                let size = metadata.len();
+                                if size > FILE_OFFER_THRESHOLD {
+                                    if verbose_for_clipboard {
+                                        eprintln!(
+                                            "file copied (native): {} ({} bytes) - FILE_OFFER not yet implemented",
+                                            path.display(),
+                                            size
+                                        );
+                                    }
+                                } else if verbose_for_clipboard {
+                                    eprintln!(
+                                        "file copied (native): {} ({} bytes) - small enough for CLIP",
+                                        path.display(),
+                                        size
+                                    );
+                                }
+                            } else if verbose_for_clipboard {
+                                eprintln!(
+                                    "directory copied (native): {} - skipping",
+                                    path.display()
+                                );
+                            }
+                        }
+                    }
+                    previous_files = Some(files);
+                    // Don't update previous_content - native file copy doesn't change text clipboard
+                    continue;
+                }
+            }
+
             let current_content = match CLIPBOARD.get_string_contents() {
                 Ok(s) => {
                     warned = false;
@@ -187,6 +301,51 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 }
             };
             if current_content != previous_content {
+                // Clear file tracking when text content changes
+                previous_files = None;
+
+                // Skip empty content
+                if current_content.is_empty() {
+                    previous_content = current_content;
+                    continue;
+                }
+
+                // Echo suppression: skip if this is content we just applied from the network
+                if let Ok(last) = LAST_APPLIED_CLIP.lock() {
+                    if *last == current_content {
+                        // This is an echo of what we just received - don't send it back
+                        previous_content = current_content;
+                        continue;
+                    }
+                }
+
+                // Check if clipboard contains a file path
+                if let Some((path, size, is_file)) = detect_file_path(&current_content) {
+                    if is_file {
+                        if size > FILE_OFFER_THRESHOLD {
+                            // TODO: Implement FILE_OFFER protocol for large files
+                            if verbose_for_clipboard {
+                                eprintln!(
+                                    "file detected: {} ({} bytes) - FILE_OFFER not yet implemented",
+                                    path.display(),
+                                    size
+                                );
+                            }
+                            // For now, still send the path as text
+                        } else if verbose_for_clipboard {
+                            eprintln!(
+                                "file detected: {} ({} bytes) - small enough for CLIP",
+                                path.display(),
+                                size
+                            );
+                        }
+                    } else if verbose_for_clipboard {
+                        eprintln!("directory detected: {} - skipping", path.display());
+                        previous_content = current_content;
+                        continue;
+                    }
+                }
+
                 let encoded = general_purpose::STANDARD.encode(&current_content);
                 if tx
                     .send(format!("CLIP {room_for_clipboard} {encoded}"))
@@ -268,7 +427,7 @@ async fn enroll(
         .await
         .map_err(|e| -> Box<dyn Error> { e })?;
 
-    let mut framed = Framed::new(tls_stream, LinesCodec::new());
+    let mut framed = Framed::new(tls_stream, LinesCodec::new_with_max_length(MAX_LINE_LENGTH));
 
     // Read the welcome message
     if let Some(Ok(line)) = framed.next().await {
@@ -299,8 +458,8 @@ async fn enroll(
     Err("Enrollment failed: no response from broker".into())
 }
 
-fn get_current_clipboard() -> SystemClipboard {
-    let Ok(clipboard) = SystemClipboard::new() else {
+fn get_current_clipboard() -> arboard::Clipboard {
+    let Ok(clipboard) = arboard::Clipboard::new() else {
         eprintln!("could not connect to clipboard");
         exit(100); // We exit here, as if this doesn't work, there is no use continue the client
     };
@@ -310,9 +469,22 @@ fn get_current_clipboard() -> SystemClipboard {
 fn replace_clipboard_content(content: &str) -> Result<(), Box<dyn std::error::Error>> {
     let decoded = general_purpose::STANDARD.decode(content)?;
     let decoded_string = String::from_utf8(decoded)?;
-    let current_content = CLIPBOARD.get_string_contents()?;
+    
+    // Skip empty content
+    if decoded_string.is_empty() {
+        return Ok(());
+    }
+    
+    let mut clipboard = CLIPBOARD
+        .lock()
+        .map_err(|e| format!("clipboard lock: {e}"))?;
+    let current_content = clipboard.get_text().unwrap_or_default();
     if current_content != decoded_string {
-        CLIPBOARD.set_string_contents(decoded_string)?;
+        // Track what we're applying for echo suppression
+        if let Ok(mut last) = LAST_APPLIED_CLIP.lock() {
+            *last = decoded_string.clone();
+        }
+        clipboard.set_text(decoded_string)?;
     }
     Ok(())
 }
@@ -345,8 +517,12 @@ mod tcp {
     ) -> Result<(), Box<dyn Error>> {
         let mut stream = TcpStream::connect(addr).await?;
         let (r, w) = stream.split();
-        let mut sink = FramedWrite::new(w, LinesCodec::new());
-        let mut stream = FramedRead::new(r, LinesCodec::new()).filter_map(|i| match i {
+        let mut sink = FramedWrite::new(w, LinesCodec::new_with_max_length(crate::MAX_LINE_LENGTH));
+        let mut stream = FramedRead::new(
+            r,
+            LinesCodec::new_with_max_length(crate::MAX_LINE_LENGTH),
+        )
+        .filter_map(|i| match i {
             Ok(message) => {
                 // Apply clipboard updates silently (avoid printing base64 payloads).
                 if let Some((room, clipboard_b64, id)) = crate::parse_clip_fields(&message) {
@@ -401,8 +577,12 @@ mod tls_transport {
             .map_err(|e| -> Box<dyn Error> { e })?;
 
         let (r, w) = tokio::io::split(tls_stream);
-        let mut sink = FramedWrite::new(w, LinesCodec::new());
-        let mut stream = FramedRead::new(r, LinesCodec::new()).filter_map(|i| match i {
+        let mut sink = FramedWrite::new(w, LinesCodec::new_with_max_length(crate::MAX_LINE_LENGTH));
+        let mut stream = FramedRead::new(
+            r,
+            LinesCodec::new_with_max_length(crate::MAX_LINE_LENGTH),
+        )
+        .filter_map(|i| match i {
             Ok(message) => {
                 // Apply clipboard updates silently (avoid printing base64 payloads).
                 if let Some((room, clipboard_b64, id)) = crate::parse_clip_fields(&message) {

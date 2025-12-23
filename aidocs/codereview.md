@@ -76,13 +76,15 @@ let current_content = match CLIPBOARD.get_string_contents() {
 
 ```rust
 lazy_static! {
-    static ref CLIPBOARD: SystemClipboard = get_current_clipboard();
+    static ref CLIPBOARD: Mutex<arboard::Clipboard> = Mutex::new(get_current_clipboard());
 }
 ```
 
-**Problem:** Global mutable state accessed from multiple async tasks (main task + clipboard watcher) without synchronization. `SystemClipboard` may not be `Send + Sync` safe on all platforms.
+**Problem:** Global mutable state accessed from multiple async tasks (main task + clipboard watcher) without synchronization. `arboard::Clipboard` may not be `Send + Sync` safe on all platforms.
 
-**Recommendation:** Consider wrapping in `Arc<Mutex<SystemClipboard>>` or passing clipboard handle explicitly. Alternatively, verify `crossclip::SystemClipboard` is thread-safe for your target platforms.
+**Recommendation:** Consider wrapping in `Arc<Mutex<arboard::Clipboard>>` or passing clipboard handle explicitly. Alternatively, verify `arboard` is thread-safe for your target platforms.
+
+**Note:** We use `arboard` crate for cross-platform clipboard access (macOS, Windows, Linux). The deprecated `crossclip` crate was removed due to Windows compatibility issues.
 
 ### 4. Outdated Module Documentation (Broker)
 **File:** [broker/src/main.rs](../broker/src/main.rs#L1-L25)  

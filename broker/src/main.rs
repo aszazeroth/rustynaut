@@ -17,6 +17,10 @@
 
 mod tls;
 
+/// Maximum line length for the wire protocol (2MB to handle large base64 clipboard payloads)
+/// For files larger than ~1.5MB raw, use the sideband FILE_OFFER protocol instead.
+const MAX_LINE_LENGTH: usize = 2 * 1024 * 1024;
+
 use tokio::io::{self, AsyncBufReadExt, AsyncRead, AsyncWrite, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc, Mutex};
@@ -505,7 +509,7 @@ async fn process<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut lines = Framed::new(stream, LinesCodec::new());
+    let mut lines = Framed::new(stream, LinesCodec::new_with_max_length(MAX_LINE_LENGTH));
 
     // Protocol note:
     // - New clients should send: `USER <name>` then optionally `JOIN <room>`.

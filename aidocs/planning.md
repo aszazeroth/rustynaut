@@ -116,7 +116,9 @@ Broker → Sender:   FILE_SENT <transfer_id> <acceptor_count>
 - [ ] On completion, send `FILE_DONE` with checksum verification result
 
 #### Step 4: Client Integration
-- [ ] Detect large clipboard (>64KB threshold) → trigger `FILE_OFFER` instead of `CLIP`
+- [x] Detect large clipboard (>64KB threshold) → shows "FILE_OFFER not yet implemented"
+- [x] Detect native file copies from Finder/Explorer (cross-platform)
+- [ ] Trigger `FILE_OFFER` instead of `CLIP` for large files
 - [ ] Auto-accept files from same room (configurable)
 - [ ] Save received files to temp dir, optionally copy to clipboard as file reference
 - [ ] Show progress bar in verbose mode
@@ -515,6 +517,21 @@ Log SHA256 fingerprints at key moments for debugging:
 - [ ] Implement client echo suppression using `<id>`
 - [ ] Manual test: start broker, connect 1 client, run `/rooms` and `/who`
 - [ ] Manual test: 2 clients in same room sync; different rooms do not
+
+### Clipboard Architecture
+- [x] Cross-platform clipboard access using `arboard` crate (replaced `crossclip`)
+- [x] Native file detection for Finder (macOS), Explorer (Windows)
+- [x] Text-based file:// URL fallback for Linux file managers
+- [x] File size detection with 64KB threshold for FILE_OFFER
+- [x] Platform-specific clipboard file detection module (`clipboard_files.rs`)
+
+#### Platform Dependencies
+| Platform | Crate | Purpose |
+|----------|-------|---------|
+| All | `arboard` | Cross-platform text/image clipboard |
+| macOS | `objc2-app-kit`, `objc2-foundation` | NSPasteboard file URL detection |
+| Windows | `clipboard-win` | Explorer file list detection |
+| Linux | (none - text fallback) | Parses file:// URIs from text clipboard |
 
 ### TLS Implementation Status
 - [x] Add TLS dependencies to broker (tokio-rustls, rustls, rcgen, etc.)

@@ -60,10 +60,15 @@
 - Transport: TCP (`tcp` module) or TLS (`tls_transport` module).
 
 ## Cross-Cutting Conventions
+- **Cross-platform compatibility is mandatory**: All code must work on Linux, macOS, and Windows. Test or verify changes work across all three platforms before merging.
 - All async work uses Tokio `full` feature set; prefer `tokio::select!` for fan-in, `tokio_stream` for stream adapters, and `tokio_util::codec` for line framing.
 - No shared library crate: duplicate helpers only if semantics differ per binary. Otherwise, consider extracting modules within each crate.
 - System/command messages always use human-readable prefix plus machine-parsable segment; update both broker + client when changing formats.
 - Tests are currently manual (run broker + multiple clients). When adding automated tests, use `tokio::test` and mock transports; avoid blocking on stdin/stdout.
-- **AVOID OS commands and binaries** (e.g., `ifconfig`, `ip`, `netstat`, shell commands via `std::process::Command`). These break cross-platform compatibility. Use pure Rust crates instead (e.g., `if-addrs` for network interfaces, `dirs` for config paths).
+- **AVOID OS commands and binaries** (e.g., `ifconfig`, `ip`, `netstat`, shell commands via `std::process::Command`). These break cross-platform compatibility. Use pure Rust crates instead:
+  - `if-addrs` for network interface detection
+  - `dirs` for platform-appropriate config/data paths
+  - `std::env::consts::OS` for OS detection when absolutely needed
+  - Prefer crates with explicit Windows/macOS/Linux support in their documentation
 
 Please let me know if any section feels incomplete or if additional workflows should be documented.
