@@ -307,7 +307,8 @@ fn detect_local_ips() -> Vec<String> {
 
 /// Extract hostnames/IPs from the bind address for certificate SANs
 fn extract_server_names(addr: &str) -> Vec<String> {
-    let mut names = vec!["localhost".to_string()];
+    // Always include rustynaut.local as a stable DNS name for cross-network connections
+    let mut names = vec!["rustynaut.local".to_string(), "localhost".to_string()];
 
     // Parse the address to extract host part
     if let Some(host) = addr.split(':').next() {

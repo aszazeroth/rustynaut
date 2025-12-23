@@ -185,18 +185,18 @@ pub fn init_tls_with_client_cert(
     Ok(TlsClientConfig { connector })
 }
 
+/// The fixed hostname used for TLS verification (matches broker certificate SAN)
+pub const TLS_SERVER_NAME: &str = "rustynaut.local";
+
 /// Connect with TLS
 pub async fn connect_tls(
     connector: &TlsConnector,
     stream: TcpStream,
-    server_name: &str,
+    _server_addr: &str,
 ) -> Result<TlsStream<TcpStream>, Box<dyn std::error::Error + Send + Sync>> {
-    // Parse server name - for IP addresses, we need special handling
-    let server_name = if let Ok(ip) = server_name.parse::<std::net::IpAddr>() {
-        ServerName::IpAddress(ip.into())
-    } else {
-        ServerName::try_from(server_name.to_string())?
-    };
+    // Always use rustynaut.local for SNI verification - this is a fixed DNS name
+    // included in all broker certificates, allowing connections from any IP
+    let server_name = ServerName::try_from(TLS_SERVER_NAME.to_string())?;
 
     let tls_stream = connector.connect(server_name, stream).await?;
     Ok(tls_stream)
