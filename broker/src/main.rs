@@ -28,7 +28,7 @@ use tokio_stream::StreamExt;
 use tokio_util::codec::{Framed, LinesCodec};
 
 use futures::SinkExt;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::error::Error;
 use std::net::SocketAddr;
@@ -344,6 +344,9 @@ type Tx = mpsc::UnboundedSender<String>;
 /// Shorthand for the receive half of the message channel.
 type Rx = mpsc::UnboundedReceiver<String>;
 
+/// Maximum number of recent clip hashes to track per room for deduplication
+const MAX_RECENT_CLIPS_PER_ROOM: usize = 20;
+
 /// Data that is shared between all peers in the chat server.
 ///
 /// This is the set of `Tx` handles for all connected clients. Whenever a
@@ -353,6 +356,10 @@ type Rx = mpsc::UnboundedReceiver<String>;
 struct Shared {
     peers: HashMap<SocketAddr, PeerInfo>,
     next_clip_id: u64,
+    /// Recent clip content hashes per room for deduplication (room -> recent hashes)
+    recent_clips: HashMap<String, VecDeque<u64>>,
+    /// Recent file offer hashes per room for deduplication (room -> recent hashes)
+    recent_file_offers: HashMap<String, VecDeque<u64>>,
 }
 
 #[derive(Clone)]
@@ -387,7 +394,66 @@ impl Shared {
         Shared {
             peers: HashMap::new(),
             next_clip_id: 0,
+            recent_clips: HashMap::new(),
+            recent_file_offers: HashMap::new(),
         }
+    }
+
+    /// Check if a clip is a duplicate and track it if not.
+    /// Returns true if the clip is a duplicate (should be skipped).
+    fn is_duplicate_clip(&mut self, room: &str, content: &str) -> bool {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        // Compute a simple hash of the content
+        let mut hasher = DefaultHasher::new();
+        content.hash(&mut hasher);
+        let hash = hasher.finish();
+
+        // Get or create the recent clips queue for this room
+        let recent = self.recent_clips.entry(room.to_string()).or_default();
+
+        // Check if this hash is already in recent clips
+        if recent.contains(&hash) {
+            return true; // Duplicate
+        }
+
+        // Not a duplicate - add to recent clips
+        if recent.len() >= MAX_RECENT_CLIPS_PER_ROOM {
+            recent.pop_front();
+        }
+        recent.push_back(hash);
+
+        false // Not a duplicate
+    }
+
+    /// Check if a file offer is a duplicate and track it if not.
+    /// Returns true if the file offer is a duplicate (should be skipped).
+    fn is_duplicate_file_offer(&mut self, room: &str, filename_b64: &str, size: &str) -> bool {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        // Compute a hash of filename + size
+        let mut hasher = DefaultHasher::new();
+        filename_b64.hash(&mut hasher);
+        size.hash(&mut hasher);
+        let hash = hasher.finish();
+
+        // Get or create the recent file offers queue for this room
+        let recent = self.recent_file_offers.entry(room.to_string()).or_default();
+
+        // Check if this hash is already in recent file offers
+        if recent.contains(&hash) {
+            return true; // Duplicate
+        }
+
+        // Not a duplicate - add to recent file offers
+        if recent.len() >= MAX_RECENT_CLIPS_PER_ROOM {
+            recent.pop_front();
+        }
+        recent.push_back(hash);
+
+        false // Not a duplicate
     }
 
     /// Send a `LineCodec` encoded message to every peer, except
@@ -461,6 +527,16 @@ fn parse_clip(line: &str) -> Option<(&str, &str)> {
     let mut parts = line.splitn(4, ' ');
     match (parts.next()?, parts.next()?, parts.next()?) {
         ("CLIP", room, b64) => Some((room, b64)),
+        _ => None,
+    }
+}
+
+/// Parse FILE_OFFER command: FILE_OFFER <room> <filename_b64> <size>
+/// Returns (room, filename_b64, size)
+fn parse_file_offer(line: &str) -> Option<(&str, &str, &str)> {
+    let mut parts = line.splitn(4, ' ');
+    match (parts.next()?, parts.next()?, parts.next()?, parts.next()?) {
+        ("FILE_OFFER", room, filename_b64, size) => Some((room, filename_b64, size)),
         _ => None,
     }
 }
@@ -683,9 +759,33 @@ where
                     // CLIP <room> <b64>
                     if let Some((_wire_room, b64)) = parse_clip(&msg) {
                         let mut state = state.lock().await;
+
+                        // Check for duplicate clip (echo suppression)
+                        if state.is_duplicate_clip(&room, b64) {
+                            // Duplicate - skip broadcasting
+                            tracing::debug!("duplicate clip from {} in room {}, skipping", username, room);
+                            continue;
+                        }
+
                         state.next_clip_id += 1;
                         let id = state.next_clip_id;
                         let out = format!("CLIP {room} {b64} {id}");
+                        state.broadcast_to_room(addr, &room, &out).await;
+                        continue;
+                    }
+
+                    // FILE_OFFER <room> <filename_b64> <size>
+                    if let Some((_wire_room, filename_b64, size)) = parse_file_offer(&msg) {
+                        let mut state = state.lock().await;
+
+                        // Check for duplicate file offer (echo suppression)
+                        if state.is_duplicate_file_offer(&room, filename_b64, size) {
+                            tracing::debug!("duplicate file offer from {} in room {}, skipping", username, room);
+                            continue;
+                        }
+
+                        // Relay file offer to room members with sender's username
+                        let out = format!("FILE_OFFER {room} {username} {filename_b64} {size}");
                         state.broadcast_to_room(addr, &room, &out).await;
                         continue;
                     }

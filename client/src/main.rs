@@ -33,9 +33,13 @@ use lazy_static::lazy_static;
 
 lazy_static! {
     static ref CLIPBOARD: Mutex<arboard::Clipboard> = Mutex::new(get_current_clipboard());
-    /// Tracks the last clipboard content we applied from the network (for echo suppression)
-    static ref LAST_APPLIED_CLIP: Mutex<String> = Mutex::new(String::new());
+    /// Tracks recently applied clipboard content from the network (for echo suppression)
+    /// We keep a few recent values since multiple clips can arrive in quick succession
+    static ref RECENT_APPLIED_CLIPS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 }
+
+/// Maximum number of recent clips to track for echo suppression
+const MAX_RECENT_CLIPS: usize = 10;
 
 /// Helper trait to get string contents from the global clipboard
 trait ClipboardExt {
@@ -48,9 +52,6 @@ impl ClipboardExt for Mutex<arboard::Clipboard> {
         clipboard.get_text().map_err(|e| e.to_string())
     }
 }
-
-/// Threshold for triggering FILE_OFFER instead of CLIP (64 KB)
-const FILE_OFFER_THRESHOLD: u64 = 64 * 1024;
 
 /// Check if a string looks like a file path and return file info if it exists.
 /// Works cross-platform (Linux, macOS, Windows).
@@ -249,17 +250,25 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         if let Ok(metadata) = std::fs::metadata(path) {
                             if metadata.is_file() {
                                 let size = metadata.len();
-                                if size > FILE_OFFER_THRESHOLD {
-                                    if verbose_for_clipboard {
-                                        eprintln!(
-                                            "file copied (native): {} ({} bytes) - FILE_OFFER not yet implemented",
-                                            path.display(),
-                                            size
-                                        );
-                                    }
-                                } else if verbose_for_clipboard {
+                                // Get just the filename for the offer
+                                let filename = path
+                                    .file_name()
+                                    .and_then(|n| n.to_str())
+                                    .unwrap_or("unknown");
+                                let filename_b64 = general_purpose::STANDARD.encode(filename);
+
+                                // Send FILE_OFFER to broker
+                                let offer_msg = format!(
+                                    "FILE_OFFER {room_for_clipboard} {filename_b64} {size}"
+                                );
+                                if tx.send(offer_msg).await.is_err() {
+                                    eprintln!("Failed to send file offer");
+                                    break;
+                                }
+
+                                if verbose_for_clipboard {
                                     eprintln!(
-                                        "file copied (native): {} ({} bytes) - small enough for CLIP",
+                                        "file offer sent: {} ({} bytes)",
                                         path.display(),
                                         size
                                     );
@@ -273,7 +282,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         }
                     }
                     previous_files = Some(files);
-                    // Don't update previous_content - native file copy doesn't change text clipboard
+                    // Also update previous_content to prevent the file path from being sent as CLIP
+                    // (copying files often also puts the path in the text clipboard)
+                    if let Ok(text) = CLIPBOARD.get_string_contents() {
+                        previous_content = text;
+                    }
                     continue;
                 }
             }
@@ -310,35 +323,42 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     continue;
                 }
 
-                // Echo suppression: skip if this is content we just applied from the network
-                if let Ok(last) = LAST_APPLIED_CLIP.lock() {
-                    if *last == current_content {
-                        // This is an echo of what we just received - don't send it back
-                        previous_content = current_content;
-                        continue;
-                    }
+                // Echo suppression: skip if this is content we recently applied from the network
+                let is_echo = if let Ok(recent) = RECENT_APPLIED_CLIPS.lock() {
+                    recent.contains(&current_content)
+                } else {
+                    false
+                };
+
+                if is_echo {
+                    // This is an echo of what we received - don't send it back
+                    previous_content = current_content;
+                    continue;
                 }
 
                 // Check if clipboard contains a file path
                 if let Some((path, size, is_file)) = detect_file_path(&current_content) {
                     if is_file {
-                        if size > FILE_OFFER_THRESHOLD {
-                            // TODO: Implement FILE_OFFER protocol for large files
-                            if verbose_for_clipboard {
-                                eprintln!(
-                                    "file detected: {} ({} bytes) - FILE_OFFER not yet implemented",
-                                    path.display(),
-                                    size
-                                );
-                            }
-                            // For now, still send the path as text
-                        } else if verbose_for_clipboard {
-                            eprintln!(
-                                "file detected: {} ({} bytes) - small enough for CLIP",
-                                path.display(),
-                                size
-                            );
+                        // Send FILE_OFFER instead of CLIP for files
+                        let filename = path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("unknown");
+                        let filename_b64 = general_purpose::STANDARD.encode(filename);
+
+                        let offer_msg =
+                            format!("FILE_OFFER {room_for_clipboard} {filename_b64} {size}");
+                        if tx.send(offer_msg).await.is_err() {
+                            eprintln!("Failed to send file offer");
+                            break;
                         }
+
+                        if verbose_for_clipboard {
+                            eprintln!("file offer sent: {} ({} bytes)", path.display(), size);
+                        }
+
+                        previous_content = current_content;
+                        continue;
                     } else if verbose_for_clipboard {
                         eprintln!("directory detected: {} - skipping", path.display());
                         previous_content = current_content;
@@ -469,20 +489,24 @@ fn get_current_clipboard() -> arboard::Clipboard {
 fn replace_clipboard_content(content: &str) -> Result<(), Box<dyn std::error::Error>> {
     let decoded = general_purpose::STANDARD.decode(content)?;
     let decoded_string = String::from_utf8(decoded)?;
-    
+
     // Skip empty content
     if decoded_string.is_empty() {
         return Ok(());
     }
-    
+
     let mut clipboard = CLIPBOARD
         .lock()
         .map_err(|e| format!("clipboard lock: {e}"))?;
     let current_content = clipboard.get_text().unwrap_or_default();
     if current_content != decoded_string {
         // Track what we're applying for echo suppression
-        if let Ok(mut last) = LAST_APPLIED_CLIP.lock() {
-            *last = decoded_string.clone();
+        if let Ok(mut recent) = RECENT_APPLIED_CLIPS.lock() {
+            // Add to recent list, removing oldest if at capacity
+            if recent.len() >= MAX_RECENT_CLIPS {
+                recent.remove(0);
+            }
+            recent.push(decoded_string.clone());
         }
         clipboard.set_text(decoded_string)?;
     }
@@ -503,7 +527,42 @@ fn parse_clip_fields(line: &str) -> Option<(&str, &str, Option<&str>)> {
     }
 }
 
+/// Parse FILE_OFFER from broker: FILE_OFFER <room> <username> <filename_b64> <size>
+fn parse_file_offer_fields(line: &str) -> Option<(&str, &str, &str, &str)> {
+    let mut parts = line.splitn(5, ' ');
+    match (
+        parts.next()?,
+        parts.next()?,
+        parts.next()?,
+        parts.next()?,
+        parts.next()?,
+    ) {
+        ("FILE_OFFER", room, username, filename_b64, size) => {
+            Some((room, username, filename_b64, size))
+        }
+        _ => None,
+    }
+}
+
+/// Format a byte size for human-readable display
+fn format_size(size: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+
+    if size >= GB {
+        format!("{:.1} GB", size as f64 / GB as f64)
+    } else if size >= MB {
+        format!("{:.1} MB", size as f64 / MB as f64)
+    } else if size >= KB {
+        format!("{:.1} KB", size as f64 / KB as f64)
+    } else {
+        format!("{} bytes", size)
+    }
+}
+
 mod tcp {
+    use base64::Engine;
     use futures::{future, Sink, SinkExt, Stream, StreamExt};
     use std::{error::Error, net::SocketAddr};
     use tokio::net::TcpStream;
@@ -540,6 +599,25 @@ mod tcp {
                     return future::ready(None);
                 }
 
+                // Handle FILE_OFFER: display as a user-friendly message
+                if let Some((room, username, filename_b64, size_str)) =
+                    crate::parse_file_offer_fields(&message)
+                {
+                    // Decode filename from base64
+                    let filename = base64::engine::general_purpose::STANDARD
+                        .decode(filename_b64)
+                        .ok()
+                        .and_then(|bytes| String::from_utf8(bytes).ok())
+                        .unwrap_or_else(|| "<unknown>".to_string());
+                    let size: u64 = size_str.parse().unwrap_or(0);
+                    let size_display = crate::format_size(size);
+                    // Display the file offer to the user
+                    let display_msg = format!(
+                        "INFO [{room}] {username} offers file: {filename} ({size_display})"
+                    );
+                    return future::ready(Some(Ok(display_msg)));
+                }
+
                 future::ready(Some(Ok(message)))
             }
             Err(e) => {
@@ -556,6 +634,7 @@ mod tcp {
 }
 
 mod tls_transport {
+    use base64::Engine;
     use futures::{future, Sink, SinkExt, Stream, StreamExt};
     use std::{error::Error, net::SocketAddr};
     use tokio::net::TcpStream;
@@ -598,6 +677,25 @@ mod tls_transport {
                         );
                     }
                     return future::ready(None);
+                }
+
+                // Handle FILE_OFFER: display as a user-friendly message
+                if let Some((room, username, filename_b64, size_str)) =
+                    crate::parse_file_offer_fields(&message)
+                {
+                    // Decode filename from base64
+                    let filename = base64::engine::general_purpose::STANDARD
+                        .decode(filename_b64)
+                        .ok()
+                        .and_then(|bytes| String::from_utf8(bytes).ok())
+                        .unwrap_or_else(|| "<unknown>".to_string());
+                    let size: u64 = size_str.parse().unwrap_or(0);
+                    let size_display = crate::format_size(size);
+                    // Display the file offer to the user
+                    let display_msg = format!(
+                        "INFO [{room}] {username} offers file: {filename} ({size_display})"
+                    );
+                    return future::ready(Some(Ok(display_msg)));
                 }
 
                 future::ready(Some(Ok(message)))

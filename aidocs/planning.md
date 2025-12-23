@@ -54,6 +54,10 @@ Notes:
 - Track `last_applied_clip_id` per room (or globally for MVP).
 - When applying a remote clipboard update, do not re-trigger sending the same clipboard back.
   - Practical approach: store last applied decoded string (or hash) + last id.
+- **Broker-side deduplication (implemented):**
+  - Broker tracks recent clip content hashes per room (up to 20 entries)
+  - Duplicate clips are detected and not re-broadcast
+  - Prevents echo loops when multiple clients sync the same content
 
 ### 5) Observability + operability
 - Broker uses `tracing` (already present). Add spans around connection lifecycle + room changes.
@@ -100,10 +104,10 @@ Broker → Sender:   FILE_SENT <transfer_id> <acceptor_count>
 ### Implementation Roadmap
 
 #### Step 1: Protocol Messages (No Transfer Yet)
-- [ ] Add `FILE_OFFER` / `FILE_AVAIL` / `FILE_ACCEPT` parsing to broker
-- [ ] Add `FILE_CANCEL <transfer_id>` for cleanup
+- [x] Add `FILE_OFFER` / `FILE_AVAIL` parsing to broker
+- [x] Broadcast `FILE_OFFER` to room (excluding sender) with username attached
+- [ ] Add `FILE_ACCEPT` and `FILE_CANCEL <transfer_id>` parsing
 - [ ] Track pending transfers in broker state: `HashMap<TransferId, FileTransfer>`
-- [ ] Broadcast `FILE_AVAIL` to room (excluding sender)
 
 #### Step 2: Sideband Listener on Broker
 - [ ] On `FILE_ACCEPT`, broker opens ephemeral TCP port (or reuses a pool)
@@ -116,9 +120,11 @@ Broker → Sender:   FILE_SENT <transfer_id> <acceptor_count>
 - [ ] On completion, send `FILE_DONE` with checksum verification result
 
 #### Step 4: Client Integration
-- [x] Detect large clipboard (>64KB threshold) → shows "FILE_OFFER not yet implemented"
+- [x] Detect large clipboard (>64KB threshold)
 - [x] Detect native file copies from Finder/Explorer (cross-platform)
-- [ ] Trigger `FILE_OFFER` instead of `CLIP` for large files
+- [x] Send `FILE_OFFER` for copied files to broker
+- [x] Display received `FILE_OFFER` as user-friendly message with human-readable size
+- [ ] Implement FILE_ACCEPT to request file transfer
 - [ ] Auto-accept files from same room (configurable)
 - [ ] Save received files to temp dir, optionally copy to clipboard as file reference
 - [ ] Show progress bar in verbose mode
@@ -512,11 +518,19 @@ Log SHA256 fingerprints at key moments for debugging:
 - [x] Remove UDP from client and CLI parsing
 - [x] Use `LinesCodec` on client TCP
 - [x] Define and implement protocol messages (USER/JOIN/CLIP/CMD + INFO/ERR/CLIP)
-- [ ] Implement broker rooms and room-scoped broadcasts
+- [x] Implement broker rooms and room-scoped broadcasts
 - [~] Implement broker slash commands (/help, /rooms, /who done; /join via JOIN line)
-- [ ] Implement client echo suppression using `<id>`
+- [x] Implement broker-side echo suppression using content hash deduplication
+- [x] Client-side echo suppression (recent applied clips tracking)
 - [ ] Manual test: start broker, connect 1 client, run `/rooms` and `/who`
 - [ ] Manual test: 2 clients in same room sync; different rooms do not
+
+### FILE_OFFER Protocol
+- [x] Broker parses and relays FILE_OFFER with username to room
+- [x] Client sends FILE_OFFER when file is copied (via Finder/Explorer)
+- [x] Client displays received FILE_OFFER with filename and human-readable size
+- [ ] Implement sideband binary transfer (FILE_ACCEPT, FILE_START, etc.)
+- [ ] Implement file reception and saving
 
 ### Clipboard Architecture
 - [x] Cross-platform clipboard access using `arboard` crate (replaced `crossclip`)
