@@ -69,65 +69,119 @@ Notes:
 - Plan for an `AUTH <token>` message in the future (no enforcement in MVP).
 ---
 
-## Large Clipboard / File Transfer (Sideband Channel)
+## Large Clipboard / File Transfer (Inline Binary Framing)
 
 ### Problem Statement
 - Current `CLIP` protocol uses base64 over line-framed TCP (~8KB default limit)
 - Real-world use cases: screenshots (PNG, 100KB–5MB), config files, logs
 - Base64 adds 33% overhead; large payloads block the message stream
 
-### Chosen Approach: Broker-Mediated Sideband Transfer
+### Chosen Approach: Inline Binary Framing (Option B)
 
-The broker acts as a relay for file transfers (no P2P), avoiding NAT/firewall issues since clients already have a connection to the broker.
+**Decision (2026-01-26):** Use inline binary framing over the existing connection rather than 
+opening separate sideband ports. This reuses our existing single-port architecture and is 
+firewall-friendly.
+
+**Key insight:** FILE_CHUNK uses a line header followed by raw bytes - similar to HTTP chunked 
+transfer encoding. The receiver reads the header line, then reads exactly `len` raw bytes.
+
+The broker acts as a relay for file transfers (no P2P), avoiding NAT/firewall issues since 
+clients already have a connection to the broker.
 
 ### Wire Protocol Extension
 
 **Phase 1: Offer & Accept**
 ```
-Client → Broker:  FILE_OFFER <room> <filename> <size_bytes> <sha256>
-Broker → Room:    FILE_AVAIL <from_user> <transfer_id> <filename> <size_bytes> <sha256>
-Client → Broker:  FILE_ACCEPT <transfer_id>
-Broker → Sender:  FILE_START <transfer_id> <port>
+# Sender announces file (already implemented)
+Client → Broker:  FILE_OFFER <room> <filename_b64> <size_bytes>
+Broker → Room:    FILE_OFFER <room> <username> <filename_b64> <size_bytes>
+
+# Receiver accepts (triggers transfer)
+Client → Broker:  FILE_ACCEPT <room> <username> <filename_b64>
+Broker → Sender:  FILE_START <transfer_id> <filename_b64> <acceptor_count>
+Broker → Receiver: FILE_INCOMING <transfer_id> <filename_b64> <size_bytes>
 ```
 
-**Phase 2: Binary Transfer (separate TCP connection)**
-- Sender connects to `broker:<port>` and streams raw bytes
-- Broker relays to all acceptors in real-time (or buffers if acceptor is slow)
-- Broker closes connection when `size_bytes` received
+**Phase 2: Binary Transfer (base64 encoded chunks over line protocol)**
+```
+# Sender streams chunks as base64 over normal line protocol
+Sender → Broker:  FILE_CHUNK <transfer_id> <offset> <chunk_b64>
+Broker → Acceptors: FILE_CHUNK <transfer_id> <offset> <chunk_b64>
+```
 
 **Phase 3: Completion**
 ```
-Broker → Acceptor: FILE_DONE <transfer_id> <sha256_verified: true|false>
-Broker → Sender:   FILE_SENT <transfer_id> <acceptor_count>
+Sender → Broker:    FILE_END <transfer_id> <sha256>
+Broker → Acceptors: FILE_DONE <transfer_id> <sha256>
+Broker → Sender:    FILE_SENT <transfer_id> <acceptor_count>
 ```
 
-### Implementation Roadmap
+**Cancellation:**
+```
+Client → Broker:  FILE_CANCEL <transfer_id>
+Broker → All:     FILE_CANCELLED <transfer_id> <reason>
+```
 
-#### Step 1: Protocol Messages (No Transfer Yet)
-- [x] Add `FILE_OFFER` / `FILE_AVAIL` parsing to broker
-- [x] Broadcast `FILE_OFFER` to room (excluding sender) with username attached
-- [ ] Add `FILE_ACCEPT` and `FILE_CANCEL <transfer_id>` parsing
-- [ ] Track pending transfers in broker state: `HashMap<TransferId, FileTransfer>`
+### Chunk Size & Encoding
+- **Chunk size:** 64KB raw → ~85KB base64 encoded
+- **Encoding:** Standard base64, fits within 2MB MAX_LINE_LENGTH
+- **Checksum:** SHA256 computed during file read, hex encoded
 
-#### Step 2: Sideband Listener on Broker
-- [ ] On `FILE_ACCEPT`, broker opens ephemeral TCP port (or reuses a pool)
-- [ ] Send `FILE_START <transfer_id> <port>` to sender
-- [ ] Sender connects and streams; broker validates size + computes SHA256
+### Implementation Status
 
-#### Step 3: Relay to Acceptors
-- [ ] Broker pushes bytes to each acceptor's sideband connection
-- [ ] Handle backpressure (slow acceptor shouldn't block others)
-- [ ] On completion, send `FILE_DONE` with checksum verification result
+#### Step 1: Transfer State Tracking (Broker) ✅
+- [x] Add `FileTransfer` struct with transfer_id, sender, acceptors, state, progress
+- [x] Add `HashMap<TransferId, FileTransfer>` to `Shared` state
+- [x] Add transfer ID generation (incrementing u64, like clip_id)
+- [x] Add `PendingOffer` struct to track offers before acceptance
 
-#### Step 4: Client Integration
+#### Step 2: FILE_ACCEPT & FILE_START (Broker) ✅
+- [x] Parse `FILE_ACCEPT <room> <username> <filename_b64>` command
+- [x] Match accept to pending offer, create FileTransfer entry
+- [x] Send `FILE_START` to sender with transfer_id
+- [x] Send `FILE_INCOMING` to acceptor(s)
+- [x] Handle `/accept <user> <filename>` command (broker-side)
+- [x] Handle `/cancel <transfer_id>` command
+
+#### Step 3: FILE_CHUNK Handling (Broker) ✅
+- [x] Parse `FILE_CHUNK <transfer_id> <offset> <chunk_b64>`
+- [x] Relay chunk to all acceptors
+- [x] Track transfer state (Transferring)
+
+#### Step 4: FILE_END & Completion (Broker) ✅
+- [x] Parse `FILE_END <transfer_id> <sha256>`
+- [x] Send `FILE_DONE` to acceptors with checksum
+- [x] Send `FILE_SENT` to sender with acceptor count
+- [x] Clean up transfer state
+
+#### Step 5: Client Send Path ✅
+- [x] On FILE_START received, spawn task to send chunks
+- [x] Read file in 64KB chunks, base64 encode, send FILE_CHUNK for each
+- [x] Compute SHA256 while reading (hex encoded)
+- [x] Send FILE_END with checksum
+- [x] FILE_TX channel for sending from async context
+
+#### Step 6: Client Receive Path ✅
+- [x] Parse FILE_INCOMING, FILE_CHUNK, FILE_DONE, FILE_SENT, FILE_CANCELLED
+- [x] Display human-readable messages for all file transfer events
+- [x] On FILE_INCOMING, prepare temp file for writing
+- [x] Handle FILE_CHUNK: decode base64, write to temp file
+- [x] On FILE_DONE, move temp file to downloads folder (with conflict resolution)
+- [x] Files saved to user's Downloads directory
+
+#### Step 7: User Commands ✅
+- [x] `/accept <user> <filename>` - manually accept a file offer (via broker CMD)
+- [x] `/cancel <transfer_id>` - cancel in-progress transfer (via broker CMD)
+- [ ] Auto-accept option (configurable)
+
+### Existing Progress (FILE_OFFER Notification)
 - [x] Detect large clipboard (>64KB threshold)
 - [x] Detect native file copies from Finder/Explorer (cross-platform)
 - [x] Send `FILE_OFFER` for copied files to broker
 - [x] Display received `FILE_OFFER` as user-friendly message with human-readable size
-- [ ] Implement FILE_ACCEPT to request file transfer
-- [ ] Auto-accept files from same room (configurable)
-- [ ] Save received files to temp dir, optionally copy to clipboard as file reference
-- [ ] Show progress bar in verbose mode
+- [x] Broker parses and relays FILE_OFFER with username
+- [x] Broker-side FILE_OFFER deduplication
+- [x] Broker registers offers for later acceptance
 
 #### Step 5: Robustness
 - [ ] Transfer timeout (configurable, default 60s)
@@ -519,25 +573,30 @@ Log SHA256 fingerprints at key moments for debugging:
 - [x] Use `LinesCodec` on client TCP
 - [x] Define and implement protocol messages (USER/JOIN/CLIP/CMD + INFO/ERR/CLIP)
 - [x] Implement broker rooms and room-scoped broadcasts
-- [~] Implement broker slash commands (/help, /rooms, /who done; /join via JOIN line)
+- [x] Implement broker slash commands (/help, /rooms, /who, /status, /quit)
 - [x] Implement broker-side echo suppression using content hash deduplication
 - [x] Client-side echo suppression (recent applied clips tracking)
-- [ ] Manual test: start broker, connect 1 client, run `/rooms` and `/who`
-- [ ] Manual test: 2 clients in same room sync; different rooms do not
+- [x] Manual test: full clipboard sync between 3 clients (macOS, Windows, Linux)
 
-### FILE_OFFER Protocol
-- [x] Broker parses and relays FILE_OFFER with username to room
-- [x] Client sends FILE_OFFER when file is copied (via Finder/Explorer)
-- [x] Client displays received FILE_OFFER with filename and human-readable size
-- [ ] Implement sideband binary transfer (FILE_ACCEPT, FILE_START, etc.)
-- [ ] Implement file reception and saving
+### FILE_OFFER Protocol (Notification Phase - Complete)
+- [x] Broker parses FILE_OFFER from client: `FILE_OFFER <room> <filename_b64> <size>`
+- [x] Broker relays to room with username: `FILE_OFFER <room> <username> <filename_b64> <size>`
+- [x] Broker-side FILE_OFFER deduplication (prevents echo loops)
+- [x] Client sends FILE_OFFER for native file copies (Finder/Explorer)
+- [x] Client sends FILE_OFFER for text-detected file paths (Linux file:// URLs)
+- [x] Client displays received FILE_OFFER with human-readable size
+- [ ] **Next Phase: Binary Transfer**
+  - [ ] FILE_ACCEPT command and handling
+  - [ ] Sideband TCP connection for file data
+  - [ ] Progress indication and completion notification
 
 ### Clipboard Architecture
-- [x] Cross-platform clipboard access using `arboard` crate (replaced `crossclip`)
-- [x] Native file detection for Finder (macOS), Explorer (Windows)
-- [x] Text-based file:// URL fallback for Linux file managers
-- [x] File size detection with 64KB threshold for FILE_OFFER
+- [x] Cross-platform clipboard access using `arboard` crate
+- [x] Native file detection for Finder (macOS) via NSPasteboard/NSURL
+- [x] Native file detection for Explorer (Windows) via clipboard-win
+- [x] Text-based file:// URL detection for Linux file managers
 - [x] Platform-specific clipboard file detection module (`clipboard_files.rs`)
+- [x] Sync text clipboard content when files detected (prevents path leaking as CLIP)
 
 #### Platform Dependencies
 | Platform | Crate | Purpose |
@@ -548,7 +607,7 @@ Log SHA256 fingerprints at key moments for debugging:
 | Linux | (none - text fallback) | Parses file:// URIs from text clipboard |
 
 ### TLS Implementation Status
-- [x] Add TLS dependencies to broker (tokio-rustls, rustls, rcgen, etc.)
+- [x] Add TLS dependencies to broker (tokio-rustls with ring, rcgen, etc.)
 - [x] Add TLS dependencies to client
 - [x] Create broker tls.rs module (CA/cert generation, TLS acceptor)
 - [x] Create client tls.rs module (cert storage, enrollment handling)
@@ -571,3 +630,9 @@ Log SHA256 fingerprints at key moments for debugging:
 - [ ] Set proper file permissions (0600) on private keys
 - [ ] Rate limiting for enrollment attempts
 - [ ] Enrollment audit logging
+
+### Broker Operability
+- [x] Graceful shutdown via /quit, /shutdown, /exit commands
+- [x] Ctrl+C signal handling with client notification
+- [x] /status command showing connected clients and rooms
+- [x] Tracing integration with configurable verbosity (--verbose)

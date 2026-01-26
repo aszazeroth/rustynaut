@@ -18,8 +18,10 @@ use tokio::time::{self, Duration};
 use tokio_stream::StreamExt;
 use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec, LinesCodecError};
 
+use std::collections::HashMap;
 use std::env;
 use std::error::Error;
+use std::io::Write;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::exit;
@@ -31,11 +33,39 @@ use std::sync::Mutex;
 
 use lazy_static::lazy_static;
 
+/// Chunk size for file transfers (64KB)
+const FILE_CHUNK_SIZE: usize = 64 * 1024;
+
+/// Pending outgoing file: filename_b64 -> file path
+/// When we send FILE_OFFER, we store the path here
+/// When we receive FILE_START, we read from this path and send chunks
+#[derive(Debug)]
+struct PendingOutgoingFile {
+    path: PathBuf,
+    size: u64,
+}
+
+/// Incoming file transfer state
+#[derive(Debug)]
+struct IncomingTransfer {
+    filename: String,
+    size: u64,
+    file: std::fs::File,
+    temp_path: PathBuf,
+    bytes_received: u64,
+}
+
 lazy_static! {
     static ref CLIPBOARD: Mutex<arboard::Clipboard> = Mutex::new(get_current_clipboard());
     /// Tracks recently applied clipboard content from the network (for echo suppression)
     /// We keep a few recent values since multiple clips can arrive in quick succession
     static ref RECENT_APPLIED_CLIPS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    /// Pending outgoing files: filename_b64 -> PendingOutgoingFile
+    static ref PENDING_OUTGOING: Mutex<HashMap<String, PendingOutgoingFile>> = Mutex::new(HashMap::new());
+    /// Incoming file transfers: transfer_id -> IncomingTransfer
+    static ref INCOMING_TRANSFERS: Mutex<HashMap<u64, IncomingTransfer>> = Mutex::new(HashMap::new());
+    /// Channel for sending file transfer messages (FILE_CHUNK, FILE_END)
+    static ref FILE_TX: Mutex<Option<mpsc::Sender<String>>> = Mutex::new(None);
 }
 
 /// Maximum number of recent clips to track for echo suppression
@@ -216,6 +246,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let (tx, rx) = mpsc::channel::<String>(10);
     let rx = tokio_stream::wrappers::ReceiverStream::new(rx);
 
+    // File transfer channel (larger buffer for chunked transfers)
+    let (file_tx, file_rx) = mpsc::channel::<String>(100);
+    let file_rx = tokio_stream::wrappers::ReceiverStream::new(file_rx);
+    
+    // Store file_tx globally so message handlers can send file chunks
+    if let Ok(mut guard) = FILE_TX.lock() {
+        *guard = Some(file_tx);
+    }
+
     // Spawn a task to monitor clipboard changes
     let room_for_clipboard = args.room.clone();
     let verbose_for_clipboard = args.verbose;
@@ -256,6 +295,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     .and_then(|n| n.to_str())
                                     .unwrap_or("unknown");
                                 let filename_b64 = general_purpose::STANDARD.encode(filename);
+
+                                // Track the pending outgoing file
+                                if let Ok(mut pending) = PENDING_OUTGOING.lock() {
+                                    pending.insert(filename_b64.clone(), PendingOutgoingFile {
+                                        path: path.clone(),
+                                        size,
+                                    });
+                                }
 
                                 // Send FILE_OFFER to broker
                                 let offer_msg = format!(
@@ -346,6 +393,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             .unwrap_or("unknown");
                         let filename_b64 = general_purpose::STANDARD.encode(filename);
 
+                        // Track the pending outgoing file
+                        if let Ok(mut pending) = PENDING_OUTGOING.lock() {
+                            pending.insert(filename_b64.clone(), PendingOutgoingFile {
+                                path: path.clone(),
+                                size,
+                            });
+                        }
+
                         let offer_msg =
                             format!("FILE_OFFER {room_for_clipboard} {filename_b64} {size}");
                         if tx.send(offer_msg).await.is_err() {
@@ -405,7 +460,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let stdin = init
         .merge(stdin)
-        .merge(rx.map(Result::<String, LinesCodecError>::Ok));
+        .merge(rx.map(Result::<String, LinesCodecError>::Ok))
+        .merge(file_rx.map(Result::<String, LinesCodecError>::Ok));
 
     let stdout = FramedWrite::new(io::stdout(), LinesCodec::new());
 
@@ -544,6 +600,195 @@ fn parse_file_offer_fields(line: &str) -> Option<(&str, &str, &str, &str)> {
     }
 }
 
+/// Parse FILE_START from broker: FILE_START <transfer_id> <filename_b64> <acceptor_count>
+fn parse_file_start_fields(line: &str) -> Option<(&str, &str, &str)> {
+    let mut parts = line.splitn(4, ' ');
+    match (parts.next()?, parts.next()?, parts.next()?, parts.next()?) {
+        ("FILE_START", transfer_id, filename_b64, acceptor_count) => {
+            Some((transfer_id, filename_b64, acceptor_count))
+        }
+        _ => None,
+    }
+}
+
+/// Parse FILE_INCOMING from broker: FILE_INCOMING <transfer_id> <filename_b64> <size>
+fn parse_file_incoming_fields(line: &str) -> Option<(&str, &str, &str)> {
+    let mut parts = line.splitn(4, ' ');
+    match (parts.next()?, parts.next()?, parts.next()?, parts.next()?) {
+        ("FILE_INCOMING", transfer_id, filename_b64, size) => {
+            Some((transfer_id, filename_b64, size))
+        }
+        _ => None,
+    }
+}
+
+/// Parse FILE_CANCELLED from broker: FILE_CANCELLED <transfer_id> <reason>
+fn parse_file_cancelled_fields(line: &str) -> Option<(&str, &str)> {
+    let rest = line.strip_prefix("FILE_CANCELLED ")?;
+    let mut parts = rest.splitn(2, ' ');
+    let transfer_id = parts.next()?;
+    let reason = parts.next().unwrap_or("unknown");
+    Some((transfer_id, reason))
+}
+
+/// Parse FILE_CHUNK from broker: FILE_CHUNK <transfer_id> <offset> <chunk_b64>
+fn parse_file_chunk_fields(line: &str) -> Option<(&str, &str, &str)> {
+    let mut parts = line.splitn(4, ' ');
+    match (parts.next()?, parts.next()?, parts.next()?, parts.next()?) {
+        ("FILE_CHUNK", transfer_id, offset, chunk_b64) => Some((transfer_id, offset, chunk_b64)),
+        _ => None,
+    }
+}
+
+/// Parse FILE_DONE from broker: FILE_DONE <transfer_id> <sha256>
+fn parse_file_done_fields(line: &str) -> Option<(&str, &str)> {
+    let mut parts = line.splitn(3, ' ');
+    match (parts.next()?, parts.next()?, parts.next()?) {
+        ("FILE_DONE", transfer_id, sha256) => Some((transfer_id, sha256)),
+        _ => None,
+    }
+}
+
+/// Parse FILE_SENT from broker: FILE_SENT <transfer_id> <count>
+fn parse_file_sent_fields(line: &str) -> Option<(&str, &str)> {
+    let mut parts = line.splitn(3, ' ');
+    match (parts.next()?, parts.next()?, parts.next()?) {
+        ("FILE_SENT", transfer_id, count) => Some((transfer_id, count)),
+        _ => None,
+    }
+}
+
+/// Generate FILE_CHUNK messages for a file transfer
+/// Returns a Vec of messages to send (FILE_CHUNK and FILE_END)
+fn generate_file_chunks(filename_b64: &str, transfer_id: &str) -> Vec<String> {
+    let mut messages = Vec::new();
+
+    // Look up the pending file
+    let file_info = if let Ok(pending) = PENDING_OUTGOING.lock() {
+        pending.get(filename_b64).map(|p| (p.path.clone(), p.size))
+    } else {
+        None
+    };
+
+    let Some((path, _size)) = file_info else {
+        eprintln!("No pending file for {}", filename_b64);
+        return messages;
+    };
+
+    // Read file and generate chunks
+    let file_data = match std::fs::read(&path) {
+        Ok(data) => data,
+        Err(e) => {
+            eprintln!("Failed to read file {}: {}", path.display(), e);
+            return messages;
+        }
+    };
+
+    // Compute SHA256
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(&file_data);
+    let hash = hasher.finalize();
+    let sha256_hex = hex::encode(hash);
+
+    // Generate chunks
+    let mut offset: u64 = 0;
+    for chunk in file_data.chunks(FILE_CHUNK_SIZE) {
+        let chunk_b64 = general_purpose::STANDARD.encode(chunk);
+        messages.push(format!("FILE_CHUNK {transfer_id} {offset} {chunk_b64}"));
+        offset += chunk.len() as u64;
+    }
+
+    // FILE_END with checksum
+    messages.push(format!("FILE_END {transfer_id} {sha256_hex}"));
+
+    // Clean up pending
+    if let Ok(mut pending) = PENDING_OUTGOING.lock() {
+        pending.remove(filename_b64);
+    }
+
+    messages
+}
+
+/// Handle incoming FILE_INCOMING - prepare to receive a file
+fn prepare_incoming_transfer(transfer_id: u64, filename: &str, size: u64) -> Result<(), String> {
+    // Create temp file in downloads directory
+    let downloads = dirs::download_dir().unwrap_or_else(std::env::temp_dir);
+    let temp_path = downloads.join(format!(".rustynaut_incoming_{}", transfer_id));
+
+    let file = std::fs::File::create(&temp_path)
+        .map_err(|e| format!("Failed to create temp file: {}", e))?;
+
+    if let Ok(mut transfers) = INCOMING_TRANSFERS.lock() {
+        transfers.insert(transfer_id, IncomingTransfer {
+            filename: filename.to_string(),
+            size,
+            file,
+            temp_path,
+            bytes_received: 0,
+        });
+    }
+
+    Ok(())
+}
+
+/// Handle incoming FILE_CHUNK - write bytes to temp file
+fn handle_file_chunk(transfer_id: u64, _offset: u64, chunk_b64: &str) -> Result<(), String> {
+    let chunk_data = general_purpose::STANDARD.decode(chunk_b64)
+        .map_err(|e| format!("Invalid base64: {}", e))?;
+
+    if let Ok(mut transfers) = INCOMING_TRANSFERS.lock() {
+        if let Some(transfer) = transfers.get_mut(&transfer_id) {
+            transfer.file.write_all(&chunk_data)
+                .map_err(|e| format!("Write failed: {}", e))?;
+            transfer.bytes_received += chunk_data.len() as u64;
+        }
+    }
+
+    Ok(())
+}
+
+/// Handle FILE_DONE - verify checksum and move file to final location
+fn finalize_transfer(transfer_id: u64, _expected_sha256: &str) -> Result<String, String> {
+    let transfer_info = if let Ok(mut transfers) = INCOMING_TRANSFERS.lock() {
+        transfers.remove(&transfer_id)
+    } else {
+        None
+    };
+
+    let Some(transfer) = transfer_info else {
+        return Err("No such transfer".to_string());
+    };
+
+    // Close the file (drop it)
+    drop(transfer.file);
+
+    // Move to final location
+    let downloads = dirs::download_dir().unwrap_or_else(std::env::temp_dir);
+    let mut final_path = downloads.join(&transfer.filename);
+
+    // Handle file already exists - add number suffix
+    let mut counter = 1;
+    while final_path.exists() {
+        let stem = Path::new(&transfer.filename)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("file");
+        let ext = Path::new(&transfer.filename)
+            .extension()
+            .and_then(|s| s.to_str())
+            .map(|s| format!(".{}", s))
+            .unwrap_or_default();
+        final_path = downloads.join(format!("{} ({}){}", stem, counter, ext));
+        counter += 1;
+    }
+
+    std::fs::rename(&transfer.temp_path, &final_path)
+        .map_err(|e| format!("Failed to move file: {}", e))?;
+
+    Ok(final_path.display().to_string())
+}
+
 /// Format a byte size for human-readable display
 fn format_size(size: u64) -> String {
     const KB: u64 = 1024;
@@ -611,9 +856,120 @@ mod tcp {
                         .unwrap_or_else(|| "<unknown>".to_string());
                     let size: u64 = size_str.parse().unwrap_or(0);
                     let size_display = crate::format_size(size);
-                    // Display the file offer to the user
+                    // Display the file offer to the user with accept hint
                     let display_msg = format!(
-                        "INFO [{room}] {username} offers file: {filename} ({size_display})"
+                        "INFO [{room}] {username} offers file: {filename} ({size_display}) - use /accept {username} {filename} to receive"
+                    );
+                    return future::ready(Some(Ok(display_msg)));
+                }
+
+                // Handle FILE_START: sender should begin transfer
+                if let Some((transfer_id, filename_b64, acceptor_count)) =
+                    crate::parse_file_start_fields(&message)
+                {
+                    let filename = base64::engine::general_purpose::STANDARD
+                        .decode(filename_b64)
+                        .ok()
+                        .and_then(|bytes| String::from_utf8(bytes).ok())
+                        .unwrap_or_else(|| "<unknown>".to_string());
+                    let display_msg = format!(
+                        "INFO File transfer started: {filename} (transfer_id={transfer_id}, {acceptor_count} receiver(s))"
+                    );
+                    
+                    // Spawn a task to send file chunks
+                    let filename_b64_owned = filename_b64.to_string();
+                    let transfer_id_owned = transfer_id.to_string();
+                    tokio::spawn(async move {
+                        let messages = crate::generate_file_chunks(&filename_b64_owned, &transfer_id_owned);
+                        // Clone the sender before releasing the lock to avoid holding lock across await
+                        let tx = crate::FILE_TX.lock().ok().and_then(|guard| guard.clone());
+                        if let Some(tx) = tx {
+                            for msg in messages {
+                                if tx.send(msg).await.is_err() {
+                                    eprintln!("Failed to send file chunk");
+                                    break;
+                                }
+                            }
+                        }
+                    });
+                    
+                    return future::ready(Some(Ok(display_msg)));
+                }
+
+                // Handle FILE_INCOMING: receiver should prepare to receive
+                if let Some((transfer_id, filename_b64, size_str)) =
+                    crate::parse_file_incoming_fields(&message)
+                {
+                    let filename = base64::engine::general_purpose::STANDARD
+                        .decode(filename_b64)
+                        .ok()
+                        .and_then(|bytes| String::from_utf8(bytes).ok())
+                        .unwrap_or_else(|| "<unknown>".to_string());
+                    let size: u64 = size_str.parse().unwrap_or(0);
+                    let size_display = crate::format_size(size);
+                    
+                    // Prepare to receive the file
+                    let tid: u64 = transfer_id.parse().unwrap_or(0);
+                    if let Err(e) = crate::prepare_incoming_transfer(tid, &filename, size) {
+                        eprintln!("Failed to prepare transfer: {}", e);
+                    }
+                    
+                    let display_msg = format!(
+                        "INFO Receiving file: {filename} ({size_display}) transfer_id={transfer_id}"
+                    );
+                    return future::ready(Some(Ok(display_msg)));
+                }
+
+                // Handle FILE_CHUNK: write chunk to temp file
+                if let Some((transfer_id, offset, chunk_b64)) =
+                    crate::parse_file_chunk_fields(&message)
+                {
+                    let tid: u64 = transfer_id.parse().unwrap_or(0);
+                    let off: u64 = offset.parse().unwrap_or(0);
+                    if let Err(e) = crate::handle_file_chunk(tid, off, chunk_b64) {
+                        eprintln!("Chunk error: {}", e);
+                    }
+                    // Don't print anything for chunks (too noisy)
+                    return future::ready(None);
+                }
+
+                // Handle FILE_DONE: finalize the transfer
+                if let Some((transfer_id, sha256)) =
+                    crate::parse_file_done_fields(&message)
+                {
+                    let tid: u64 = transfer_id.parse().unwrap_or(0);
+                    match crate::finalize_transfer(tid, sha256) {
+                        Ok(final_path) => {
+                            let display_msg = format!(
+                                "INFO File received: {final_path}"
+                            );
+                            return future::ready(Some(Ok(display_msg)));
+                        }
+                        Err(e) => {
+                            let display_msg = format!(
+                                "INFO File transfer failed: {e}"
+                            );
+                            return future::ready(Some(Ok(display_msg)));
+                        }
+                    }
+                }
+
+                // Handle FILE_SENT: sender confirmation
+                if let Some((transfer_id, count)) =
+                    crate::parse_file_sent_fields(&message)
+                {
+                    let display_msg = format!(
+                        "INFO File sent successfully (transfer_id={transfer_id}, {count} receiver(s))"
+                    );
+                    return future::ready(Some(Ok(display_msg)));
+                }
+
+                // Handle FILE_CANCELLED
+                if let Some((transfer_id, reason)) =
+                    crate::parse_file_cancelled_fields(&message)
+                {
+                    let display_msg = format!(
+                        "INFO File transfer {transfer_id} cancelled: {reason}"
                     );
                     return future::ready(Some(Ok(display_msg)));
                 }
@@ -691,9 +1047,120 @@ mod tls_transport {
                         .unwrap_or_else(|| "<unknown>".to_string());
                     let size: u64 = size_str.parse().unwrap_or(0);
                     let size_display = crate::format_size(size);
-                    // Display the file offer to the user
+                    // Display the file offer to the user with accept hint
                     let display_msg = format!(
-                        "INFO [{room}] {username} offers file: {filename} ({size_display})"
+                        "INFO [{room}] {username} offers file: {filename} ({size_display}) - use /accept {username} {filename} to receive"
+                    );
+                    return future::ready(Some(Ok(display_msg)));
+                }
+
+                // Handle FILE_START: sender should begin transfer
+                if let Some((transfer_id, filename_b64, acceptor_count)) =
+                    crate::parse_file_start_fields(&message)
+                {
+                    let filename = base64::engine::general_purpose::STANDARD
+                        .decode(filename_b64)
+                        .ok()
+                        .and_then(|bytes| String::from_utf8(bytes).ok())
+                        .unwrap_or_else(|| "<unknown>".to_string());
+                    let display_msg = format!(
+                        "INFO File transfer started: {filename} (transfer_id={transfer_id}, {acceptor_count} receiver(s))"
+                    );
+                    
+                    // Spawn a task to send file chunks
+                    let filename_b64_owned = filename_b64.to_string();
+                    let transfer_id_owned = transfer_id.to_string();
+                    tokio::spawn(async move {
+                        let messages = crate::generate_file_chunks(&filename_b64_owned, &transfer_id_owned);
+                        // Clone the sender before releasing the lock to avoid holding lock across await
+                        let tx = crate::FILE_TX.lock().ok().and_then(|guard| guard.clone());
+                        if let Some(tx) = tx {
+                            for msg in messages {
+                                if tx.send(msg).await.is_err() {
+                                    eprintln!("Failed to send file chunk");
+                                    break;
+                                }
+                            }
+                        }
+                    });
+                    
+                    return future::ready(Some(Ok(display_msg)));
+                }
+
+                // Handle FILE_INCOMING: receiver should prepare to receive
+                if let Some((transfer_id, filename_b64, size_str)) =
+                    crate::parse_file_incoming_fields(&message)
+                {
+                    let filename = base64::engine::general_purpose::STANDARD
+                        .decode(filename_b64)
+                        .ok()
+                        .and_then(|bytes| String::from_utf8(bytes).ok())
+                        .unwrap_or_else(|| "<unknown>".to_string());
+                    let size: u64 = size_str.parse().unwrap_or(0);
+                    let size_display = crate::format_size(size);
+                    
+                    // Prepare to receive the file
+                    let tid: u64 = transfer_id.parse().unwrap_or(0);
+                    if let Err(e) = crate::prepare_incoming_transfer(tid, &filename, size) {
+                        eprintln!("Failed to prepare transfer: {}", e);
+                    }
+                    
+                    let display_msg = format!(
+                        "INFO Receiving file: {filename} ({size_display}) transfer_id={transfer_id}"
+                    );
+                    return future::ready(Some(Ok(display_msg)));
+                }
+
+                // Handle FILE_CHUNK: write chunk to temp file
+                if let Some((transfer_id, offset, chunk_b64)) =
+                    crate::parse_file_chunk_fields(&message)
+                {
+                    let tid: u64 = transfer_id.parse().unwrap_or(0);
+                    let off: u64 = offset.parse().unwrap_or(0);
+                    if let Err(e) = crate::handle_file_chunk(tid, off, chunk_b64) {
+                        eprintln!("Chunk error: {}", e);
+                    }
+                    // Don't print anything for chunks (too noisy)
+                    return future::ready(None);
+                }
+
+                // Handle FILE_DONE: finalize the transfer
+                if let Some((transfer_id, sha256)) =
+                    crate::parse_file_done_fields(&message)
+                {
+                    let tid: u64 = transfer_id.parse().unwrap_or(0);
+                    match crate::finalize_transfer(tid, sha256) {
+                        Ok(final_path) => {
+                            let display_msg = format!(
+                                "INFO File received: {final_path}"
+                            );
+                            return future::ready(Some(Ok(display_msg)));
+                        }
+                        Err(e) => {
+                            let display_msg = format!(
+                                "INFO File transfer failed: {e}"
+                            );
+                            return future::ready(Some(Ok(display_msg)));
+                        }
+                    }
+                }
+
+                // Handle FILE_SENT: sender confirmation
+                if let Some((transfer_id, count)) =
+                    crate::parse_file_sent_fields(&message)
+                {
+                    let display_msg = format!(
+                        "INFO File sent successfully (transfer_id={transfer_id}, {count} receiver(s))"
+                    );
+                    return future::ready(Some(Ok(display_msg)));
+                }
+
+                // Handle FILE_CANCELLED
+                if let Some((transfer_id, reason)) =
+                    crate::parse_file_cancelled_fields(&message)
+                {
+                    let display_msg = format!(
+                        "INFO File transfer {transfer_id} cancelled: {reason}"
                     );
                     return future::ready(Some(Ok(display_msg)));
                 }

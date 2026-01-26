@@ -28,12 +28,13 @@ use tokio_stream::StreamExt;
 use tokio_util::codec::{Framed, LinesCodec};
 
 use futures::SinkExt;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::error::Error;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 const BANNER: &str = r#"
 ██████  ██████   ██████  ██   ██ ███████ ██████  
@@ -347,6 +348,57 @@ type Rx = mpsc::UnboundedReceiver<String>;
 /// Maximum number of recent clip hashes to track per room for deduplication
 const MAX_RECENT_CLIPS_PER_ROOM: usize = 20;
 
+/// Chunk size for file transfers (64KB)
+const FILE_CHUNK_SIZE: usize = 64 * 1024;
+
+/// File transfer timeout in seconds
+const FILE_TRANSFER_TIMEOUT_SECS: u64 = 300;
+
+/// Maximum file size for transfer (50MB)
+const MAX_FILE_SIZE: u64 = 50 * 1024 * 1024;
+
+/// State of a file transfer
+#[derive(Debug, Clone, PartialEq)]
+enum TransferState {
+    /// Offer sent, waiting for acceptors
+    Offered,
+    /// Transfer in progress
+    Transferring,
+    /// Transfer complete
+    Done,
+    /// Transfer failed or cancelled
+    Failed(String),
+}
+
+/// A pending file offer (before any accepts)
+#[derive(Debug, Clone)]
+struct PendingOffer {
+    sender: SocketAddr,
+    sender_username: String,
+    room: String,
+    filename_b64: String,
+    size: u64,
+    created_at: Instant,
+}
+
+/// An active file transfer (after at least one accept)
+#[derive(Debug)]
+struct FileTransfer {
+    id: u64,
+    sender: SocketAddr,
+    sender_username: String,
+    room: String,
+    filename_b64: String,
+    size: u64,
+    acceptors: HashSet<SocketAddr>,
+    state: TransferState,
+    bytes_received: u64,
+    created_at: Instant,
+}
+
+/// Unique key for a pending offer (room + sender + filename)
+type OfferKey = (String, String, String); // (room, sender_username, filename_b64)
+
 /// Data that is shared between all peers in the chat server.
 ///
 /// This is the set of `Tx` handles for all connected clients. Whenever a
@@ -360,6 +412,12 @@ struct Shared {
     recent_clips: HashMap<String, VecDeque<u64>>,
     /// Recent file offer hashes per room for deduplication (room -> recent hashes)
     recent_file_offers: HashMap<String, VecDeque<u64>>,
+    /// Pending file offers waiting for acceptors (key: room+sender+filename)
+    pending_offers: HashMap<OfferKey, PendingOffer>,
+    /// Active file transfers (key: transfer_id)
+    active_transfers: HashMap<u64, FileTransfer>,
+    /// Next transfer ID
+    next_transfer_id: u64,
 }
 
 #[derive(Clone)]
@@ -396,6 +454,120 @@ impl Shared {
             next_clip_id: 0,
             recent_clips: HashMap::new(),
             recent_file_offers: HashMap::new(),
+            pending_offers: HashMap::new(),
+            active_transfers: HashMap::new(),
+            next_transfer_id: 0,
+        }
+    }
+
+    /// Register a file offer from a sender
+    fn register_offer(
+        &mut self,
+        sender: SocketAddr,
+        sender_username: &str,
+        room: &str,
+        filename_b64: &str,
+        size: u64,
+    ) {
+        let key = (
+            room.to_string(),
+            sender_username.to_string(),
+            filename_b64.to_string(),
+        );
+        self.pending_offers.insert(
+            key,
+            PendingOffer {
+                sender,
+                sender_username: sender_username.to_string(),
+                room: room.to_string(),
+                filename_b64: filename_b64.to_string(),
+                size,
+                created_at: Instant::now(),
+            },
+        );
+    }
+
+    /// Accept a file offer and start a transfer
+    /// Returns (transfer_id, sender_addr) if successful
+    fn accept_offer(
+        &mut self,
+        acceptor: SocketAddr,
+        room: &str,
+        sender_username: &str,
+        filename_b64: &str,
+    ) -> Option<(u64, SocketAddr)> {
+        let key = (
+            room.to_string(),
+            sender_username.to_string(),
+            filename_b64.to_string(),
+        );
+
+        // Check if there's already an active transfer for this offer
+        for (tid, transfer) in &mut self.active_transfers {
+            if transfer.room == room
+                && transfer.sender_username == sender_username
+                && transfer.filename_b64 == filename_b64
+                && transfer.state == TransferState::Offered
+            {
+                // Add this acceptor to existing transfer
+                transfer.acceptors.insert(acceptor);
+                return Some((*tid, transfer.sender));
+            }
+        }
+
+        // Look for pending offer
+        if let Some(offer) = self.pending_offers.remove(&key) {
+            self.next_transfer_id += 1;
+            let transfer_id = self.next_transfer_id;
+
+            let mut acceptors = HashSet::new();
+            acceptors.insert(acceptor);
+
+            self.active_transfers.insert(
+                transfer_id,
+                FileTransfer {
+                    id: transfer_id,
+                    sender: offer.sender,
+                    sender_username: offer.sender_username,
+                    room: offer.room,
+                    filename_b64: offer.filename_b64,
+                    size: offer.size,
+                    acceptors,
+                    state: TransferState::Offered,
+                    bytes_received: 0,
+                    created_at: offer.created_at,
+                },
+            );
+
+            return Some((transfer_id, offer.sender));
+        }
+
+        None
+    }
+
+    /// Get transfer by ID
+    fn get_transfer(&self, transfer_id: u64) -> Option<&FileTransfer> {
+        self.active_transfers.get(&transfer_id)
+    }
+
+    /// Get mutable transfer by ID
+    fn get_transfer_mut(&mut self, transfer_id: u64) -> Option<&mut FileTransfer> {
+        self.active_transfers.get_mut(&transfer_id)
+    }
+
+    /// Send a message to a specific peer
+    fn send_to_peer(&self, addr: SocketAddr, message: &str) {
+        if let Some(peer) = self.peers.get(&addr) {
+            let _ = peer.tx.send(message.to_string());
+        }
+    }
+
+    /// Send a message to all acceptors of a transfer
+    fn send_to_acceptors(&self, transfer_id: u64, message: &str) {
+        if let Some(transfer) = self.active_transfers.get(&transfer_id) {
+            for &acceptor in &transfer.acceptors {
+                self.send_to_peer(acceptor, message);
+            }
         }
     }
 
@@ -537,6 +709,47 @@ fn parse_file_offer(line: &str) -> Option<(&str, &str, &str)> {
     let mut parts = line.splitn(4, ' ');
     match (parts.next()?, parts.next()?, parts.next()?, parts.next()?) {
         ("FILE_OFFER", room, filename_b64, size) => Some((room, filename_b64, size)),
+        _ => None,
+    }
+}
+
+/// Parse FILE_ACCEPT command: FILE_ACCEPT <room> <sender_username> <filename_b64>
+/// Returns (room, sender_username, filename_b64)
+fn parse_file_accept(line: &str) -> Option<(&str, &str, &str)> {
+    let mut parts = line.splitn(4, ' ');
+    match (parts.next()?, parts.next()?, parts.next()?, parts.next()?) {
+        ("FILE_ACCEPT", room, sender_username, filename_b64) => {
+            Some((room, sender_username, filename_b64))
+        }
+        _ => None,
+    }
+}
+
+/// Parse FILE_CANCEL command: FILE_CANCEL <transfer_id>
+/// Returns transfer_id
+fn parse_file_cancel(line: &str) -> Option<u64> {
+    let rest = line.strip_prefix("FILE_CANCEL ")?;
+    rest.trim().parse().ok()
+}
+
+/// Parse FILE_CHUNK command: FILE_CHUNK <transfer_id> <offset> <chunk_b64>
+/// Returns (transfer_id, offset, chunk_b64)
+fn parse_file_chunk(line: &str) -> Option<(u64, u64, &str)> {
+    let mut parts = line.splitn(4, ' ');
+    match (parts.next()?, parts.next()?, parts.next()?, parts.next()?) {
+        ("FILE_CHUNK", tid, offset, chunk_b64) => {
+            Some((tid.parse().ok()?, offset.parse().ok()?, chunk_b64))
+        }
+        _ => None,
+    }
+}
+
+/// Parse FILE_END command: FILE_END <transfer_id> <sha256>
+/// Returns (transfer_id, sha256)
+fn parse_file_end(line: &str) -> Option<(u64, &str)> {
+    let mut parts = line.splitn(3, ' ');
+    match (parts.next()?, parts.next()?, parts.next()?) {
+        ("FILE_END", tid, sha256) => Some((tid.parse().ok()?, sha256)),
         _ => None,
     }
 }
@@ -718,7 +931,7 @@ where
                         match cmd {
                             "/help" => {
                                         peer.lines
-                                            .send("INFO commands: /help /rooms /who".to_string())
+                                            .send("INFO commands: /help /rooms /who /accept <user> <filename>".to_string())
                                             .await?;
                             }
                             "/rooms" => {
@@ -749,6 +962,66 @@ where
                                     .send(format!("INFO users in {room}: {}", users.join(", ")))
                                     .await?;
                             }
+                            _ if cmd.starts_with("/accept ") => {
+                                // Parse /accept <username> <filename>
+                                let rest = cmd.strip_prefix("/accept ").unwrap().trim();
+                                let parts: Vec<&str> = rest.splitn(2, ' ').collect();
+                                if parts.len() < 2 {
+                                    peer.lines.send("ERR usage: /accept <username> <filename>").await?;
+                                    continue;
+                                }
+                                let sender_username = parts[0];
+                                let filename = parts[1];
+
+                                // Base64 encode the filename for the protocol
+                                use base64::{engine::general_purpose, Engine as _};
+                                let filename_b64 = general_purpose::STANDARD.encode(filename);
+
+                                let mut state = state.lock().await;
+
+                                // Try to accept the offer
+                                if let Some((transfer_id, sender_addr)) = state.accept_offer(addr, &room, sender_username, &filename_b64) {
+                                    let transfer = state.get_transfer(transfer_id).unwrap();
+                                    let size = transfer.size;
+                                    let acceptor_count = transfer.acceptors.len();
+
+                                    // Notify the sender to start the transfer
+                                    let start_msg = format!("FILE_START {transfer_id} {filename_b64} {acceptor_count}");
+                                    state.send_to_peer(sender_addr, &start_msg);
+
+                                    // Notify the acceptor that the file is incoming
+                                    let incoming_msg = format!("FILE_INCOMING {transfer_id} {filename_b64} {size}");
+                                    peer.lines.send(&incoming_msg).await?;
+
+                                    tracing::info!(
+                                        "file transfer {} started: {} -> {} ({} bytes)",
+                                        transfer_id, sender_username, username, size
+                                    );
+                                } else {
+                                    peer.lines.send("ERR no such file offer (or already accepted)").await?;
+                                }
+                            }
+                            _ if cmd.starts_with("/cancel ") => {
+                                // Parse /cancel <transfer_id>
+                                let rest = cmd.strip_prefix("/cancel ").unwrap().trim();
+                                if let Ok(transfer_id) = rest.parse::<u64>() {
+                                    let mut state = state.lock().await;
+
+                                    if let Some(transfer) = state.active_transfers.remove(&transfer_id) {
+                                        // Notify all participants
+                                        let cancel_msg = format!("FILE_CANCELLED {transfer_id} cancelled by {username}");
+                                        state.send_to_peer(transfer.sender, &cancel_msg);
+                                        for &acceptor in &transfer.acceptors {
+                                            state.send_to_peer(acceptor, &cancel_msg);
+                                        }
+                                        tracing::info!("file transfer {} cancelled by {}", transfer_id, username);
+                                    } else {
+                                        peer.lines.send("ERR no such transfer").await?;
+                                    }
+                                } else {
+                                    peer.lines.send("ERR usage: /cancel <transfer_id>").await?;
+                                }
+                            }
                             _ => {
                                 peer.lines.send(format!("ERR unknown command: {cmd}")).await?;
                             }
@@ -775,18 +1048,143 @@ where
                     }
 
                     // FILE_OFFER <room> <filename_b64> <size>
-                    if let Some((_wire_room, filename_b64, size)) = parse_file_offer(&msg) {
+                    if let Some((_wire_room, filename_b64, size_str)) = parse_file_offer(&msg) {
                         let mut state = state.lock().await;
 
                         // Check for duplicate file offer (echo suppression)
-                        if state.is_duplicate_file_offer(&room, filename_b64, size) {
+                        if state.is_duplicate_file_offer(&room, filename_b64, size_str) {
                             tracing::debug!("duplicate file offer from {} in room {}, skipping", username, room);
                             continue;
                         }
 
+                        // Parse and validate size
+                        let size: u64 = match size_str.parse() {
+                            Ok(s) => s,
+                            Err(_) => {
+                                peer.lines.send("ERR invalid file size").await?;
+                                continue;
+                            }
+                        };
+
+                        if size > MAX_FILE_SIZE {
+                            peer.lines.send(format!("ERR file too large (max {} bytes)", MAX_FILE_SIZE)).await?;
+                            continue;
+                        }
+
+                        // Register the offer for later acceptance
+                        state.register_offer(addr, &username, &room, filename_b64, size);
+
                         // Relay file offer to room members with sender's username
                         let out = format!("FILE_OFFER {room} {username} {filename_b64} {size}");
+                        tracing::info!("file offer from {} in room {}: {} bytes", username, room, size);
                         state.broadcast_to_room(addr, &room, &out).await;
+                        continue;
+                    }
+
+                    // FILE_ACCEPT <room> <sender_username> <filename_b64>
+                    if let Some((accept_room, sender_username, filename_b64)) = parse_file_accept(&msg) {
+                        // Validate room matches current room
+                        if accept_room != room {
+                            peer.lines.send("ERR can only accept files in your current room").await?;
+                            continue;
+                        }
+
+                        let mut state = state.lock().await;
+
+                        // Try to accept the offer
+                        if let Some((transfer_id, sender_addr)) = state.accept_offer(addr, &room, sender_username, filename_b64) {
+                            let transfer = state.get_transfer(transfer_id).unwrap();
+                            let size = transfer.size;
+                            let acceptor_count = transfer.acceptors.len();
+
+                            // Notify the sender to start the transfer
+                            let start_msg = format!("FILE_START {transfer_id} {filename_b64} {acceptor_count}");
+                            state.send_to_peer(sender_addr, &start_msg);
+
+                            // Notify the acceptor that the file is incoming
+                            let incoming_msg = format!("FILE_INCOMING {transfer_id} {filename_b64} {size}");
+                            peer.lines.send(&incoming_msg).await?;
+
+                            tracing::info!(
+                                "file transfer {} started: {} -> {} ({} bytes)",
+                                transfer_id, sender_username, username, size
+                            );
+                        } else {
+                            peer.lines.send("ERR no such file offer").await?;
+                        }
+                        continue;
+                    }
+
+                    // FILE_CANCEL <transfer_id>
+                    if let Some(transfer_id) = parse_file_cancel(&msg) {
+                        let mut state = state.lock().await;
+
+                        if let Some(transfer) = state.active_transfers.remove(&transfer_id) {
+                            // Notify all participants
+                            let cancel_msg = format!("FILE_CANCELLED {transfer_id} cancelled by {username}");
+                            state.send_to_peer(transfer.sender, &cancel_msg);
+                            for &acceptor in &transfer.acceptors {
+                                state.send_to_peer(acceptor, &cancel_msg);
+                            }
+                            tracing::info!("file transfer {} cancelled by {}", transfer_id, username);
+                        } else {
+                            peer.lines.send("ERR no such transfer").await?;
+                        }
+                        continue;
+                    }
+
+                    // FILE_CHUNK <transfer_id> <offset> <chunk_b64>
+                    if let Some((transfer_id, offset, chunk_b64)) = parse_file_chunk(&msg) {
+                        let mut state = state.lock().await;
+
+                        // Verify sender owns this transfer
+                        if let Some(transfer) = state.get_transfer_mut(transfer_id) {
+                            if transfer.sender != addr {
+                                peer.lines.send("ERR not the sender of this transfer").await?;
+                                continue;
+                            }
+
+                            // Update transfer state
+                            transfer.state = TransferState::Transferring;
+
+                            // Relay chunk to all acceptors
+                            let chunk_msg = format!("FILE_CHUNK {transfer_id} {offset} {chunk_b64}");
+                            state.send_to_acceptors(transfer_id, &chunk_msg);
+                        } else {
+                            peer.lines.send("ERR no such transfer").await?;
+                        }
+                        continue;
+                    }
+
+                    // FILE_END <transfer_id> <sha256>
+                    if let Some((transfer_id, sha256)) = parse_file_end(&msg) {
+                        let mut state = state.lock().await;
+
+                        if let Some(transfer) = state.active_transfers.remove(&transfer_id) {
+                            if transfer.sender != addr {
+                                peer.lines.send("ERR not the sender of this transfer").await?;
+                                // Put it back
+                                state.active_transfers.insert(transfer_id, transfer);
+                                continue;
+                            }
+
+                            // Notify acceptors that transfer is complete
+                            let done_msg = format!("FILE_DONE {transfer_id} {sha256}");
+                            for &acceptor in &transfer.acceptors {
+                                state.send_to_peer(acceptor, &done_msg);
+                            }
+
+                            // Notify sender of success
+                            let sent_msg = format!("FILE_SENT {transfer_id} {}", transfer.acceptors.len());
+                            peer.lines.send(&sent_msg).await?;
+
+                            tracing::info!(
+                                "file transfer {} complete: {} receivers",
+                                transfer_id, transfer.acceptors.len()
+                            );
+                        } else {
+                            peer.lines.send("ERR no such transfer").await?;
+                        }
                         continue;
                     }
 

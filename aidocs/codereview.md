@@ -1,153 +1,148 @@
 # Code Review: Rustynaut Broker & Client
 
-**Date:** 2025-12-18  
+**Date:** 2025-12-23 (Updated)  
 **Reviewer:** AI Assistant  
-**Scope:** broker/src/main.rs, client/src/main.rs
+**Scope:** broker/src/main.rs, client/src/main.rs, client/src/clipboard_files.rs
 
 ---
 
 ## Summary
 
-Overall the code is functional and follows reasonable Rust idioms. The main areas for improvement are around error handling (unwrap usage), potential concurrency issues with double mutex locking, and some cleanup opportunities.
+The codebase has matured significantly. TLS/mTLS enrollment is fully implemented, FILE_OFFER notifications work cross-platform, and echo suppression is handled at both broker and client levels. Most critical issues from the previous review have been resolved.
 
 ---
 
-## 🔴 Critical Issues
+## ✅ Resolved Issues (from previous review)
 
-### 1. Double Mutex Lock in CLIP Handler (Broker)
-**File:** [broker/src/main.rs](../broker/src/main.rs#L383-L391)  
-**Severity:** High  
+### 1. Double Mutex Lock in CLIP Handler (Broker) — FIXED
+The CLIP handler now uses a single lock scope for both incrementing clip_id and broadcasting.
 
-```rust
-// CLIP <room> <b64>
-if let Some((_wire_room, b64)) = parse_clip(&msg) {
-    let out = {
-        let mut state = state.lock().await;  // Lock #1
-        state.next_clip_id += 1;
-        let id = state.next_clip_id;
-        format!("CLIP {room} {b64} {id}")
-    };
+### 2. Clipboard Error Handling (Client) — IMPROVED
+Empty clipboard is now handled gracefully (treated as empty string). Errors are logged in verbose mode.
 
-    let mut state = state.lock().await;  // Lock #2 (redundant)
-    state.broadcast_to_room(addr, &room, &out).await;
-    continue;
-}
-```
+### 3. Module Documentation (Broker) — FIXED
+Updated to reflect Rustynaut protocol and usage.
 
-**Problem:** The mutex is locked twice in sequence. While not a deadlock (since the first lock is released before the second), it's inefficient and confusing.
+### 4. Input Validation (Broker) — FIXED
+`is_valid_name()` validates usernames and room names (alphanumeric, _, -, max 32 chars).
 
-**Fix:** Combine into a single lock scope:
-```rust
-if let Some((_wire_room, b64)) = parse_clip(&msg) {
-    let mut state = state.lock().await;
-    state.next_clip_id += 1;
-    let id = state.next_clip_id;
-    let out = format!("CLIP {room} {b64} {id}");
-    state.broadcast_to_room(addr, &room, &out).await;
-    continue;
-}
-```
+### 5. Graceful Shutdown (Broker) — FIXED
+Broker handles `/quit`, `/shutdown`, `/exit` commands and Ctrl+C signal. Notifies clients before shutdown.
+
+### 6. /status Command (Broker) — FIXED
+Broker `/status` shows connected clients and active rooms.
 
 ---
 
-## 🟠 Medium Issues
+## 🟠 Medium Issues (Remaining)
 
-### 2. `unwrap_or_default()` Hides Clipboard Errors (Client)
-**File:** [client/src/main.rs](../client/src/main.rs#L142)  
-**Severity:** Medium  
-
-```rust
-let current_content = CLIPBOARD.get_string_contents().unwrap_or_default();
-```
-
-**Problem:** If the clipboard read fails while checking for duplicates, we silently assume empty content. This could cause unnecessary writes or missed deduplication.
-
-**Recommendation:** Log the error in verbose mode or propagate it:
-```rust
-let current_content = match CLIPBOARD.get_string_contents() {
-    Ok(s) => s,
-    Err(_) => return Err("clipboard read failed during update".into()),
-};
-```
-
-### 3. Global Mutable State via `lazy_static` (Client)
-**File:** [client/src/main.rs](../client/src/main.rs#L23-L25)  
-**Severity:** Medium  
+### 1. Global Mutable State via `lazy_static` (Client)
+**File:** [client/src/main.rs](../client/src/main.rs#L33-L38)
 
 ```rust
 lazy_static! {
     static ref CLIPBOARD: Mutex<arboard::Clipboard> = Mutex::new(get_current_clipboard());
+    static ref RECENT_APPLIED_CLIPS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 }
 ```
 
-**Problem:** Global mutable state accessed from multiple async tasks (main task + clipboard watcher) without synchronization. `arboard::Clipboard` may not be `Send + Sync` safe on all platforms.
+**Status:** Acceptable for current use case. `arboard` is designed for cross-platform use and the Mutex ensures thread safety. Consider refactoring to explicit dependency injection in future if testing becomes complex.
 
-**Recommendation:** Consider wrapping in `Arc<Mutex<arboard::Clipboard>>` or passing clipboard handle explicitly. Alternatively, verify `arboard` is thread-safe for your target platforms.
-
-**Note:** We use `arboard` crate for cross-platform clipboard access (macOS, Windows, Linux). The deprecated `crossclip` crate was removed due to Windows compatibility issues.
-
-### 4. Outdated Module Documentation (Broker)
-**File:** [broker/src/main.rs](../broker/src/main.rs#L1-L25)  
-**Severity:** Low-Medium  
-
-The module doc comments still reference the original Tokio chat example:
-- "telnet clients"
-- "cargo run --example chat"
-- "telnet localhost 6142"
-
-**Fix:** Update to reflect Rustynaut protocol and usage.
-
----
-
-## 🟡 Minor Issues / Best Practices
-
-### 5. Inconsistent Indentation in Command Handlers (Broker)
-**File:** [broker/src/main.rs](../broker/src/main.rs#L356-L378)  
-
-The `/help` and `/who` handlers have extra indentation compared to `/rooms`. Should be consistent.
-
-### 6. `exit(100)` Without Error Context (Client)
-**File:** [client/src/main.rs](../client/src/main.rs#L135-L138)  
+### 2. Exit Code 100 Without Documentation (Client)
+**File:** [client/src/main.rs](../client/src/main.rs#L471-L475)
 
 ```rust
-let Ok(clipboard) = SystemClipboard::new() else {
+let Ok(clipboard) = arboard::Clipboard::new() else {
     eprintln!("could not connect to clipboard");
     exit(100);
 };
 ```
 
-**Recommendation:** Exit code 100 is arbitrary. Consider using standard exit codes (1 for general error) or documenting the meaning.
+**Status:** Low priority. Consider documenting or using standard exit codes.
 
-### 7. Unused Variable Warning Potential (Client)
-**File:** [client/src/main.rs](../client/src/main.rs#L171)  
+---
+
+## 🟡 Minor Issues / Best Practices
+
+### 1. Unused `mut` on stream variable (Client - tcp module)
+**File:** [client/src/main.rs](../client/src/main.rs#L600)
 
 ```rust
 let mut stream = TcpStream::connect(addr).await?;
 ```
 
-The `stream` binding is mutable but never mutated directly (only split). Consider removing `mut`.
+The `stream` is split immediately, doesn't need `mut`. Minor clippy-level issue.
 
-### 8. `broadcast()` Still Used for Join/Leave (Broker)
-**File:** [broker/src/main.rs](../broker/src/main.rs#L315-L319)  
+### 2. Platform-Specific Code Organization
+**File:** [client/src/clipboard_files.rs](../client/src/clipboard_files.rs)
 
-Join/leave notifications go to ALL users, not just those in the same room. This may be intentional (global presence awareness) or should be room-scoped for consistency.
+Good use of `#[cfg(target_os = "...")]` for platform-specific implementations. Consider extracting into separate files if complexity grows (e.g., `clipboard_files_macos.rs`).
 
-### 9. No Input Validation on Room/Username (Broker)
-**File:** [broker/src/main.rs](../broker/src/main.rs#L300-L305)  
+---
 
-Usernames and room names are accepted without validation. A malicious client could send:
-- Empty room names (after JOIN)
-- Room names with spaces or special characters
-- Very long strings
+## ✅ What's Good
 
-**Recommendation:** Add basic validation:
-```rust
-fn is_valid_name(s: &str) -> bool {
-    !s.is_empty() && s.len() <= 32 && s.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-')
-}
+1. **TLS/mTLS Implementation** — Complete enrollment flow with auto-generated certificates
+2. **Cross-Platform File Detection** — Native APIs for macOS (NSPasteboard) and Windows (clipboard-win), text fallback for Linux
+3. **Broker-Side Echo Suppression** — Content hash deduplication prevents echo loops at source
+4. **FILE_OFFER Protocol** — Clean notification system with human-readable size display
+5. **Room-Scoped Broadcasts** — CLIP, SAY, and FILE_OFFER properly scoped to rooms
+6. **Graceful Shutdown** — Signal handling and client notification
+7. **Clean Protocol Parsing** — Well-organized `parse_*` functions
+8. **Tracing Integration** — Good observability with configurable verbosity
+
+---
+
+## 📋 Action Items (Priority Order)
+
+| # | Issue | Effort | Priority | Status |
+|---|-------|--------|----------|--------|
+| 1 | Fix double mutex lock in CLIP handler | 5 min | High | ✅ Fixed |
+| 2 | Handle clipboard read error gracefully | 5 min | Medium | ✅ Fixed |
+| 3 | Fix inconsistent indentation | 2 min | Low | ✅ Fixed |
+| 4 | Update broker module documentation | 5 min | Low | ✅ Fixed |
+| 5 | Add input validation for room/username | 15 min | Medium | ✅ Fixed |
+| 6 | Add graceful shutdown | 20 min | Medium | ✅ Fixed |
+| 7 | Add /status command for broker | 5 min | Low | ✅ Fixed |
+| 8 | Implement FILE_OFFER notifications | 30 min | Medium | ✅ Fixed |
+| 9 | Broker-side echo suppression | 20 min | Medium | ✅ Fixed |
+| 10 | Document exit codes | 5 min | Low | Deferred |
+| 11 | Remove unused `mut` bindings | 2 min | Low | Deferred |
+
+---
+
+## 🏗️ Architecture Notes
+
+### Current Wire Protocol
+```
+Client → Broker:
+  USER <name>                          # Authentication
+  JOIN <room>                          # Room selection
+  CLIP <room> <b64>                    # Clipboard content
+  FILE_OFFER <room> <filename_b64> <size>  # File notification
+  CMD /<command>                       # Slash commands
+  SAY <text>                           # Chat message
+  ENROLL <token> <username>            # TLS enrollment
+
+Broker → Client:
+  INFO <text>                          # Informational message
+  ERR <text>                           # Error message
+  CLIP <room> <b64> <id>               # Clipboard broadcast
+  FILE_OFFER <room> <user> <filename_b64> <size>  # File notification
+  SAY <user> <text>                    # Chat message
+  ENROLLED <cert_b64> <key_b64> <ca_b64>  # Enrollment response
 ```
 
-### 10. No Graceful Shutdown (Broker)
+### Echo Suppression Strategy
+1. **Broker-side (primary):** Hash-based deduplication per room for CLIP and FILE_OFFER
+2. **Client-side (secondary):** Track recently applied clips to avoid re-sending
+
+### Platform-Specific Clipboard Detection
+| Platform | Native API | Fallback |
+|----------|------------|----------|
+| macOS | NSPasteboard via objc2 | file:// URL parsing |
+| Windows | clipboard-win FileList | file:// URL parsing |
+| Linux | — | file:// URL parsing |
 **Severity:** Low  
 
 The broker runs in an infinite loop with no signal handling. Ctrl+C works but doesn't clean up connections gracefully.
@@ -183,9 +178,11 @@ The broker runs in an infinite loop with no signal handling. Ctrl+C works but do
 
 ---
 
-## 📝 Planning Doc Updates Needed
+## 📝 Next Steps
 
-Based on this review, the planning.md should update:
-- [x] Implement broker rooms and room-scoped broadcasts → **DONE** (CLIP + SAY are room-scoped)
-- [ ] Echo suppression using `<id>` → Still TODO (client receives id but doesn't use it to suppress)
-- [ ] Manual tests → Should be marked done if verified
+Based on this review, recommended next steps:
+1. **FILE_ACCEPT Implementation** — Allow clients to request actual file transfers
+2. **Sideband Binary Transfer** — Broker-mediated file streaming
+3. **Progress Indicators** — Show transfer progress in verbose mode
+4. **Rate Limiting** — Protect enrollment and transfer endpoints
+5. **Audit Logging** — Track enrollment attempts and file transfers

@@ -10,6 +10,7 @@ arboard = "3"
 base64 = "0.22.0"
 dirs = "6.0"
 futures = "0.3.30"
+hex = "0.4"
 lazy_static = "1.4.0"
 ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = [
