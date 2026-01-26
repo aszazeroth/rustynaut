@@ -49,7 +49,6 @@ struct PendingOutgoingFile {
 #[derive(Debug)]
 struct IncomingTransfer {
     filename: String,
-    size: u64,
     file: std::fs::File,
     temp_path: PathBuf,
     bytes_received: u64,
@@ -719,7 +718,7 @@ fn generate_file_chunks(filename_b64: &str, transfer_id: &str) -> Vec<String> {
 }
 
 /// Handle incoming FILE_INCOMING - prepare to receive a file
-fn prepare_incoming_transfer(transfer_id: u64, filename: &str, size: u64) -> Result<(), String> {
+fn prepare_incoming_transfer(transfer_id: u64, filename: &str, _size: u64) -> Result<(), String> {
     // Create temp file in downloads directory
     let downloads = dirs::download_dir().unwrap_or_else(std::env::temp_dir);
     let temp_path = downloads.join(format!(".rustynaut_incoming_{}", transfer_id));
@@ -730,7 +729,6 @@ fn prepare_incoming_transfer(transfer_id: u64, filename: &str, size: u64) -> Res
     if let Ok(mut transfers) = INCOMING_TRANSFERS.lock() {
         transfers.insert(transfer_id, IncomingTransfer {
             filename: filename.to_string(),
-            size,
             file,
             temp_path,
             bytes_received: 0,

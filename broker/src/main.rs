@@ -349,12 +349,6 @@ type Rx = mpsc::UnboundedReceiver<String>;
 /// Maximum number of recent clip hashes to track per room for deduplication
 const MAX_RECENT_CLIPS_PER_ROOM: usize = 20;
 
-/// Chunk size for file transfers (64KB)
-const FILE_CHUNK_SIZE: usize = 64 * 1024;
-
-/// File transfer timeout in seconds
-const FILE_TRANSFER_TIMEOUT_SECS: u64 = 300;
-
 /// Maximum file size for transfer (50MB)
 const MAX_FILE_SIZE: u64 = 50 * 1024 * 1024;
 
@@ -365,10 +359,6 @@ enum TransferState {
     Offered,
     /// Transfer in progress
     Transferring,
-    /// Transfer complete
-    Done,
-    /// Transfer failed or cancelled
-    Failed(String),
 }
 
 /// A pending file offer (before any accepts)
@@ -385,7 +375,6 @@ struct PendingOffer {
 /// An active file transfer (after at least one accept)
 #[derive(Debug)]
 struct FileTransfer {
-    id: u64,
     sender: SocketAddr,
     sender_username: String,
     room: String,
@@ -393,8 +382,6 @@ struct FileTransfer {
     size: u64,
     acceptors: HashSet<SocketAddr>,
     state: TransferState,
-    bytes_received: u64,
-    created_at: Instant,
 }
 
 /// Unique key for a pending offer (room + sender + filename)
@@ -552,7 +539,6 @@ impl Shared {
             self.active_transfers.insert(
                 transfer_id,
                 FileTransfer {
-                    id: transfer_id,
                     sender: offer.sender,
                     sender_username: offer.sender_username,
                     room: offer.room,
@@ -560,8 +546,6 @@ impl Shared {
                     size: offer.size,
                     acceptors,
                     state: TransferState::Offered,
-                    bytes_received: 0,
-                    created_at: offer.created_at,
                 },
             );
 
@@ -957,8 +941,36 @@ where
                         match cmd {
                             "/help" => {
                                         peer.lines
-                                            .send("INFO commands: /help /rooms /who /accept <user> [filename]".to_string())
+                                            .send("INFO commands: /help /rooms /who /offers /accept <user>".to_string())
                                             .await?;
+                            }
+                            "/offers" => {
+                                let state = state.lock().await;
+                                let offers = state.list_offers(&room);
+                                if offers.is_empty() {
+                                    peer.lines.send(format!("INFO no pending file offers in {room}")).await?;
+                                } else {
+                                    use base64::{engine::general_purpose, Engine as _};
+                                    let mut lines = vec![format!("INFO pending file offers in {room}:")];
+                                    for (username, filename_b64, size) in offers {
+                                        let filename = general_purpose::STANDARD
+                                            .decode(filename_b64)
+                                            .ok()
+                                            .and_then(|b| String::from_utf8(b).ok())
+                                            .unwrap_or_else(|| "<unknown>".to_string());
+                                        let size_display = if size >= 1024 * 1024 {
+                                            format!("{:.1} MB", size as f64 / (1024.0 * 1024.0))
+                                        } else if size >= 1024 {
+                                            format!("{:.1} KB", size as f64 / 1024.0)
+                                        } else {
+                                            format!("{} bytes", size)
+                                        };
+                                        lines.push(format!("INFO   {username}: {filename} ({size_display})"));
+                                    }
+                                    for line in lines {
+                                        peer.lines.send(line).await?;
+                                    }
+                                }
                             }
                             "/rooms" => {
                                 let state = state.lock().await;
