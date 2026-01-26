@@ -636,3 +636,8 @@ Log SHA256 fingerprints at key moments for debugging:
 - [x] Ctrl+C signal handling with client notification
 - [x] /status command showing connected clients and rooms
 - [x] Tracing integration with configurable verbosity (--verbose)
+
+### Future Enhancements
+- [ ] **Tab completion for client commands** - Add readline library (rustyline or reedline) to enable tab-completing usernames and filenames in `/accept`, `/join`, etc. Requires replacing raw stdin reads with readline input handling.
+- [ ] Sunset `--no-tls` flag (require TLS for all connections)
+- [ ] Auto-accept option for file transfers (configurable per-user or per-room)

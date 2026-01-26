@@ -73,6 +73,20 @@ pub fn is_enrolled(cert_dir: &Path) -> bool {
     cert_path.exists() && key_path.exists() && ca_path.exists()
 }
 
+/// Clear existing certificates (for re-enrollment)
+pub fn clear_certs(cert_dir: &Path) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let cert_path = cert_dir.join("client.crt");
+    let key_path = cert_dir.join("client.key");
+    let ca_path = cert_dir.join("ca.crt");
+
+    // Remove files if they exist (ignore errors if they don't)
+    let _ = fs::remove_file(&cert_path);
+    let _ = fs::remove_file(&key_path);
+    let _ = fs::remove_file(&ca_path);
+
+    Ok(())
+}
+
 /// Save the certificate bundle received during enrollment
 pub fn save_enrolled_certs(
     cert_dir: &Path,
@@ -198,7 +212,14 @@ pub async fn connect_tls(
     // included in all broker certificates, allowing connections from any IP
     let server_name = ServerName::try_from(TLS_SERVER_NAME.to_string())?;
 
-    let tls_stream = connector.connect(server_name, stream).await?;
+    eprintln!("TLS: Connecting with SNI name: {}", TLS_SERVER_NAME);
+
+    let tls_stream = connector.connect(server_name, stream).await.map_err(|e| {
+        eprintln!("TLS handshake error: {:?}", e);
+        e
+    })?;
+
+    eprintln!("TLS: Handshake complete");
     Ok(tls_stream)
 }
 

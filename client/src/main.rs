@@ -232,6 +232,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         enroll(&args.addr, token, &args.username, &args.cert_dir).await?;
         // After successful enrollment, continue to connect with TLS
         println!("Auto-connecting with TLS...\n");
+        // Small delay to ensure broker has cleaned up the enrollment connection
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     }
 
     // Check if we need TLS and have certificates
@@ -489,6 +491,12 @@ async fn enroll(
     use futures::SinkExt;
     use tokio::net::TcpStream;
     use tokio_util::codec::{Framed, LinesCodec};
+
+    // Clear any existing certificates first (handles re-enrollment with new broker)
+    if tls::is_enrolled(cert_dir) {
+        eprintln!("Clearing existing certificates for re-enrollment...");
+        tls::clear_certs(cert_dir).map_err(|e| -> Box<dyn Error> { e })?;
+    }
 
     println!("Enrolling with broker at {addr}...");
 

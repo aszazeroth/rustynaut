@@ -194,7 +194,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
                 // Spawn our handler to be run asynchronously.
                 tokio::spawn(async move {
-                    tracing::debug!("accepted connection");
+                    tracing::debug!("accepted connection from {}", addr);
                     let result = if let Some(ref tls_cfg) = tls_config {
                         // TLS connection
                         match tls_cfg.acceptor.accept(stream).await {
@@ -202,7 +202,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 process_tls(state, tls_stream, addr, tls_cfg.clone()).await
                             }
                             Err(e) => {
-                                tracing::warn!("TLS handshake failed: {:?}", e);
+                                eprintln!("TLS handshake failed from {}: {:?}", addr, e);
+                                tracing::warn!("TLS handshake failed from {}: {:?}", addr, e);
                                 Ok(())
                             }
                         }
@@ -485,6 +486,31 @@ impl Shared {
                 created_at: Instant::now(),
             },
         );
+    }
+
+    /// Find the most recent offer from a user in a room
+    /// Returns the filename_b64 of the offer if found
+    fn find_latest_offer(&self, room: &str, sender_username: &str) -> Option<String> {
+        self.pending_offers
+            .values()
+            .filter(|offer| offer.room == room && offer.sender_username == sender_username)
+            .max_by_key(|offer| offer.created_at)
+            .map(|offer| offer.filename_b64.clone())
+    }
+
+    /// List all pending offers in a room (for /offers command)
+    fn list_offers(&self, room: &str) -> Vec<(&str, &str, u64)> {
+        self.pending_offers
+            .values()
+            .filter(|offer| offer.room == room)
+            .map(|offer| {
+                (
+                    offer.sender_username.as_str(),
+                    offer.filename_b64.as_str(),
+                    offer.size,
+                )
+            })
+            .collect()
     }
 
     /// Accept a file offer and start a transfer
@@ -931,7 +957,7 @@ where
                         match cmd {
                             "/help" => {
                                         peer.lines
-                                            .send("INFO commands: /help /rooms /who /accept <user> <filename>".to_string())
+                                            .send("INFO commands: /help /rooms /who /accept <user> [filename]".to_string())
                                             .await?;
                             }
                             "/rooms" => {
@@ -963,21 +989,34 @@ where
                                     .await?;
                             }
                             _ if cmd.starts_with("/accept ") => {
-                                // Parse /accept <username> <filename>
+                                // Parse /accept <username> [filename]
+                                // If filename is omitted, accept the most recent offer from that user
                                 let rest = cmd.strip_prefix("/accept ").unwrap().trim();
                                 let parts: Vec<&str> = rest.splitn(2, ' ').collect();
-                                if parts.len() < 2 {
-                                    peer.lines.send("ERR usage: /accept <username> <filename>").await?;
+                                if parts.is_empty() || parts[0].is_empty() {
+                                    peer.lines.send("ERR usage: /accept <username> [filename]").await?;
                                     continue;
                                 }
                                 let sender_username = parts[0];
-                                let filename = parts[1];
 
-                                // Base64 encode the filename for the protocol
                                 use base64::{engine::general_purpose, Engine as _};
-                                let filename_b64 = general_purpose::STANDARD.encode(filename);
 
                                 let mut state = state.lock().await;
+
+                                // Get filename_b64 - either from argument or find latest offer
+                                let filename_b64 = if parts.len() >= 2 {
+                                    // Explicit filename provided - base64 encode it
+                                    general_purpose::STANDARD.encode(parts[1])
+                                } else {
+                                    // No filename - find the most recent offer from this user
+                                    match state.find_latest_offer(&room, sender_username) {
+                                        Some(fb64) => fb64,
+                                        None => {
+                                            peer.lines.send(format!("ERR no pending offers from {sender_username}")).await?;
+                                            continue;
+                                        }
+                                    }
+                                };
 
                                 // Try to accept the offer
                                 if let Some((transfer_id, sender_addr)) = state.accept_offer(addr, &room, sender_username, &filename_b64) {
