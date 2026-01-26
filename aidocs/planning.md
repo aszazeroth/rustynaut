@@ -639,5 +639,6 @@ Log SHA256 fingerprints at key moments for debugging:
 
 ### Future Enhancements
 - [ ] **Tab completion for client commands** - Add readline library (rustyline or reedline) to enable tab-completing usernames and filenames in `/accept`, `/join`, etc. Requires replacing raw stdin reads with readline input handling.
+- [ ] **File transfer resume support** - Add `FILE_RESUME <transfer_id> <offset>` protocol message to resume interrupted transfers. Track partial transfers on disk with metadata file. Useful for large files (1GB max) over unreliable connections.
 - [ ] Sunset `--no-tls` flag (require TLS for all connections)
 - [ ] Auto-accept option for file transfers (configurable per-user or per-room)

@@ -502,7 +502,9 @@ async fn enroll(
     // Connect with TLS in insecure mode (for enrollment)
     let tls_config = tls::init_tls_for_enrollment().map_err(|e| -> Box<dyn Error> { e })?;
 
+    eprintln!("TCP: Connecting to {}...", addr);
     let stream = TcpStream::connect(addr).await?;
+    eprintln!("TCP: Connected successfully to {}", addr);
 
     // Extract host for TLS SNI
     let host = addr.ip().to_string();

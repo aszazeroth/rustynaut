@@ -206,13 +206,19 @@ pub const TLS_SERVER_NAME: &str = "rustynaut.local";
 pub async fn connect_tls(
     connector: &TlsConnector,
     stream: TcpStream,
-    _server_addr: &str,
+    server_addr: &str,
 ) -> Result<TlsStream<TcpStream>, Box<dyn std::error::Error + Send + Sync>> {
-    // Always use rustynaut.local for SNI verification - this is a fixed DNS name
-    // included in all broker certificates, allowing connections from any IP
-    let server_name = ServerName::try_from(TLS_SERVER_NAME.to_string())?;
+    // For IP addresses, use rustynaut.local (which is in the broker's certificate SANs)
+    // For hostnames, use the provided hostname
+    let sni_name = if server_addr.parse::<std::net::IpAddr>().is_ok() {
+        TLS_SERVER_NAME.to_string()
+    } else {
+        server_addr.to_string()
+    };
 
-    eprintln!("TLS: Connecting with SNI name: {}", TLS_SERVER_NAME);
+    let server_name = ServerName::try_from(sni_name.clone())?;
+
+    eprintln!("TLS: Connecting with SNI name: {}", sni_name);
 
     let tls_stream = connector.connect(server_name, stream).await.map_err(|e| {
         eprintln!("TLS handshake error: {:?}", e);

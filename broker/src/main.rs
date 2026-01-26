@@ -195,10 +195,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 // Spawn our handler to be run asynchronously.
                 tokio::spawn(async move {
                     tracing::debug!("accepted connection from {}", addr);
+                    eprintln!("TCP: Accepted connection from {}", addr);
                     let result = if let Some(ref tls_cfg) = tls_config {
                         // TLS connection
+                        eprintln!("TLS: Starting handshake with {}...", addr);
                         match tls_cfg.acceptor.accept(stream).await {
                             Ok(tls_stream) => {
+                                eprintln!("TLS: Handshake complete with {}", addr);
                                 process_tls(state, tls_stream, addr, tls_cfg.clone()).await
                             }
                             Err(e) => {
@@ -349,8 +352,8 @@ type Rx = mpsc::UnboundedReceiver<String>;
 /// Maximum number of recent clip hashes to track per room for deduplication
 const MAX_RECENT_CLIPS_PER_ROOM: usize = 20;
 
-/// Maximum file size for transfer (50MB)
-const MAX_FILE_SIZE: u64 = 50 * 1024 * 1024;
+/// Maximum file size for transfer (1GB)
+const MAX_FILE_SIZE: u64 = 1024 * 1024 * 1024;
 
 /// State of a file transfer
 #[derive(Debug, Clone, PartialEq)]
