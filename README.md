@@ -2,15 +2,16 @@
 
 # Rustynaut
 
-Clipboard-sync broker + CLI client (Tokio) with mTLS encryption.
+Clipboard-sync broker + CLI client (Tokio) with mTLS encryption and file transfers.
 
 ## What it is
 
-Rustynaut is a small TCP, line-framed broker that relays clipboard updates between clients.
+Rustynaut is a small TCP, line-framed broker that relays clipboard updates and files between clients.
 
 - The **broker** runs on a host (your server, a VM, etc.).
 - The **clients** run on machines/VMs and publish/subscribe by **room**.
 - **TLS encryption** is enabled by default with automatic certificate enrollment.
+- **File transfers** up to 1GB via broker-mediated streaming (no P2P/NAT issues).
 
 Rooms are the "pub/sub" unit: **one shared clipboard per room**.
 
@@ -126,6 +127,48 @@ cargo run --release -- --no-tls 127.0.0.1:4242
 cargo run --release -- --no-tls 127.0.0.1:4242 alice
 ```
 
+## File Transfers
+
+Rustynaut supports file transfers up to 1GB through the broker (no P2P/NAT issues).
+
+### How it works
+
+1. **Offer**: When you copy a file in Finder (macOS), Explorer (Windows), or a file path on Linux, the client detects it and sends a `FILE_OFFER` to the room.
+2. **Accept**: Other clients see the offer and can accept it with `/accept <username> <filename>`.
+3. **Transfer**: The broker coordinates the transfer, streaming 64KB chunks from sender to receiver(s).
+4. **Complete**: Files are saved to the user's Downloads folder with automatic conflict resolution (adds `(1)`, `(2)`, etc.).
+
+### File Transfer Commands
+
+```bash
+# List pending offers in your room
+/offers
+
+# Accept the most recent offer from a user
+/accept alice
+
+# Accept a specific file
+/accept alice report.pdf
+
+# Cancel a transfer (use the transfer_id shown in messages)
+/cancel 42
+```
+
+### Size Limits
+
+| Content Size | Strategy |
+|--------------|----------|
+| < 64 KB | Sent as `CLIP` (inline base64) |
+| 64 KB – 1 GB | `FILE_OFFER` + broker-mediated transfer |
+| > 1 GB | Rejected with error |
+
+### Security
+
+- Files are transferred through the broker over the existing TLS connection
+- SHA-256 checksums verify integrity
+- Transfers are room-scoped (only room members see offers)
+- No files are stored on the broker (streaming relay only)
+
 ## Build & Run
 
 ### Broker Options
@@ -165,31 +208,48 @@ Type commands into the client stdin:
 
 | Command | Description |
 |---------|-------------|
-| \`/help\` | Show available commands |
-| \`/rooms\` | List active rooms |
-| \`/who\` | Show users in current room |
-| \`/quit\` or \`/exit\` | Exit the client |
+| `/help` | Show available commands |
+| `/rooms` | List active rooms |
+| `/who` | Show users in current room |
+| `/offers` | List pending file offers in current room |
+| `/accept <user> [filename]` | Accept a file offer from a user |
+| `/cancel <transfer_id>` | Cancel an in-progress file transfer |
+| `/quit` or `/exit` | Exit the client |
 
 ## Wire Protocol
 
-Transport is line-framed TCP/TLS (\`LinesCodec\`).
+Transport is line-framed TCP/TLS (`LinesCodec`).
 
 **Client → Broker:**
-- \`USER <name>\` — Set username
-- \`JOIN <room>\` — Join a room
-- \`CLIP <room> <b64>\` — Clipboard update (base64)
-- \`CMD /...\` — Slash command
-- \`SAY <text>\` — Chat message
-- \`ENROLL <token> <username>\` — Request certificate enrollment
+- `USER <name>` — Set username
+- `JOIN <room>` — Join a room
+- `CLIP <room> <b64>` — Clipboard update (base64)
+- `CMD /...` — Slash command
+- `SAY <text>` — Chat message
+- `ENROLL <token> <username>` — Request certificate enrollment
+- `FILE_OFFER <room> <filename_b64> <size>` — Offer a file to the room
+- `FILE_ACCEPT <room> <sender_username> <filename_b64>` — Accept a file offer
+- `FILE_CANCEL <transfer_id>` — Cancel a file transfer
+- `FILE_CHUNK <transfer_id> <offset> <chunk_b64>` — File data chunk (64KB)
+- `FILE_END <transfer_id> <sha256>` — End of file transfer
 
 **Broker → Client:**
-- \`INFO <text>\` — Informational message
-- \`ERR <text>\` — Error message
-- \`CLIP <room> <b64> <id>\` — Clipboard broadcast
-- \`SAY <user> <text>\` — Chat message
-- \`ENROLLED <cert_b64> <key_b64> <ca_b64>\` — Enrollment response
+- `INFO <text>` — Informational message
+- `ERR <text>` — Error message
+- `CLIP <room> <b64> <id>` — Clipboard broadcast
+- `SAY <user> <text>` — Chat message
+- `ENROLLED <cert_b64> <key_b64> <ca_b64>` — Enrollment response
+- `FILE_OFFER <room> <username> <filename_b64> <size>` — File offer notification
+- `FILE_START <transfer_id> <filename_b64> <acceptor_count>` — Start sending file
+- `FILE_INCOMING <transfer_id> <filename_b64> <size>` — Incoming file notification
+- `FILE_CHUNK <transfer_id> <offset> <chunk_b64>` — Relayed file chunk
+- `FILE_DONE <transfer_id> <sha256>` — File transfer complete
+- `FILE_SENT <transfer_id> <receiver_count>` — Confirmation to sender
+- `FILE_CANCELLED <transfer_id> <reason>` — Transfer cancelled
 
 ## Example Session
+
+### Clipboard Sync
 
 ```bash
 # Terminal 1: Start broker
@@ -203,6 +263,21 @@ cd client && cargo run --release -- --enroll <TOKEN> 127.0.0.1:4242 bob lobby
 ```
 
 Now changing the system clipboard on one client replicates to the other.
+
+### File Transfer
+
+```bash
+# In Terminal 2 (alice), copy a file to clipboard (macOS example)
+# Or simply copy a file in Finder/Explorer
+
+# Terminal 3 (bob) sees:
+# INFO [lobby] alice offers file: report.pdf (245 KB) - use /accept alice report.pdf to receive
+
+# In Terminal 3, accept the file:
+/accept alice report.pdf
+
+# File is downloaded to ~/Downloads/report.pdf
+```
 
 ## Debugging
 

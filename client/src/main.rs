@@ -7,6 +7,8 @@
 
 mod clipboard_files;
 mod tls;
+mod tui;
+mod completion;
 
 /// Maximum line length for the wire protocol (2MB to handle large base64 clipboard payloads)
 /// For files larger than ~1.5MB raw, use the sideband FILE_OFFER protocol instead.
@@ -222,55 +224,64 @@ fn parse_args() -> Result<Args, Box<dyn Error>> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    println!("{BANNER}");
-
+    // Parse args first (before TUI setup)
     let args = parse_args()?;
 
-    // Handle enrollment if requested
+    // Handle enrollment if requested (before TUI)
     if let Some(ref token) = args.enroll_token {
+        println!("{BANNER}");
         enroll(&args.addr, token, &args.username, &args.cert_dir).await?;
-        // After successful enrollment, continue to connect with TLS
         println!("Auto-connecting with TLS...\n");
-        // Small delay to ensure broker has cleaned up the enrollment connection
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     }
 
     // Check if we need TLS and have certificates
     let tls_enabled = !args.tls_disabled;
     if tls_enabled && !tls::is_enrolled(&args.cert_dir) {
+        println!("{BANNER}");
         eprintln!("TLS is enabled by default but you are not enrolled.");
         eprintln!("Use --enroll <token> to enroll first, or --no-tls for insecure mode.");
         eprintln!("Certificates should be in: {:?}", args.cert_dir);
         return Err("Not enrolled for TLS".into());
     }
 
-    let (tx, rx) = mpsc::channel::<String>(10);
-    let rx = tokio_stream::wrappers::ReceiverStream::new(rx);
+    // Setup TUI
+    let mut terminal = tui::setup_terminal()?;
+    let mut app = tui::App::new(args.username.clone(), args.room.clone());
+    app.handle_room_join(&args.room);
+    app.completion_context_mut()
+        .add_user(args.username.clone());
 
-    // File transfer channel (larger buffer for chunked transfers)
-    let (file_tx, file_rx) = mpsc::channel::<String>(100);
-    let file_rx = tokio_stream::wrappers::ReceiverStream::new(file_rx);
+    // Add initial messages
+    app.add_info("Welcome to Rustynaut!");
+    app.add_info(format!("Connecting to {} as {}...", args.addr, args.username));
+
+    // Channels for communication between TUI and network
+    let (net_tx, mut net_rx) = mpsc::channel::<String>(100);
+    let (ui_tx, mut ui_rx) = mpsc::channel::<tui::Message>(100);
+
+    // File transfer channel
+    let (file_tx, mut file_rx) = mpsc::channel::<String>(100);
     
     // Store file_tx globally so message handlers can send file chunks
     if let Ok(mut guard) = FILE_TX.lock() {
         *guard = Some(file_tx);
     }
 
-    // Spawn a task to monitor clipboard changes
+    // Clone for clipboard task
     let room_for_clipboard = args.room.clone();
     let verbose_for_clipboard = args.verbose;
+    let clipboard_tx = net_tx.clone();
+
+    // Spawn clipboard monitoring task
     tokio::spawn(async move {
         let mut previous_content = match CLIPBOARD.get_string_contents() {
             Ok(s) => s,
             Err(err) => {
-                // Treat "clipboard is empty" as an empty string, not an error
                 let err_str = err.to_string();
                 if err_str.contains("empty") || err_str.contains("Empty") {
                     String::new()
                 } else {
-                    eprintln!(
-                        "clipboard unavailable ({err}); clipboard publishing disabled for this client"
-                    );
                     return;
                 }
             }
@@ -278,26 +289,24 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let mut previous_files: Option<Vec<std::path::PathBuf>> = None;
         let mut interval = time::interval(Duration::from_secs(2));
         let mut warned = false;
+        
         loop {
             interval.tick().await;
 
-            // First, check for native file clipboard (Finder/Explorer copy)
+            // Check for native file clipboard (Finder/Explorer copy)
             if let Some(files) = clipboard_files::get_clipboard_files() {
-                // Check if files changed
                 let files_changed = previous_files.as_ref() != Some(&files);
                 if files_changed {
                     for path in &files {
                         if let Ok(metadata) = std::fs::metadata(path) {
                             if metadata.is_file() {
                                 let size = metadata.len();
-                                // Get just the filename for the offer
                                 let filename = path
                                     .file_name()
                                     .and_then(|n| n.to_str())
                                     .unwrap_or("unknown");
                                 let filename_b64 = general_purpose::STANDARD.encode(filename);
 
-                                // Track the pending outgoing file
                                 if let Ok(mut pending) = PENDING_OUTGOING.lock() {
                                     pending.insert(filename_b64.clone(), PendingOutgoingFile {
                                         path: path.clone(),
@@ -305,33 +314,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     });
                                 }
 
-                                // Send FILE_OFFER to broker
                                 let offer_msg = format!(
                                     "FILE_OFFER {room_for_clipboard} {filename_b64} {size}"
                                 );
-                                if tx.send(offer_msg).await.is_err() {
-                                    eprintln!("Failed to send file offer");
+                                if clipboard_tx.send(offer_msg).await.is_err() {
                                     break;
                                 }
-
-                                if verbose_for_clipboard {
-                                    eprintln!(
-                                        "file offer sent: {} ({} bytes)",
-                                        path.display(),
-                                        size
-                                    );
-                                }
-                            } else if verbose_for_clipboard {
-                                eprintln!(
-                                    "directory copied (native): {} - skipping",
-                                    path.display()
-                                );
                             }
                         }
                     }
                     previous_files = Some(files);
-                    // Also update previous_content to prevent the file path from being sent as CLIP
-                    // (copying files often also puts the path in the text clipboard)
                     if let Ok(text) = CLIPBOARD.get_string_contents() {
                         previous_content = text;
                     }
@@ -345,33 +337,25 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     s
                 }
                 Err(err) => {
-                    // Treat "clipboard is empty" as an empty string, not an error
                     let err_str = err.to_string();
                     if err_str.contains("empty") || err_str.contains("Empty") {
                         warned = false;
                         String::new()
                     } else {
-                        if verbose_for_clipboard && !warned {
-                            eprintln!(
-                                "clipboard read failed ({err}); will retry (publishing paused)"
-                            );
-                            warned = true;
-                        }
+                        warned = true;
                         continue;
                     }
                 }
             };
+            
             if current_content != previous_content {
-                // Clear file tracking when text content changes
                 previous_files = None;
 
-                // Skip empty content
                 if current_content.is_empty() {
                     previous_content = current_content;
                     continue;
                 }
 
-                // Echo suppression: skip if this is content we recently applied from the network
                 let is_echo = if let Ok(recent) = RECENT_APPLIED_CLIPS.lock() {
                     recent.contains(&current_content)
                 } else {
@@ -379,22 +363,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 };
 
                 if is_echo {
-                    // This is an echo of what we received - don't send it back
                     previous_content = current_content;
                     continue;
                 }
 
-                // Check if clipboard contains a file path
                 if let Some((path, size, is_file)) = detect_file_path(&current_content) {
                     if is_file {
-                        // Send FILE_OFFER instead of CLIP for files
                         let filename = path
                             .file_name()
                             .and_then(|n| n.to_str())
                             .unwrap_or("unknown");
                         let filename_b64 = general_purpose::STANDARD.encode(filename);
 
-                        // Track the pending outgoing file
                         if let Ok(mut pending) = PENDING_OUTGOING.lock() {
                             pending.insert(filename_b64.clone(), PendingOutgoingFile {
                                 path: path.clone(),
@@ -404,31 +384,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
                         let offer_msg =
                             format!("FILE_OFFER {room_for_clipboard} {filename_b64} {size}");
-                        if tx.send(offer_msg).await.is_err() {
-                            eprintln!("Failed to send file offer");
+                        if clipboard_tx.send(offer_msg).await.is_err() {
                             break;
                         }
 
-                        if verbose_for_clipboard {
-                            eprintln!("file offer sent: {} ({} bytes)", path.display(), size);
-                        }
-
-                        previous_content = current_content;
-                        continue;
-                    } else if verbose_for_clipboard {
-                        eprintln!("directory detected: {} - skipping", path.display());
                         previous_content = current_content;
                         continue;
                     }
                 }
 
                 let encoded = general_purpose::STANDARD.encode(&current_content);
-                if tx
+                if clipboard_tx
                     .send(format!("CLIP {room_for_clipboard} {encoded}"))
                     .await
                     .is_err()
                 {
-                    eprintln!("Failed to send encoded content");
                     break;
                 }
                 previous_content = current_content;
@@ -436,48 +406,182 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     });
 
-    let init = tokio_stream::iter([
-        Ok::<String, LinesCodecError>(format!("USER {}", args.username)),
-        Ok::<String, LinesCodecError>(format!("JOIN {}", args.room)),
-    ]);
+    // Send initial USER and JOIN
+    if net_tx
+        .send(format!("USER {}", args.username))
+        .await
+        .is_err()
+    {
+        app.add_error("Failed to send USER command");
+    }
+    if net_tx
+        .send(format!("JOIN {}", args.room))
+        .await
+        .is_err()
+    {
+        app.add_error("Failed to send JOIN command");
+    }
 
-    let stdin = FramedRead::new(io::stdin(), LinesCodec::new()).filter_map(|i| {
-        match i {
-            Ok(line) => {
-                // Handle local quit commands
-                if line == "/quit" || line == "/exit" {
-                    println!("Goodbye!");
-                    std::process::exit(0);
+    // Spawn network connection task
+    let addr = args.addr;
+    let cert_dir = args.cert_dir.clone();
+    let tls_disabled = args.tls_disabled;
+    let verbose = args.verbose;
+    
+    tokio::spawn(async move {
+        if tls_disabled {
+            if let Err(e) = tcp::connect_with_channels(&addr, net_rx, ui_tx, verbose).await {
+                eprintln!("Connection error: {}", e);
+            }
+        } else {
+            match tls::init_tls_with_client_cert(&cert_dir) {
+                Ok(tls_config) => {
+                    if let Err(e) = tls_transport::connect_with_channels(&addr, &tls_config, net_rx, ui_tx, verbose).await {
+                        eprintln!("TLS connection error: {}", e);
+                    }
                 }
-                if line.starts_with('/') {
-                    Some(Ok(format!("CMD {line}")))
-                } else {
-                    Some(Ok(format!("SAY {line}")))
+                Err(e) => {
+                    eprintln!("TLS init error: {}", e);
                 }
             }
-            Err(e) => Some(Err(e)),
         }
     });
 
-    let stdin = init
-        .merge(stdin)
-        .merge(rx.map(Result::<String, LinesCodecError>::Ok))
-        .merge(file_rx.map(Result::<String, LinesCodecError>::Ok));
+    // Main TUI event loop
+    let result = run_tui_loop(&mut terminal, &mut app, net_tx, ui_rx).await;
 
-    let stdout = FramedWrite::new(io::stdout(), LinesCodec::new());
+    // Restore terminal
+    tui::restore_terminal()?;
+    
+    result
+}
 
-    if tls_enabled {
-        // TLS connection
-        let tls_config =
-            tls::init_tls_with_client_cert(&args.cert_dir).map_err(|e| -> Box<dyn Error> { e })?;
-        tls_transport::connect(&args.addr, &tls_config, stdin, stdout, args.verbose).await?;
-    } else {
-        // Plain TCP (insecure) connection
-        eprintln!("WARNING: TLS disabled, connection is not encrypted!");
-        tcp::connect(&args.addr, stdin, stdout, args.verbose).await?;
+/// Main TUI event loop
+async fn run_tui_loop(
+    terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
+    app: &mut tui::App,
+    net_tx: mpsc::Sender<String>,
+    mut ui_rx: mpsc::Receiver<tui::Message>,
+) -> Result<(), Box<dyn Error>> {
+    let mut last_tick = tokio::time::Instant::now();
+    let tick_rate = tokio::time::Duration::from_millis(100);
+
+    loop {
+        // Draw UI
+        terminal.draw(|frame| app.draw(frame))?;
+
+        // Handle timeout for polling
+        let timeout = tick_rate
+            .checked_sub(last_tick.elapsed())
+            .unwrap_or_else(|| tokio::time::Duration::from_secs(0));
+
+        // Check for UI messages from network
+        while let Ok(msg) = ui_rx.try_recv() {
+            match msg {
+                tui::Message::Info { text, .. } => app.handle_info(&text),
+                tui::Message::Error { text, .. } => app.add_error(text),
+                tui::Message::Chat { user, text, .. } => app.add_chat(user, text),
+                tui::Message::FileOffer { room, user, filename, size, .. } => {
+                    app.handle_file_offer(&room, &user, &filename, &size)
+                }
+                tui::Message::FileTransfer { text, .. } => app.handle_file_transfer(&text),
+                tui::Message::Clip { room, preview, .. } => app.handle_clip(&room, &preview),
+            }
+        }
+
+        // Poll for events with timeout
+        if crossterm::event::poll(std::time::Duration::from_millis(10))? {
+            if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
+                if key.kind == crossterm::event::KeyEventKind::Press {
+                    match key.code {
+                        crossterm::event::KeyCode::Char('c')
+                            if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) =>
+                        {
+                            app.should_quit = true;
+                        }
+                        crossterm::event::KeyCode::Char(c) => {
+                            // Cancel completions when typing
+                            if !app.current_completions.is_empty() {
+                                app.cancel_completion();
+                            }
+                            if let Some(cmd) = app.handle_input(c) {
+                                // Process command
+                                if cmd == "/quit" || cmd == "/exit" {
+                                    app.should_quit = true;
+                                } else if let Err(e) = process_command(cmd, &net_tx).await {
+                                    app.add_error(format!("Failed to send: {}", e));
+                                }
+                            }
+                        }
+                        crossterm::event::KeyCode::Backspace => app.handle_backspace(),
+                        crossterm::event::KeyCode::Delete => app.handle_delete(),
+                        crossterm::event::KeyCode::Left => app.cursor_left(),
+                        crossterm::event::KeyCode::Right => app.cursor_right(),
+                        crossterm::event::KeyCode::Home => app.cursor_home(),
+                        crossterm::event::KeyCode::End => app.cursor_end(),
+                        crossterm::event::KeyCode::Up => app.history_previous(),
+                        crossterm::event::KeyCode::Down => app.history_next(),
+                        crossterm::event::KeyCode::PageUp => {
+                            for _ in 0..5 {
+                                app.scroll_up();
+                            }
+                        }
+                        crossterm::event::KeyCode::PageDown => {
+                            for _ in 0..5 {
+                                app.scroll_down();
+                            }
+                        }
+                        crossterm::event::KeyCode::Tab => {
+                            // Tab completion
+                            app.handle_tab();
+                        }
+                        crossterm::event::KeyCode::Enter => {
+                            if !app.current_completions.is_empty() {
+                                app.apply_completion();
+                            } else if let Some(cmd) = app.handle_input('\n') {
+                                // Process command
+                                if cmd == "/quit" || cmd == "/exit" {
+                                    app.should_quit = true;
+                                } else if let Err(e) = process_command(cmd, &net_tx).await {
+                                    app.add_error(format!("Failed to send: {}", e));
+                                }
+                            }
+                        }
+                        crossterm::event::KeyCode::F(1) => app.toggle_sidebar(),
+                        crossterm::event::KeyCode::Esc => {
+                            if !app.current_completions.is_empty() {
+                                app.cancel_completion();
+                            } else {
+                                app.should_quit = true;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        if last_tick.elapsed() >= tick_rate {
+            last_tick = tokio::time::Instant::now();
+        }
+
+        if app.should_quit {
+            break;
+        }
     }
 
     Ok(())
+}
+
+/// Process a user command and send to network
+async fn process_command(cmd: String, net_tx: &mpsc::Sender<String>) -> Result<(), Box<dyn Error>> {
+    let message = if cmd.starts_with('/') {
+        format!("CMD {}", cmd)
+    } else {
+        format!("SAY {}", cmd)
+    };
+    
+    net_tx.send(message).await.map_err(|e| e.into())
 }
 
 /// Enroll with the broker to obtain client certificates
@@ -667,6 +771,15 @@ fn parse_file_sent_fields(line: &str) -> Option<(&str, &str)> {
     }
 }
 
+/// Parse SAY from broker: SAY <user> <text>
+fn parse_say_fields(line: &str) -> Option<(&str, &str)> {
+    let mut parts = line.splitn(3, ' ');
+    match (parts.next()?, parts.next()?, parts.next()?) {
+        ("SAY", user, text) => Some((user, text)),
+        _ => None,
+    }
+}
+
 /// Generate FILE_CHUNK messages for a file transfer
 /// Returns a Vec of messages to send (FILE_CHUNK and FILE_END)
 fn generate_file_chunks(filename_b64: &str, transfer_id: &str) -> Vec<String> {
@@ -819,7 +932,249 @@ mod tcp {
     use futures::{future, Sink, SinkExt, Stream, StreamExt};
     use std::{error::Error, net::SocketAddr};
     use tokio::net::TcpStream;
+    use tokio::sync::mpsc;
     use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec, LinesCodecError};
+
+    /// Connect using channels for TUI integration
+    pub async fn connect_with_channels(
+        addr: &SocketAddr,
+        mut net_rx: mpsc::Receiver<String>,
+        ui_tx: mpsc::Sender<crate::tui::Message>,
+        verbose: bool,
+    ) -> Result<(), Box<dyn Error>> {
+        let mut stream = TcpStream::connect(addr).await?;
+        let (r, w) = stream.split();
+        
+        let mut sink = FramedWrite::new(w, LinesCodec::new_with_max_length(crate::MAX_LINE_LENGTH));
+        let mut stream_reader = FramedRead::new(
+            r,
+            LinesCodec::new_with_max_length(crate::MAX_LINE_LENGTH),
+        );
+
+        // Send initial connection message
+        let _ = ui_tx.send(crate::tui::Message::Info { text: format!("Connected to {}", addr), timestamp: std::time::SystemTime::now() }).await;
+
+        loop {
+            tokio::select! {
+                // Read from network
+                msg = stream_reader.next() => {
+                    match msg {
+                        Some(Ok(message)) => {
+                            if let Err(e) = handle_message(&message, &ui_tx, verbose).await {
+                                let _ = ui_tx.send(crate::tui::Message::Error { text: format!("Error handling message: {}", e), timestamp: std::time::SystemTime::now() }).await;
+                            }
+                        }
+                        Some(Err(e)) => {
+                            let _ = ui_tx.send(crate::tui::Message::Error { text: format!("Read error: {}", e), timestamp: std::time::SystemTime::now() }).await;
+                            break;
+                        }
+                        None => {
+                            let _ = ui_tx.send(crate::tui::Message::Info { text: "Connection closed".to_string(), timestamp: std::time::SystemTime::now() }).await;
+                            break;
+                        }
+                    }
+                }
+                // Write to network
+                msg = net_rx.recv() => {
+                    match msg {
+                        Some(line) => {
+                            if let Err(e) = sink.send(&line).await {
+                                let _ = ui_tx.send(crate::tui::Message::Error { text: format!("Write error: {}", e), timestamp: std::time::SystemTime::now() }).await;
+                                break;
+                            }
+                        }
+                        None => {
+                            // Channel closed
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Handle a message from the network and send to UI
+    pub async fn handle_message(
+        message: &str,
+        ui_tx: &mpsc::Sender<crate::tui::Message>,
+        verbose: bool,
+    ) -> Result<(), String> {
+        // Apply clipboard updates silently (avoid printing base64 payloads).
+        if let Some((room, clipboard_b64, id)) = crate::parse_clip_fields(message) {
+            let err_msg = if let Err(err) = crate::replace_clipboard_content(clipboard_b64) {
+                Some(format!("could not replace the clipboard content, {}", err))
+            } else {
+                None
+            };
+            
+            if let Some(msg) = err_msg {
+                let _ = ui_tx.send(crate::tui::Message::Error { 
+                    text: msg,
+                    timestamp: std::time::SystemTime::now()
+                }).await;
+            }
+
+            if verbose {
+                let id_str = id.unwrap_or("?");
+                let _ = ui_tx.send(crate::tui::Message::Info { 
+                    text: format!("clip applied: room={} id={} (b64_len={})", room, id_str, clipboard_b64.len()),
+                    timestamp: std::time::SystemTime::now()
+                }).await;
+            }
+            return Ok(());
+        }
+
+        // Handle FILE_OFFER: display as a user-friendly message
+        if let Some((room, username, filename_b64, size_str)) =
+            crate::parse_file_offer_fields(message)
+        {
+            let filename = base64::engine::general_purpose::STANDARD
+                .decode(filename_b64)
+                .ok()
+                .and_then(|bytes| String::from_utf8(bytes).ok())
+                .unwrap_or_else(|| "<unknown>".to_string());
+            let size: u64 = size_str.parse().unwrap_or(0);
+            let size_display = crate::format_size(size);
+            
+            let _ = ui_tx.send(crate::tui::Message::FileOffer {
+                room: room.to_string(),
+                user: username.to_string(),
+                filename,
+                size: size_display,
+                timestamp: std::time::SystemTime::now()
+            }).await;
+            return Ok(());
+        }
+
+        // Handle FILE_START: sender should begin transfer
+        if let Some((transfer_id, filename_b64, acceptor_count)) =
+            crate::parse_file_start_fields(message)
+        {
+            let filename = base64::engine::general_purpose::STANDARD
+                .decode(filename_b64)
+                .ok()
+                .and_then(|bytes| String::from_utf8(bytes).ok())
+                .unwrap_or_else(|| "<unknown>".to_string());
+            
+            let _ = ui_tx.send(crate::tui::Message::FileTransfer {
+                text: format!(
+                    "File transfer started: {} (transfer_id={}, {} receiver(s))",
+                    filename, transfer_id, acceptor_count
+                ),
+                timestamp: std::time::SystemTime::now()
+            }).await;
+            
+            // Spawn a task to send file chunks
+            let filename_b64_owned = filename_b64.to_string();
+            let transfer_id_owned = transfer_id.to_string();
+            tokio::spawn(async move {
+                let messages = crate::generate_file_chunks(&filename_b64_owned, &transfer_id_owned);
+                let tx = crate::FILE_TX.lock().ok().and_then(|guard| guard.clone());
+                if let Some(tx) = tx {
+                    for msg in messages {
+                        if tx.send(msg).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            });
+            
+            return Ok(());
+        }
+
+        // Handle FILE_INCOMING: receiver should prepare to receive
+        if let Some((transfer_id, filename_b64, size_str)) =
+            crate::parse_file_incoming_fields(message)
+        {
+            let filename = base64::engine::general_purpose::STANDARD
+                .decode(filename_b64)
+                .ok()
+                .and_then(|bytes| String::from_utf8(bytes).ok())
+                .unwrap_or_else(|| "<unknown>".to_string());
+            let size: u64 = size_str.parse().unwrap_or(0);
+            
+            let tid: u64 = transfer_id.parse().unwrap_or(0);
+            if let Err(e) = crate::prepare_incoming_transfer(tid, &filename, size) {
+                let _ = ui_tx.send(crate::tui::Message::Error { 
+                    text: format!("Failed to prepare transfer: {}", e),
+                    timestamp: std::time::SystemTime::now()
+                }).await;
+            }
+            
+            let _ = ui_tx.send(crate::tui::Message::FileTransfer {
+                text: format!("Receiving file: {} ({} bytes)", filename, size),
+                timestamp: std::time::SystemTime::now()
+            }).await;
+            return Ok(());
+        }
+
+        // Handle FILE_CHUNK: write chunk to temp file
+        if let Some((transfer_id, offset, chunk_b64)) = crate::parse_file_chunk_fields(message) {
+            let tid: u64 = transfer_id.parse().unwrap_or(0);
+            let off: u64 = offset.parse().unwrap_or(0);
+            if let Err(e) = crate::handle_file_chunk(tid, off, chunk_b64) {
+                let _ = ui_tx.send(crate::tui::Message::Error { text: format!("Chunk error: {}", e), timestamp: std::time::SystemTime::now() }).await;
+            }
+            return Ok(());
+        }
+
+        // Handle FILE_DONE: finalize the transfer
+        if let Some((transfer_id, sha256)) = crate::parse_file_done_fields(message) {
+            let tid: u64 = transfer_id.parse().unwrap_or(0);
+            match crate::finalize_transfer(tid, sha256) {
+                Ok(final_path) => {
+                    let _ = ui_tx.send(crate::tui::Message::FileTransfer {
+                        text: format!("File received: {}", final_path),
+                        timestamp: std::time::SystemTime::now()
+                    }).await;
+                }
+                Err(e) => {
+                    let _ = ui_tx.send(crate::tui::Message::Error {
+                        text: format!("File transfer failed: {}", e),
+                        timestamp: std::time::SystemTime::now()
+                    }).await;
+                }
+            }
+            return Ok(());
+        }
+
+        // Handle FILE_SENT: sender confirmation
+        if let Some((transfer_id, count)) = crate::parse_file_sent_fields(message) {
+            let _ = ui_tx.send(crate::tui::Message::FileTransfer {
+                text: format!(
+                    "File sent successfully (transfer_id={}, {} receiver(s))",
+                    transfer_id, count
+                ),
+                timestamp: std::time::SystemTime::now()
+            }).await;
+            return Ok(());
+        }
+
+        // Handle FILE_CANCELLED
+        if let Some((transfer_id, reason)) = crate::parse_file_cancelled_fields(message) {
+            let _ = ui_tx.send(crate::tui::Message::FileTransfer {
+                text: format!("File transfer {} cancelled: {}", transfer_id, reason),
+                timestamp: std::time::SystemTime::now()
+            }).await;
+            return Ok(());
+        }
+
+        // Handle SAY messages
+        if let Some((user, text)) = crate::parse_say_fields(message) {
+            let _ = ui_tx.send(crate::tui::Message::Chat {
+                user: user.to_string(),
+                text: text.to_string(),
+                timestamp: std::time::SystemTime::now()
+            }).await;
+            return Ok(());
+        }
+
+        // Default: treat as info message
+        let _ = ui_tx.send(crate::tui::Message::Info { text: message.to_string(), timestamp: std::time::SystemTime::now() }).await;
+        Ok(())
+    }
 
     pub async fn connect(
         addr: &SocketAddr,
@@ -1001,8 +1356,78 @@ mod tls_transport {
     use base64::Engine;
     use futures::{future, Sink, SinkExt, Stream, StreamExt};
     use std::{error::Error, net::SocketAddr};
+    use tokio::io::{AsyncRead, AsyncWrite};
     use tokio::net::TcpStream;
+    use tokio::sync::mpsc;
+    use tokio_rustls::client::TlsStream;
     use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec, LinesCodecError};
+
+    /// Connect using channels for TUI integration
+    pub async fn connect_with_channels(
+        addr: &SocketAddr,
+        tls_config: &crate::tls::TlsClientConfig,
+        mut net_rx: mpsc::Receiver<String>,
+        ui_tx: mpsc::Sender<crate::tui::Message>,
+        verbose: bool,
+    ) -> Result<(), Box<dyn Error>> {
+        let tcp_stream = TcpStream::connect(addr).await?;
+        
+        // Extract host for TLS SNI
+        let host = addr.ip().to_string();
+        let tls_stream = crate::tls::connect_tls(&tls_config.connector, tcp_stream, &host)
+            .await
+            .map_err(|e| -> Box<dyn Error> { e })?;
+
+        let (r, w) = tokio::io::split(tls_stream);
+        let mut sink = FramedWrite::new(w, LinesCodec::new_with_max_length(crate::MAX_LINE_LENGTH));
+        let mut stream_reader = FramedRead::new(
+            r,
+            LinesCodec::new_with_max_length(crate::MAX_LINE_LENGTH),
+        );
+
+        // Send initial connection message
+        let _ = ui_tx.send(crate::tui::Message::Info { text: format!("TLS connected to {}", addr), timestamp: std::time::SystemTime::now() }).await;
+
+        loop {
+            tokio::select! {
+                // Read from network
+                msg = stream_reader.next() => {
+                    match msg {
+                        Some(Ok(message)) => {
+                            if let Err(e) = super::tcp::handle_message(&message, &ui_tx, verbose).await {
+                                let _ = ui_tx.send(crate::tui::Message::Error { text: format!("Error handling message: {}", e), timestamp: std::time::SystemTime::now() }).await;
+                            }
+                        }
+                        Some(Err(e)) => {
+                            let _ = ui_tx.send(crate::tui::Message::Error { text: format!("Read error: {}", e), timestamp: std::time::SystemTime::now() }).await;
+                            break;
+                        }
+                        None => {
+                            let _ = ui_tx.send(crate::tui::Message::Info { text: "Connection closed".to_string(), timestamp: std::time::SystemTime::now() }).await;
+                            break;
+                        }
+                    }
+                }
+                // Write to network
+                msg = net_rx.recv() => {
+                    match msg {
+                        Some(line) => {
+                            if let Err(e) = sink.send(&line).await {
+                                let _ = ui_tx.send(crate::tui::Message::Error { text: format!("Write error: {}", e), timestamp: std::time::SystemTime::now() }).await;
+                                break;
+                            }
+                        }
+                        None => {
+                            // Channel closed
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
 
     pub async fn connect(
         addr: &SocketAddr,
