@@ -638,7 +638,276 @@ Log SHA256 fingerprints at key moments for debugging:
 - [x] Tracing integration with configurable verbosity (--verbose)
 
 ### Future Enhancements
-- [ ] **Tab completion for client commands** - Add readline library (rustyline or reedline) to enable tab-completing usernames and filenames in `/accept`, `/join`, etc. Requires replacing raw stdin reads with readline input handling.
+- [ ] **TUI Client with Tab Completion** - Replace raw terminal with ratatui + tui-prompts. Provides better UI (no scrolling issues), built-in tab completion for commands/usernames/filenames, and visual polish. See detailed planning below.
 - [ ] **File transfer resume support** - Add `FILE_RESUME <transfer_id> <offset>` protocol message to resume interrupted transfers. Track partial transfers on disk with metadata file. Useful for large files (1GB max) over unreliable connections.
 - [ ] Sunset `--no-tls` flag (require TLS for all connections)
 - [ ] Auto-accept option for file transfers (configurable per-user or per-room)
+
+---
+
+## TUI Client with Tab Completion
+
+### Overview
+Replace the raw terminal interface with a proper TUI (Terminal User Interface) using **ratatui** + **tui-prompts**. This consolidates two efforts:
+1. Eliminate scrolling issues and improve terminal experience
+2. Add tab completion for commands, usernames, and filenames
+
+**Why consolidate?** Ratatui doesn't provide input handling itself, but `tui-prompts` (a ratatui extension) has **built-in autocomplete support** along with readline-style keybindings. Using a TUI library gives us both goals in one implementation.
+
+### Key Insight
+> Ratatui is just a widget/rendering library. For input with completion, we need `tui-prompts` which explicitly supports "Autocomplete" and "Autocomplete multi-select" as features.
+
+### Library Stack
+
+| Crate | Purpose | Version |
+|-------|---------|---------|
+| `ratatui` | TUI rendering framework | `0.29` |
+| `tui-prompts` | Input prompts with autocomplete | `0.6` |
+| `crossterm` | Cross-platform terminal events | `0.28` |
+
+**Alternative considered:** `rustyline` + raw terminal - rejected because it doesn't solve the scrolling/UI issues.
+
+### New Architecture
+
+**Current (raw terminal):**
+```
+┌─────────────────────────────┐
+│ ██████  ██   ██ ...         │  ← ASCII banner prints once
+│                             │
+│ INFO alice joined           │  ← Messages scroll up
+│ INFO [lobby] bob offers...  │
+│ > /accept                   │  ← Input at bottom
+└─────────────────────────────┘
+```
+
+**New (TUI layout):**
+```
+┌─────────────────────────────┐
+│ ██████  ██   ██ ...         │  ← Banner (top, fixed)
+├─────────────────────────────┤
+│ alice: Hey everyone!        │  ← Chat/log area (scrollable)
+│ INFO [lobby] bob offers...  │
+│ ...                         │
+├─────────────────────────────┤
+│ Users: alice, bob, charlie  │  ← Status bar (optional)
+├─────────────────────────────┤
+│ rustynaut> /accept bo       │  ← Input prompt with completion
+│        bob                  │     dropdown
+└─────────────────────────────┘
+```
+
+### UI Layout Components
+
+```rust
+struct App {
+    // Protocol state
+    connection: ConnectionState,
+    current_room: String,
+    username: String,
+    
+    // UI state
+    messages: Vec<ChatMessage>,       // Chat history (scrollable)
+    users_in_room: Vec<String>,       // For sidebar/status
+    pending_offers: Vec<FileOffer>,   // Active file offers
+    
+    // Input with completion
+    input_state: TextState<'static>,  // From tui-prompts
+    completer: RustynautCompleter,    // Custom completion logic
+    
+    // Layout refs
+    scroll_offset: usize,
+    show_sidebar: bool,
+}
+```
+
+### Layout Areas
+
+```rust
+// Proposed layout
+┌───────────────────────────────────┐
+│ Banner (2 lines, fixed)           │ area[0]
+├───────────────────────────────────┤
+│                                   │
+│  Chat / Log Area                  │ area[1] (scrollable)
+│  (Messages + file transfer status)│
+│                                   │
+├───────────────────────────────────┤
+│ Status Bar (optional): Room | N users │ area[2]
+├───────────────────────────────────┤
+│ Input: rustynaut> _               │ area[3] (with completion dropdown)
+└───────────────────────────────────┘
+```
+
+### Tab Completion Integration
+
+**tui-prompts features we use:**
+- Text input with cursor positioning
+- Readline/emacs keybindings (`C-a`, `C-e`, `C-k`, etc.)
+- **Autocomplete** - our custom completion provider
+- History support
+- Bracketed paste
+
+**Completion Context (same data as before):**
+```rust
+struct RustynautCompleter {
+    known_rooms: Vec<String>,
+    users_in_room: Vec<String>,
+    pending_filenames: HashMap<String, Vec<String>>,
+}
+
+impl tui_prompts::completion::Completer for RustynautCompleter {
+    fn complete(&self, line: &str, pos: usize) -> Vec<Completion> {
+        // Parse: "/accept bo" → complete "bo" against usernames
+        // Parse: "/accept bob re" → complete "re" against bob's files
+        // Parse: "/join " → complete room names
+    }
+}
+```
+
+**Completion targets (same as before):**
+
+| Command | Completion Target | Data Source |
+|---------|------------------|-------------|
+| `/join <room>` | Room names | Known rooms from `/rooms` |
+| `/accept <user>` | Usernames | Users in current room |
+| `/accept <user> <file>` | Filenames | Pending offers from that user |
+| `/cancel <id>` | Transfer IDs | Active transfers |
+
+### Protocol Integration
+
+**No broker changes required** - client tracks state from existing messages:
+
+- **Users**: Track from `INFO <user> joined/left` messages
+- **Rooms**: Track from successful `JOIN` responses
+- **File offers**: Track from `FILE_OFFER` messages
+- **Transfers**: Track from `FILE_START`/`FILE_INCOMING` responses
+
+### Implementation Phases
+
+**Phase 1: Basic TUI Setup**
+- [ ] Add dependencies: `ratatui`, `tui-prompts`, `crossterm`
+- [ ] Create `App` struct with layout state
+- [ ] Implement basic render loop (banner + chat area + input)
+- [ ] Replace `FramedRead(stdin)` with TUI event loop
+- [ ] Connect protocol messages to UI (display in chat area)
+
+**Phase 2: Message Display**
+- [ ] Format protocol messages nicely (CLIP, SAY, FILE_OFFER, etc.)
+- [ ] Scrollable message history (PgUp/PgDn)
+- [ ] Color-coded message types (green=info, red=error, etc.)
+- [ ] Timestamp display (optional)
+
+**Phase 3: Input with History**
+- [ ] Integrate `TextPrompt` from tui-prompts
+- [ ] Command history (Up/Down arrows)
+- [ ] Show current room in prompt: `[lobby] rustynaut> `
+
+**Phase 4: Tab Completion**
+- [ ] Implement `Completer` trait
+- [ ] Command completion (`/help`, `/join`, etc.)
+- [ ] Username completion for `/accept`
+- [ ] Room name completion for `/join`
+- [ ] Filename completion for `/accept <user>`
+
+**Phase 5: Polish**
+- [ ] Sidebar showing users in room (toggle with key)
+- [ ] File transfer progress bars
+- [ ] Configuration file for TUI preferences
+
+### Dependencies
+
+```toml
+[dependencies]
+ratatui = "0.29"
+tui-prompts = "0.6"
+crossterm = "0.28"
+# existing deps remain...
+```
+
+### Code Structure Changes
+
+**New file: `client/src/tui.rs`**
+```rust
+use ratatui::{
+    layout::{Constraint, Direction, Layout},
+    widgets::{Block, Borders, List, Paragraph},
+    Frame,
+};
+use tui_prompts::{Prompt, TextPrompt, TextState};
+
+pub struct App {
+    messages: Vec<Message>,
+    input: TextState<'static>,
+    completer: RustynautCompleter,
+}
+
+impl App {
+    pub fn draw(&mut self, frame: &mut Frame) {
+        // Layout: banner | chat | status | input
+    }
+    
+    pub fn handle_event(&mut self, event: Event) -> Option<String> {
+        // Returns Some(line) when user presses Enter
+    }
+}
+```
+
+**Modified: `client/src/main.rs`**
+```rust
+// Old: stdin stream merged into protocol loop
+// New: TUI event loop drives everything
+#[tokio::main]
+async fn main() -> Result<()> {
+    let mut terminal = ratatui::init()?;
+    let mut app = App::new(args);
+    
+    loop {
+        terminal.draw(|frame| app.draw(frame))?;
+        
+        // Handle terminal events (non-blocking with timeout)
+        if event::poll(Duration::from_millis(100))? {
+            if let Some(line) = app.handle_event(event::read()?) {
+                // Send to broker
+                tx.send(line).await?;
+            }
+        }
+        
+        // Handle protocol messages (from async channel)
+        while let Ok(msg) = rx.try_recv() {
+            app.handle_protocol_message(msg);
+        }
+    }
+}
+```
+
+### Benefits of TUI Approach
+
+| Aspect | Raw Terminal | TUI |
+|--------|-------------|-----|
+| **Scrolling** | Terminal scrollback (messy) | Controlled viewport |
+| **Layout** | Single stream | Multiple areas (banner, chat, input) |
+| **Completion** | Requires readline lib | Built into tui-prompts |
+| **Visual polish** | ASCII only | Colors, borders, progress bars |
+| **File transfers** | Text messages | Progress bars + status |
+| **Cross-platform** | Varies | Crossterm abstracts differences |
+
+### Edge Cases & Mitigations
+
+| Issue | Mitigation |
+|-------|------------|
+| Async + TUI mixing | TUI runs in main thread, protocol in spawned task |
+| Terminal resize | Handle `Resize` event, redraw layout |
+| Raw mode cleanup | Use `ratatui::restore()` in panic handler |
+| Windows compatibility | Crossterm handles Windows console |
+| Completion blocking | Completion is synchronous (fast), UI stays responsive |
+| TLS logs in TUI | Route TLS handshake/SNI logs into TUI message stream when verbose; avoid stderr writes |
+
+### Testing Strategy
+
+- [ ] Manual: Basic TUI renders correctly
+- [ ] Manual: All slash commands work
+- [ ] Manual: Tab completion for commands
+- [ ] Manual: Tab completion for usernames
+- [ ] Manual: History (Up/Down) works
+- [ ] Cross-platform: Linux, macOS, Windows
+- [ ] Resize terminal, layout adjusts

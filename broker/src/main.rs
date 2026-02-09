@@ -194,18 +194,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
                 // Spawn our handler to be run asynchronously.
                 tokio::spawn(async move {
-                    tracing::debug!("accepted connection from {}", addr);
-                    eprintln!("TCP: Accepted connection from {}", addr);
+                    tracing::debug!("TCP: Accepted connection from {}", addr);
                     let result = if let Some(ref tls_cfg) = tls_config {
                         // TLS connection
-                        eprintln!("TLS: Starting handshake with {}...", addr);
+                        tracing::debug!("TLS: Starting handshake with {}...", addr);
                         match tls_cfg.acceptor.accept(stream).await {
                             Ok(tls_stream) => {
-                                eprintln!("TLS: Handshake complete with {}", addr);
+                                tracing::debug!("TLS: Handshake complete with {}", addr);
                                 process_tls(state, tls_stream, addr, tls_cfg.clone()).await
                             }
                             Err(e) => {
-                                eprintln!("TLS handshake failed from {}: {:?}", addr, e);
                                 tracing::warn!("TLS handshake failed from {}: {:?}", addr, e);
                                 Ok(())
                             }
