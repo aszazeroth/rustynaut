@@ -14,11 +14,8 @@ mod completion;
 /// For files larger than ~1.5MB raw, use the sideband FILE_OFFER protocol instead.
 const MAX_LINE_LENGTH: usize = 2 * 1024 * 1024;
 
-use tokio::io;
 use tokio::sync::mpsc;
 use tokio::time::{self, Duration};
-use tokio_stream::StreamExt;
-use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec, LinesCodecError};
 
 use std::collections::HashMap;
 use std::env;
@@ -37,6 +34,23 @@ use lazy_static::lazy_static;
 
 /// Chunk size for file transfers (64KB)
 const FILE_CHUNK_SIZE: usize = 64 * 1024;
+
+fn resolve_download_dir() -> PathBuf {
+    if let Some(downloads) = dirs::download_dir() {
+        if std::fs::create_dir_all(&downloads).is_ok() {
+            return downloads;
+        }
+    }
+
+    if let Some(home) = dirs::home_dir() {
+        let candidate = home.join("Downloads");
+        if std::fs::create_dir_all(&candidate).is_ok() {
+            return candidate;
+        }
+    }
+
+    std::env::temp_dir()
+}
 
 /// Pending outgoing file: filename_b64 -> file path
 /// When we send FILE_OFFER, we store the path here
@@ -257,20 +271,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
     app.add_info(format!("Connecting to {} as {}...", args.addr, args.username));
 
     // Channels for communication between TUI and network
-    let (net_tx, mut net_rx) = mpsc::channel::<String>(100);
-    let (ui_tx, mut ui_rx) = mpsc::channel::<tui::Message>(100);
+    let (net_tx, net_rx) = mpsc::channel::<String>(100);
+    let (ui_tx, ui_rx) = mpsc::channel::<tui::Message>(100);
 
-    // File transfer channel
-    let (file_tx, mut file_rx) = mpsc::channel::<String>(100);
-    
-    // Store file_tx globally so message handlers can send file chunks
+    // Store net_tx globally so message handlers can send file chunks
     if let Ok(mut guard) = FILE_TX.lock() {
-        *guard = Some(file_tx);
+        *guard = Some(net_tx.clone());
     }
 
     // Clone for clipboard task
     let room_for_clipboard = args.room.clone();
-    let verbose_for_clipboard = args.verbose;
+    let _verbose_for_clipboard = args.verbose;
     let clipboard_tx = net_tx.clone();
 
     // Spawn clipboard monitoring task
@@ -288,7 +299,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
         };
         let mut previous_files: Option<Vec<std::path::PathBuf>> = None;
         let mut interval = time::interval(Duration::from_secs(2));
-        let mut warned = false;
         
         loop {
             interval.tick().await;
@@ -332,17 +342,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
 
             let current_content = match CLIPBOARD.get_string_contents() {
-                Ok(s) => {
-                    warned = false;
-                    s
-                }
+                Ok(s) => s,
                 Err(err) => {
                     let err_str = err.to_string();
                     if err_str.contains("empty") || err_str.contains("Empty") {
-                        warned = false;
                         String::new()
                     } else {
-                        warned = true;
                         continue;
                     }
                 }
@@ -470,11 +475,6 @@ async fn run_tui_loop(
         // Draw UI
         terminal.draw(|frame| app.draw(frame))?;
 
-        // Handle timeout for polling
-        let timeout = tick_rate
-            .checked_sub(last_tick.elapsed())
-            .unwrap_or_else(|| tokio::time::Duration::from_secs(0));
-
         // Check for UI messages from network
         while let Ok(msg) = ui_rx.try_recv() {
             match msg {
@@ -591,7 +591,7 @@ async fn enroll(
     username: &str,
     cert_dir: &std::path::Path,
 ) -> Result<(), Box<dyn Error>> {
-    use futures::SinkExt;
+    use futures::{SinkExt, StreamExt};
     use tokio::net::TcpStream;
     use tokio_util::codec::{Framed, LinesCodec};
 
@@ -612,9 +612,9 @@ async fn enroll(
 
     // Extract host for TLS SNI
     let host = addr.ip().to_string();
-    let tls_stream = tls::connect_tls(&tls_config.connector, stream, &host)
-        .await
-        .map_err(|e| -> Box<dyn Error> { e })?;
+        let tls_stream = tls::connect_tls(&tls_config.connector, stream, &host, true)
+            .await
+            .map_err(|e| -> Box<dyn Error> { e })?;
 
     let mut framed = Framed::new(tls_stream, LinesCodec::new_with_max_length(MAX_LINE_LENGTH));
 
@@ -834,22 +834,19 @@ fn generate_file_chunks(filename_b64: &str, transfer_id: &str) -> Vec<String> {
 
 /// Handle incoming FILE_INCOMING - prepare to receive a file
 fn prepare_incoming_transfer(transfer_id: u64, filename: &str, _size: u64) -> Result<(), String> {
-    // Create temp file in downloads directory
-    let downloads = dirs::download_dir().unwrap_or_else(std::env::temp_dir);
+    let downloads = resolve_download_dir();
     let temp_path = downloads.join(format!(".rustynaut_incoming_{}", transfer_id));
 
     let file = std::fs::File::create(&temp_path)
         .map_err(|e| format!("Failed to create temp file: {}", e))?;
 
-    if let Ok(mut transfers) = INCOMING_TRANSFERS.lock() {
-        transfers.insert(transfer_id, IncomingTransfer {
-            filename: filename.to_string(),
-            file,
-            temp_path,
-            bytes_received: 0,
-        });
-    }
-
+    let mut transfers = INCOMING_TRANSFERS.lock().map_err(|e| format!("Lock failed: {}", e))?;
+    transfers.insert(transfer_id, IncomingTransfer {
+        filename: filename.to_string(),
+        file,
+        temp_path,
+        bytes_received: 0,
+    });
     Ok(())
 }
 
@@ -858,44 +855,34 @@ fn handle_file_chunk(transfer_id: u64, _offset: u64, chunk_b64: &str) -> Result<
     let chunk_data = general_purpose::STANDARD.decode(chunk_b64)
         .map_err(|e| format!("Invalid base64: {}", e))?;
 
-    if let Ok(mut transfers) = INCOMING_TRANSFERS.lock() {
-        if let Some(transfer) = transfers.get_mut(&transfer_id) {
-            transfer.file.write_all(&chunk_data)
-                .map_err(|e| format!("Write failed: {}", e))?;
-            transfer.bytes_received += chunk_data.len() as u64;
-        }
-    }
-
+    let mut transfers = INCOMING_TRANSFERS.lock().map_err(|e| format!("Lock failed: {}", e))?;
+    let transfer = transfers.get_mut(&transfer_id).ok_or_else(|| format!("Transfer {} not found", transfer_id))?;
+    transfer.file.write_all(&chunk_data).map_err(|e| format!("Write failed: {}", e))?;
+    transfer.bytes_received += chunk_data.len() as u64;
     Ok(())
 }
 
 /// Handle FILE_DONE - verify checksum and move file to final location
 fn finalize_transfer(transfer_id: u64, _expected_sha256: &str) -> Result<String, String> {
-    let transfer_info = if let Ok(mut transfers) = INCOMING_TRANSFERS.lock() {
-        transfers.remove(&transfer_id)
-    } else {
-        None
-    };
-
-    let Some(transfer) = transfer_info else {
-        return Err("No such transfer".to_string());
-    };
+    let mut transfers = INCOMING_TRANSFERS.lock().map_err(|e| format!("Lock failed: {}", e))?;
+    let transfer_info = transfers.remove(&transfer_id).ok_or_else(|| "No such transfer".to_string())?;
+    drop(transfers);
 
     // Close the file (drop it)
-    drop(transfer.file);
+    drop(transfer_info.file);
 
     // Move to final location
-    let downloads = dirs::download_dir().unwrap_or_else(std::env::temp_dir);
-    let mut final_path = downloads.join(&transfer.filename);
+    let downloads = resolve_download_dir();
+    let mut final_path = downloads.join(&transfer_info.filename);
 
     // Handle file already exists - add number suffix
     let mut counter = 1;
     while final_path.exists() {
-        let stem = Path::new(&transfer.filename)
+        let stem = Path::new(&transfer_info.filename)
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("file");
-        let ext = Path::new(&transfer.filename)
+        let ext = Path::new(&transfer_info.filename)
             .extension()
             .and_then(|s| s.to_str())
             .map(|s| format!(".{}", s))
@@ -904,7 +891,7 @@ fn finalize_transfer(transfer_id: u64, _expected_sha256: &str) -> Result<String,
         counter += 1;
     }
 
-    std::fs::rename(&transfer.temp_path, &final_path)
+    std::fs::rename(&transfer_info.temp_path, &final_path)
         .map_err(|e| format!("Failed to move file: {}", e))?;
 
     Ok(final_path.display().to_string())
@@ -1176,6 +1163,7 @@ mod tcp {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub async fn connect(
         addr: &SocketAddr,
         mut stdin: impl Stream<Item = Result<String, LinesCodecError>> + Unpin,
@@ -1356,10 +1344,8 @@ mod tls_transport {
     use base64::Engine;
     use futures::{future, Sink, SinkExt, Stream, StreamExt};
     use std::{error::Error, net::SocketAddr};
-    use tokio::io::{AsyncRead, AsyncWrite};
     use tokio::net::TcpStream;
     use tokio::sync::mpsc;
-    use tokio_rustls::client::TlsStream;
     use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec, LinesCodecError};
 
     /// Connect using channels for TUI integration
@@ -1374,7 +1360,7 @@ mod tls_transport {
         
         // Extract host for TLS SNI
         let host = addr.ip().to_string();
-        let tls_stream = crate::tls::connect_tls(&tls_config.connector, tcp_stream, &host)
+        let tls_stream = crate::tls::connect_tls(&tls_config.connector, tcp_stream, &host, false)
             .await
             .map_err(|e| -> Box<dyn Error> { e })?;
 
@@ -1429,6 +1415,7 @@ mod tls_transport {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub async fn connect(
         addr: &SocketAddr,
         tls_config: &crate::tls::TlsClientConfig,
@@ -1440,7 +1427,7 @@ mod tls_transport {
 
         // Extract host for TLS SNI
         let host = addr.ip().to_string();
-        let tls_stream = crate::tls::connect_tls(&tls_config.connector, tcp_stream, &host)
+        let tls_stream = crate::tls::connect_tls(&tls_config.connector, tcp_stream, &host, false)
             .await
             .map_err(|e| -> Box<dyn Error> { e })?;
 

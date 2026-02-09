@@ -77,6 +77,7 @@ impl CompletionContext {
     }
 
     /// Remove a file offer (when accepted or cancelled)
+    #[allow(dead_code)]
     pub fn remove_file_offer(&mut self, user: &str, filename: &str) {
         if let Some(offers) = self.pending_offers.get_mut(user) {
             offers.retain(|(f, _)| f != filename);
@@ -160,7 +161,10 @@ impl Completer {
                 self.complete_rooms(prefix)
             }
             "/accept" => {
-                if parts.len() == 2 && !before_cursor.ends_with(' ') {
+                if parts.len() == 1 {
+                    // No args yet, suggest users with offers
+                    self.complete_users("")
+                } else if parts.len() == 2 && !before_cursor.ends_with(' ') {
                     // Completing username
                     let prefix = parts[1];
                     self.complete_users(prefix)
@@ -211,16 +215,33 @@ impl Completer {
 
     /// Complete usernames
     fn complete_users(&self, prefix: &str) -> Vec<Completion> {
-        self.context
-            .users_in_room
-            .iter()
+        let mut matches: Vec<Completion> = self
+            .context
+            .pending_offers
+            .keys()
             .filter(|user| user.starts_with(prefix))
             .map(|user| Completion {
                 text: user.clone(),
                 display: user.clone(),
-                description: "User".to_string(),
+                description: "User (has offer)".to_string(),
             })
-            .collect()
+            .collect();
+
+        if matches.is_empty() {
+            matches = self
+                .context
+                .users_in_room
+                .iter()
+                .filter(|user| user.starts_with(prefix))
+                .map(|user| Completion {
+                    text: user.clone(),
+                    display: user.clone(),
+                    description: "User".to_string(),
+                })
+                .collect();
+        }
+
+        matches
     }
 
     /// Complete filenames for a specific user

@@ -14,11 +14,19 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
     Frame, Terminal,
 };
-use std::collections::HashMap;
-use std::io::{self, Write};
+use std::io;
 use std::time::SystemTime;
 
 use crate::completion::{Completer, Completion, CompletionContext};
+
+const CLIENT_VERSION: &str = "0.1.0-dev";
+
+const COLOR_BG: Color = Color::Rgb(0x07, 0x36, 0x42);
+const COLOR_BG_SOFT: Color = Color::Rgb(0x00, 0x2B, 0x36);
+const COLOR_FG: Color = Color::Rgb(0x93, 0xA1, 0xA1);
+const COLOR_ACCENT: Color = Color::Rgb(0x2A, 0xA1, 0x98);
+const COLOR_HILITE: Color = Color::Rgb(0xB5, 0x89, 0x00);
+const COLOR_ERR: Color = Color::Rgb(0xDC, 0x32, 0x2F);
 
 /// A single message in the chat history with timestamp
 #[derive(Clone, Debug)]
@@ -67,9 +75,6 @@ pub struct App {
     /// Users in current room
     pub users_in_room: Vec<String>,
 
-    /// Pending file offers: username -> list of filenames
-    pub pending_offers: HashMap<String, Vec<String>>,
-
     /// Current input buffer
     pub input: String,
 
@@ -116,7 +121,6 @@ impl App {
             connected: false,
             messages: Vec::new(),
             users_in_room: Vec::new(),
-            pending_offers: HashMap::new(),
             input: String::new(),
             cursor_pos: 0,
             scroll_offset: 0,
@@ -168,6 +172,7 @@ impl App {
 
     /// Handle an info message and update completion context
     pub fn handle_info(&mut self, text: &str) {
+        let text = text.strip_prefix("INFO ").unwrap_or(text);
         if let Some(room) = text.strip_prefix("joined ") {
             self.handle_room_join(room.trim());
         }
@@ -184,6 +189,7 @@ impl App {
 
     /// Handle a file offer and update completion context
     pub fn handle_file_offer(&mut self, room: &str, user: &str, filename: &str, size: &str) {
+        self.completion_context_mut().add_user(user.to_string());
         self.completion_context_mut().add_file_offer(
             user.to_string(),
             filename.to_string(),
@@ -317,11 +323,6 @@ impl App {
         if self.scroll_offset < self.messages.len().saturating_sub(1) {
             self.scroll_offset += 1;
         }
-    }
-
-    /// Scroll to bottom
-    pub fn scroll_to_bottom(&mut self) {
-        self.scroll_offset = self.messages.len().saturating_sub(1);
     }
 
     /// Navigate to previous command in history (Up arrow)
@@ -537,7 +538,7 @@ impl App {
         let main_layout = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(3), // Banner
+                Constraint::Length(8), // Banner
                 Constraint::Min(5),    // Messages (flexible)
                 Constraint::Length(1), // Status bar
                 Constraint::Length(3), // Input area
@@ -567,19 +568,66 @@ impl App {
         self.draw_input(frame, main_layout[3]);
     }
 
-    /// Draw the ASCII banner
-    fn draw_banner(&self, frame: &mut Frame<'_>, area: Rect) {
-        let banner_text = "Rustynaut - Clipboard Sync Client";
-        let banner = Paragraph::new(banner_text)
-            .style(
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )
-            .alignment(ratatui::layout::Alignment::Center)
-            .block(Block::default().borders(Borders::BOTTOM));
-        frame.render_widget(banner, area);
+
+    /// Draw the ASCII banner (explicit top padding, flat ANSI, no shadow)
+fn draw_banner(&self, frame: &mut Frame<'_>, area: Rect) {
+    // ORIGINAL art — do NOT modify spacing
+    let art = [
+        " ██████ ██      ██ ███████ ███    ██ ████████",
+        "██      ██      ██ ██      ████   ██    ██",
+        "██      ██      ██ █████   ██ ██  ██    ██",
+        "██      ██      ██ ██      ██  ██ ██    ██",
+        " ██████ ███████ ██ ███████ ██   ████    ██",
+    ];
+
+    let meta_text = "https://github.com/aszazeroth/rustynaut";
+    let version_text = format!(" {}", CLIENT_VERSION);
+
+    let max_art_width = art.iter().map(|l| l.chars().count()).max().unwrap_or(0);
+    let meta_width = meta_text.len() + version_text.len();
+    let content_width = max_art_width.max(meta_width);
+
+    let area_width = area.width as usize;
+    let left_pad = area_width.saturating_sub(content_width) / 2;
+
+    let mut lines: Vec<Line<'_>> = Vec::new();
+
+    // ---- EXPLICIT vertical padding (this is what you were missing) ----
+    const TOP_PADDING_LINES: usize = 1;
+
+    for _ in 0..TOP_PADDING_LINES {
+        lines.push(Line::from(Span::raw("")));
     }
+
+    // ---- ASCII art (flat, single color, no shadow) ----
+    for line in art {
+        lines.push(Line::from(Span::styled(
+            format!("{:pad$}{}", "", line, pad = left_pad),
+            Style::default().fg(COLOR_ACCENT),
+        )));
+    }
+
+    // Tight spacing before URL (intentional)
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!("{:pad$}{}", "", meta_text, pad = left_pad),
+            Style::default().fg(COLOR_FG),
+        ),
+        Span::styled(version_text, Style::default().fg(COLOR_HILITE)),
+    ]));
+
+    let banner = Paragraph::new(lines)
+        .alignment(ratatui::layout::Alignment::Left)
+        .style(Style::default().bg(COLOR_BG))
+        .block(
+            Block::default()
+                .borders(Borders::BOTTOM)
+                .style(Style::default().fg(COLOR_ACCENT)),
+        );
+
+    frame.render_widget(banner, area);
+}
+
 
     /// Draw the scrollable message area
     fn draw_messages(&self, frame: &mut Frame<'_>, area: Rect) {
@@ -599,8 +647,13 @@ impl App {
         let visible_items: Vec<_> = items[start..end].to_vec();
 
         let messages_list = List::new(visible_items)
-            .block(Block::default().borders(Borders::ALL).title("Messages"))
-            .style(Style::default().fg(Color::White));
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Messages")
+                    .style(Style::default().fg(COLOR_ACCENT)),
+            )
+            .style(Style::default().fg(COLOR_FG).bg(COLOR_BG_SOFT));
 
         frame.render_widget(messages_list, area);
     }
@@ -618,14 +671,14 @@ impl App {
         let ts_str = Self::format_timestamp(timestamp);
         let ts_span = Span::styled(
             format!("[{}] ", ts_str),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::Rgb(0x58, 0x6E, 0x75)),
         );
 
         match msg {
             Message::Info { text, .. } => {
                 let spans = vec![
                     ts_span,
-                    Span::styled("INFO ", Style::default().fg(Color::Green)),
+                    Span::styled("INFO ", Style::default().fg(COLOR_ACCENT)),
                     Span::raw(text.clone()),
                 ];
                 ListItem::new(Line::from(spans))
@@ -633,7 +686,7 @@ impl App {
             Message::Error { text, .. } => {
                 let spans = vec![
                     ts_span,
-                    Span::styled("ERR  ", Style::default().fg(Color::Red)),
+                    Span::styled("ERR  ", Style::default().fg(COLOR_ERR)),
                     Span::raw(text.clone()),
                 ];
                 ListItem::new(Line::from(spans))
@@ -641,7 +694,7 @@ impl App {
             Message::Chat { user, text, .. } => {
                 let spans = vec![
                     ts_span,
-                    Span::styled(format!("{}: ", user), Style::default().fg(Color::Yellow)),
+                    Span::styled(format!("{}: ", user), Style::default().fg(COLOR_HILITE)),
                     Span::raw(text.clone()),
                 ];
                 ListItem::new(Line::from(spans))
@@ -649,8 +702,8 @@ impl App {
             Message::Clip { room, preview, .. } => {
                 let spans = vec![
                     ts_span,
-                    Span::styled("CLIP ", Style::default().fg(Color::Blue)),
-                    Span::styled(format!("[{}] ", room), Style::default().fg(Color::Cyan)),
+                    Span::styled("CLIP ", Style::default().fg(Color::Rgb(0x26, 0x8B, 0xD2))),
+                    Span::styled(format!("[{}] ", room), Style::default().fg(COLOR_ACCENT)),
                     Span::raw(preview.clone()),
                 ];
                 ListItem::new(Line::from(spans))
@@ -664,9 +717,9 @@ impl App {
             } => {
                 let spans = vec![
                     ts_span,
-                    Span::styled("FILE ", Style::default().fg(Color::Magenta)),
-                    Span::styled(format!("[{}] ", room), Style::default().fg(Color::Cyan)),
-                    Span::styled(format!("{} ", user), Style::default().fg(Color::Yellow)),
+                    Span::styled("FILE ", Style::default().fg(Color::Rgb(0x6C, 0x71, 0xC4))),
+                    Span::styled(format!("[{}] ", room), Style::default().fg(COLOR_ACCENT)),
+                    Span::styled(format!("{} ", user), Style::default().fg(COLOR_HILITE)),
                     Span::raw(format!("offers: {} ({})", filename, size)),
                 ];
                 ListItem::new(Line::from(spans))
@@ -674,7 +727,7 @@ impl App {
             Message::FileTransfer { text, .. } => {
                 let spans = vec![
                     ts_span,
-                    Span::styled("FILE ", Style::default().fg(Color::Magenta)),
+                    Span::styled("FILE ", Style::default().fg(Color::Rgb(0x6C, 0x71, 0xC4))),
                     Span::raw(text.clone()),
                 ];
                 ListItem::new(Line::from(spans))
@@ -691,8 +744,13 @@ impl App {
             .collect();
 
         let user_list = List::new(user_items)
-            .block(Block::default().borders(Borders::ALL).title("Users"))
-            .style(Style::default().fg(Color::White));
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Users")
+                    .style(Style::default().fg(COLOR_ACCENT)),
+            )
+            .style(Style::default().fg(COLOR_FG).bg(COLOR_BG_SOFT));
 
         frame.render_widget(user_list, area);
     }
@@ -712,8 +770,7 @@ impl App {
             }
         );
 
-        let status =
-            Paragraph::new(status_text).style(Style::default().fg(Color::White).bg(Color::Blue));
+        let status = Paragraph::new(status_text).style(Style::default().fg(COLOR_FG).bg(COLOR_BG));
 
         frame.render_widget(status, area);
     }
@@ -726,12 +783,12 @@ impl App {
         // Create text with cursor indicator
         let mut spans = vec![Span::styled(
             prompt.clone(),
-            Style::default().fg(Color::Cyan),
+            Style::default().fg(COLOR_ACCENT),
         )];
 
         // Add input text
         if self.input.is_empty() {
-            spans.push(Span::styled(" ", Style::default().bg(Color::DarkGray)));
+            spans.push(Span::styled(" ", Style::default().bg(COLOR_BG)));
         } else {
             // Show text with cursor position
             if self.cursor_pos < self.input.len() {
@@ -742,12 +799,12 @@ impl App {
                 spans.push(Span::raw(before.to_string()));
                 spans.push(Span::styled(
                     at_cursor,
-                    Style::default().bg(Color::White).fg(Color::Black),
+                    Style::default().bg(COLOR_FG).fg(COLOR_BG_SOFT),
                 ));
                 spans.push(Span::raw(after.to_string()));
             } else {
                 spans.push(Span::raw(self.input.clone()));
-                spans.push(Span::styled(" ", Style::default().bg(Color::DarkGray)));
+                spans.push(Span::styled(" ", Style::default().bg(COLOR_BG)));
             }
         }
 
@@ -796,7 +853,13 @@ impl App {
 
         let title = format!("Completions ({})", self.current_completions.len());
         let completion_list = List::new(items)
-            .block(Block::default().borders(Borders::ALL).title(title))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(title)
+                    .style(Style::default().fg(COLOR_ACCENT)),
+            )
+            .style(Style::default().fg(COLOR_FG).bg(COLOR_BG_SOFT))
             .highlight_style(Style::default().add_modifier(Modifier::BOLD));
 
         frame.render_widget(completion_list, area);
@@ -817,6 +880,15 @@ fn extract_user_from_join_msg(text: &str) -> Option<(&str, bool)> {
             }
         }
     }
+
+    // Pattern: "user joined" or "user left"
+    if let Some(joined_pos) = text.find(" joined") {
+        return Some((&text[..joined_pos], true));
+    }
+    if let Some(left_pos) = text.find(" left") {
+        return Some((&text[..left_pos], false));
+    }
+
     None
 }
 

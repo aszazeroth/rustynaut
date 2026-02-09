@@ -900,6 +900,7 @@ async fn main() -> Result<()> {
 | Raw mode cleanup | Use `ratatui::restore()` in panic handler |
 | Windows compatibility | Crossterm handles Windows console |
 | Completion blocking | Completion is synchronous (fast), UI stays responsive |
+| TLS logs in TUI | Route TLS handshake/SNI logs into TUI message stream when verbose; avoid stderr writes |
 
 ### Testing Strategy
 
