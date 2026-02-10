@@ -90,8 +90,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     if !args.tls_disabled {
         app.add_info("TLS enabled");
         if let Some(ref tls_cfg) = tls_config {
+            app.enrollment_token = Some(tls_cfg.enrollment_token.clone());
             app.add_info(format!("Enrollment token: {}", tls_cfg.enrollment_token));
             app.add_info(format!("CA cert: {:?}", tls_cfg.ca_cert_path));
+            app.add_info("Use /copy to copy token to clipboard");
         }
     } else {
         app.add_error("TLS disabled, connections will not be encrypted");
@@ -232,7 +234,7 @@ async fn run_tui_loop(
                             }
                             if let Some(cmd) = app.handle_input(c) {
                                 let should_quit =
-                                    handle_broker_command(cmd, &state, &shutdown_tx, &ui_tx)
+                                    handle_broker_command(cmd, &state, &shutdown_tx, &ui_tx, app)
                                         .await?;
                                 if should_quit {
                                     shutdown_requested = true;
@@ -264,7 +266,7 @@ async fn run_tui_loop(
                                 app.apply_completion();
                             } else if let Some(cmd) = app.handle_input('\n') {
                                 let should_quit =
-                                    handle_broker_command(cmd, &state, &shutdown_tx, &ui_tx)
+                                    handle_broker_command(cmd, &state, &shutdown_tx, &ui_tx, app)
                                         .await?;
                                 if should_quit {
                                     shutdown_requested = true;
@@ -303,6 +305,7 @@ async fn handle_broker_command(
     state: &Arc<Mutex<Shared>>,
     shutdown_tx: &broadcast::Sender<()>,
     ui_tx: &mpsc::Sender<tui::Message>,
+    app: &tui::App,
 ) -> Result<bool, Box<dyn Error>> {
     let trimmed = cmd.trim();
     match trimmed {
@@ -324,9 +327,30 @@ async fn handle_broker_command(
                 .await;
             Ok(false)
         }
+        "/token" => {
+            if let Some(ref token) = app.enrollment_token {
+                ui_info(ui_tx, format!("Enrollment token: {token}")).await;
+            } else {
+                ui_error(ui_tx, "No enrollment token available (TLS not enabled)").await;
+            }
+            Ok(false)
+        }
+        "/copy" => {
+            if let Some(ref token) = app.enrollment_token {
+                match app.copy_to_clipboard(token) {
+                    Ok(_) => ui_info(ui_tx, "Enrollment token copied to clipboard").await,
+                    Err(e) => ui_error(ui_tx, format!("Failed to copy: {e}")).await,
+                }
+            } else {
+                ui_error(ui_tx, "No enrollment token available (TLS not enabled)").await;
+            }
+            Ok(false)
+        }
         "/help" => {
             ui_info(ui_tx, "Broker commands:").await;
             ui_info(ui_tx, "  /status   - Show connected clients and rooms").await;
+            ui_info(ui_tx, "  /token    - Show enrollment token").await;
+            ui_info(ui_tx, "  /copy     - Copy enrollment token to clipboard").await;
             ui_info(ui_tx, "  /quit     - Gracefully shutdown the broker").await;
             Ok(false)
         }

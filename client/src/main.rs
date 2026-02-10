@@ -272,6 +272,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // Add initial messages
     app.add_info("Welcome to Rustynaut!");
     app.add_info(format!("Connecting to {} as {}...", args.addr, args.username));
+    app.add_info("Click a message to select it, press 'y' to copy, ESC to deselect");
 
     // Channels for communication between TUI and network
     let (net_tx, net_rx) = mpsc::channel::<String>(100);
@@ -494,73 +495,92 @@ async fn run_tui_loop(
 
         // Poll for events with timeout
         if crossterm::event::poll(std::time::Duration::from_millis(10))? {
-            if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
-                if key.kind == crossterm::event::KeyEventKind::Press {
-                    match key.code {
-                        crossterm::event::KeyCode::Char('c')
-                            if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) =>
-                        {
-                            app.should_quit = true;
-                        }
-                        crossterm::event::KeyCode::Char(c) => {
-                            // Cancel completions when typing
-                            if !app.current_completions.is_empty() {
-                                app.cancel_completion();
-                            }
-                            if let Some(cmd) = app.handle_input(c) {
-                                // Process command
-                                if cmd == "/quit" || cmd == "/exit" {
-                                    app.should_quit = true;
-                                } else if let Err(e) = process_command(cmd, &net_tx).await {
-                                    app.add_error(format!("Failed to send: {}", e));
-                                }
-                            }
-                        }
-                        crossterm::event::KeyCode::Backspace => app.handle_backspace(),
-                        crossterm::event::KeyCode::Delete => app.handle_delete(),
-                        crossterm::event::KeyCode::Left => app.cursor_left(),
-                        crossterm::event::KeyCode::Right => app.cursor_right(),
-                        crossterm::event::KeyCode::Home => app.cursor_home(),
-                        crossterm::event::KeyCode::End => app.cursor_end(),
-                        crossterm::event::KeyCode::Up => app.history_previous(),
-                        crossterm::event::KeyCode::Down => app.history_next(),
-                        crossterm::event::KeyCode::PageUp => {
-                            for _ in 0..5 {
-                                app.scroll_up();
-                            }
-                        }
-                        crossterm::event::KeyCode::PageDown => {
-                            for _ in 0..5 {
-                                app.scroll_down();
-                            }
-                        }
-                        crossterm::event::KeyCode::Tab => {
-                            // Tab completion
-                            app.handle_tab();
-                        }
-                        crossterm::event::KeyCode::Enter => {
-                            if !app.current_completions.is_empty() {
-                                app.apply_completion();
-                            } else if let Some(cmd) = app.handle_input('\n') {
-                                // Process command
-                                if cmd == "/quit" || cmd == "/exit" {
-                                    app.should_quit = true;
-                                } else if let Err(e) = process_command(cmd, &net_tx).await {
-                                    app.add_error(format!("Failed to send: {}", e));
-                                }
-                            }
-                        }
-                        crossterm::event::KeyCode::F(1) => app.toggle_sidebar(),
-                        crossterm::event::KeyCode::Esc => {
-                            if !app.current_completions.is_empty() {
-                                app.cancel_completion();
-                            } else {
+            match crossterm::event::read()? {
+                crossterm::event::Event::Key(key) => {
+                    if key.kind == crossterm::event::KeyEventKind::Press {
+                        match key.code {
+                            crossterm::event::KeyCode::Char('c')
+                                if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) =>
+                            {
                                 app.should_quit = true;
                             }
+                            crossterm::event::KeyCode::Char('y') => {
+                                // Copy selected message to clipboard
+                                app.copy_selected_message();
+                            }
+                            crossterm::event::KeyCode::Char(c) => {
+                                // Cancel completions when typing
+                                if !app.current_completions.is_empty() {
+                                    app.cancel_completion();
+                                }
+                                if let Some(cmd) = app.handle_input(c) {
+                                    // Process command
+                                    if cmd == "/quit" || cmd == "/exit" {
+                                        app.should_quit = true;
+                                    } else if let Err(e) = process_command(cmd, &net_tx).await {
+                                        app.add_error(format!("Failed to send: {}", e));
+                                    }
+                                }
+                            }
+                            crossterm::event::KeyCode::Backspace => app.handle_backspace(),
+                            crossterm::event::KeyCode::Delete => app.handle_delete(),
+                            crossterm::event::KeyCode::Left => app.cursor_left(),
+                            crossterm::event::KeyCode::Right => app.cursor_right(),
+                            crossterm::event::KeyCode::Home => app.cursor_home(),
+                            crossterm::event::KeyCode::End => app.cursor_end(),
+                            crossterm::event::KeyCode::Up => app.history_previous(),
+                            crossterm::event::KeyCode::Down => app.history_next(),
+                            crossterm::event::KeyCode::PageUp => {
+                                for _ in 0..5 {
+                                    app.scroll_up();
+                                }
+                            }
+                            crossterm::event::KeyCode::PageDown => {
+                                for _ in 0..5 {
+                                    app.scroll_down();
+                                }
+                            }
+                            crossterm::event::KeyCode::Tab => {
+                                // Tab completion
+                                app.handle_tab();
+                            }
+                            crossterm::event::KeyCode::Enter => {
+                                if !app.current_completions.is_empty() {
+                                    app.apply_completion();
+                                } else if let Some(cmd) = app.handle_input('\n') {
+                                    // Process command
+                                    if cmd == "/quit" || cmd == "/exit" {
+                                        app.should_quit = true;
+                                    } else if let Err(e) = process_command(cmd, &net_tx).await {
+                                        app.add_error(format!("Failed to send: {}", e));
+                                    }
+                                }
+                            }
+                            crossterm::event::KeyCode::F(1) => app.toggle_sidebar(),
+                            crossterm::event::KeyCode::Esc => {
+                                if app.selected_message_index.is_some() {
+                                    // Clear message selection first
+                                    app.clear_selection();
+                                } else if !app.current_completions.is_empty() {
+                                    app.cancel_completion();
+                                } else {
+                                    app.should_quit = true;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                crossterm::event::Event::Mouse(mouse_event) => {
+                    match mouse_event.kind {
+                        crossterm::event::MouseEventKind::Down(_) => {
+                            // Handle mouse click in message area
+                            app.handle_mouse_click(mouse_event.row);
                         }
                         _ => {}
                     }
                 }
+                _ => {}
             }
         }
 
@@ -1151,19 +1171,29 @@ mod tcp {
             return Ok(());
         }
 
-        // Handle SAY messages
-        if let Some((user, text)) = crate::parse_say_fields(message) {
-            let _ = ui_tx.send(crate::tui::Message::Chat {
-                user: user.to_string(),
-                text: text.to_string(),
-                timestamp: std::time::SystemTime::now()
-            }).await;
-            return Ok(());
-        }
+         // Handle SAY messages
+    if let Some((user, text)) = crate::parse_say_fields(message) {
+        let _ = ui_tx.send(crate::tui::Message::Chat {
+            user: user.to_string(),
+            text: text.to_string(),
+            timestamp: std::time::SystemTime::now()
+        }).await;
+        return Ok(());
+    }
 
-        // Default: treat as info message
-        let _ = ui_tx.send(crate::tui::Message::Info { text: message.to_string(), timestamp: std::time::SystemTime::now() }).await;
-        Ok(())
+    // Special handling for token commands - this catches the response from broker when /token sent
+    if message.starts_with("INFO Token copied to clipboard") {
+        // The command was successfully processed, just display a helpful message
+        let _ = ui_tx.send(crate::tui::Message::Info { 
+            text: "Token copied to clipboard".to_string(), 
+            timestamp: std::time::SystemTime::now() 
+        }).await;
+        return Ok(());
+    }
+    
+    // Default: treat as info message
+         let _ = ui_tx.send(crate::tui::Message::Info { text: message.to_string(), timestamp: std::time::SystemTime::now() }).await;
+         Ok(())
     }
 
     #[allow(dead_code)]

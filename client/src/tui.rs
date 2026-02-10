@@ -6,6 +6,7 @@
 //! - Status bar showing room and users
 //! - Color-coded message types
 
+use arboard::Clipboard;
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
@@ -110,6 +111,12 @@ pub struct App {
 
     /// Selected completion index
     pub selected_completion: Option<usize>,
+
+    /// Selected message index (for copy functionality via mouse)
+    pub selected_message_index: Option<usize>,
+
+    /// Message area bounds for mouse click calculation
+    message_area: Option<Rect>,
 }
 
 impl App {
@@ -133,6 +140,8 @@ impl App {
             completer: Completer::new(),
             current_completions: Vec::new(),
             selected_completion: None,
+            selected_message_index: None,
+            message_area: None,
         }
     }
 
@@ -428,10 +437,6 @@ impl App {
             return;
         }
 
-        if self.selected_completion.is_none() {
-            self.selected_completion = Some(0);
-        }
-
         if self.apply_common_prefix() {
             return;
         }
@@ -440,6 +445,15 @@ impl App {
             self.next_completion();
         }
         self.apply_completion_internal(false);
+    }
+
+    /// Copy text from messages to clipboard
+    pub fn copy_to_clipboard(&mut self, text: &str) {
+        if let Ok(mut clipboard) = Clipboard::new() {
+            if let Err(e) = clipboard.set_text(text) {
+                self.add_error(format!("Failed to copy to clipboard: {}", e));
+            }
+        }
     }
 
     /// Cycle to next completion
@@ -529,6 +543,71 @@ impl App {
         self.show_sidebar = !self.show_sidebar;
     }
 
+    /// Select a message by index (for copying)
+    pub fn select_message(&mut self, index: usize) {
+        if self.selected_message_index == Some(index) {
+            // Deselect if already selected
+            self.selected_message_index = None;
+        } else {
+            // Select new message
+            self.selected_message_index = Some(index);
+        }
+    }
+
+    /// Clear the current message selection
+    pub fn clear_selection(&mut self) {
+        self.selected_message_index = None;
+    }
+
+    /// Copy currently selected message to clipboard
+    pub fn copy_selected_message(&mut self) {
+        if let Some(index) = self.selected_message_index {
+            if index < self.messages.len() {
+                let text = self.get_message_text(&self.messages[index]);
+                self.copy_to_clipboard(&text);
+            }
+        }
+    }
+
+    /// Handle mouse click in message area
+    pub fn handle_mouse_click(&mut self, row: u16) {
+        if let Some(area) = self.message_area {
+            // Calculate which message was clicked based on row position
+            let visible_count = (area.height as usize).saturating_sub(2); // Account for borders
+            let start = self
+                .scroll_offset
+                .saturating_sub(visible_count.saturating_sub(1));
+
+            // The row within the message list (0 = first visible message)
+            let relative_row = (row.saturating_sub(area.y + 1)) as usize; // +1 for top border
+
+            if relative_row < visible_count {
+                let message_index = start + relative_row;
+                if message_index < self.messages.len() {
+                    self.select_message(message_index);
+                }
+            }
+        }
+    }
+
+    /// Get the text content of a message
+    fn get_message_text(&self, msg: &Message) -> String {
+        match msg {
+            Message::Info { text, .. } => text.clone(),
+            Message::Error { text, .. } => text.clone(),
+            Message::Chat { user, text, .. } => format!("{}: {}", user, text),
+            Message::Clip { room, preview, .. } => format!("[{}] {}", room, preview),
+            Message::FileOffer {
+                room,
+                user,
+                filename,
+                size,
+                ..
+            } => format!("[{}] {} offers: {} ({})", room, user, filename, size),
+            Message::FileTransfer { text, .. } => text.clone(),
+        }
+    }
+
     /// Draw the UI
     pub fn draw(&mut self, frame: &mut Frame<'_>) {
         let area = frame.area();
@@ -559,6 +638,7 @@ impl App {
         } else {
             main_layout[1]
         };
+        self.message_area = Some(message_area);
         self.draw_messages(frame, message_area);
 
         // Status bar
@@ -629,20 +709,23 @@ impl App {
 
     /// Draw the scrollable message area
     fn draw_messages(&self, frame: &mut Frame<'_>, area: Rect) {
-        // Convert messages to list items with styling
-        let items: Vec<ListItem<'_>> = self
-            .messages
-            .iter()
-            .map(|msg| self.format_message(msg))
-            .collect();
-
         // Calculate visible range based on scroll offset
         let visible_count = (area.height as usize).saturating_sub(2); // Account for borders
         let start = self
             .scroll_offset
             .saturating_sub(visible_count.saturating_sub(1));
-        let end = (start + visible_count).min(items.len());
-        let visible_items: Vec<_> = items[start..end].to_vec();
+        let end = (start + visible_count).min(self.messages.len());
+
+        // Convert visible messages to list items with styling
+        let visible_items: Vec<ListItem<'_>> = self.messages[start..end]
+            .iter()
+            .enumerate()
+            .map(|(idx, msg)| {
+                let absolute_idx = start + idx;
+                let is_selected = self.selected_message_index == Some(absolute_idx);
+                self.format_message_with_selection(msg, is_selected)
+            })
+            .collect();
 
         let messages_list = List::new(visible_items)
             .block(
@@ -658,6 +741,15 @@ impl App {
 
     /// Format a message for display
     fn format_message<'a>(&self, msg: &'a Message) -> ListItem<'a> {
+        self.format_message_with_selection(msg, false)
+    }
+
+    /// Format a message for display with optional selection highlighting
+    fn format_message_with_selection<'a>(
+        &self,
+        msg: &'a Message,
+        is_selected: bool,
+    ) -> ListItem<'a> {
         let timestamp = match msg {
             Message::Info { timestamp, .. } => timestamp,
             Message::Error { timestamp, .. } => timestamp,
@@ -672,7 +764,7 @@ impl App {
             Style::default().fg(Color::Rgb(0x58, 0x6E, 0x75)),
         );
 
-        match msg {
+        let item = match msg {
             Message::Info { text, .. } => {
                 let spans = vec![
                     ts_span,
@@ -730,6 +822,13 @@ impl App {
                 ];
                 ListItem::new(Line::from(spans))
             }
+        };
+
+        // Apply selection highlighting
+        if is_selected {
+            item.style(Style::default().bg(COLOR_ACCENT).fg(COLOR_BG))
+        } else {
+            item
         }
     }
 

@@ -65,6 +65,16 @@ impl Completer {
                     description: "Show connected clients and rooms".to_string(),
                 },
                 Completion {
+                    text: "/token".to_string(),
+                    display: "/token".to_string(),
+                    description: "Show enrollment token".to_string(),
+                },
+                Completion {
+                    text: "/copy".to_string(),
+                    display: "/copy".to_string(),
+                    description: "Copy enrollment token to clipboard".to_string(),
+                },
+                Completion {
                     text: "/quit".to_string(),
                     display: "/quit".to_string(),
                     description: "Gracefully shutdown broker".to_string(),
@@ -105,6 +115,7 @@ pub struct App {
     pub tls_enabled: bool,
     pub peer_count: usize,
     pub rooms: Vec<String>,
+    pub enrollment_token: Option<String>,
 
     pub messages: Vec<Message>,
     pub input: String,
@@ -130,6 +141,7 @@ impl App {
             tls_enabled,
             peer_count: 0,
             rooms: Vec::new(),
+            enrollment_token: None,
             messages: Vec::new(),
             input: String::new(),
             cursor_pos: 0,
@@ -144,6 +156,16 @@ impl App {
             current_completions: Vec::new(),
             selected_completion: None,
         }
+    }
+
+    /// Copy text to system clipboard
+    pub fn copy_to_clipboard(&self, text: &str) -> Result<(), String> {
+        let mut clipboard =
+            arboard::Clipboard::new().map_err(|e| format!("Failed to access clipboard: {}", e))?;
+        clipboard
+            .set_text(text)
+            .map_err(|e| format!("Failed to copy to clipboard: {}", e))?;
+        Ok(())
     }
 
     pub fn handle_message(&mut self, msg: Message) {
