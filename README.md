@@ -154,11 +154,11 @@ cargo run --release -- --regenerate-token 0.0.0.0:4242
 ### Disable TLS (Development Only)
 
 ```bash
-# Broker (WARNING: insecure!)
-cargo run --release -- --no-tls 127.0.0.1:4242
+# Broker - TLS required
+cargo run --release -- 0.0.0.0:4242
 
-# Client
-cargo run --release -- --no-tls 127.0.0.1:4242 alice
+# Client - TLS required, must enroll first
+cargo run --release -- --enroll <TOKEN> 127.0.0.1:4242 alice
 ```
 
 ## File Transfers
@@ -213,11 +213,25 @@ cargo run --release -- [OPTIONS] [addr]
 
 Options:
   --verbose, -v         Enable verbose logging
-  --no-tls              Disable TLS (insecure, for testing)
   --cert-dir <PATH>     Certificate directory (default: ~/.config/rustynaut)
   --regenerate-token    Generate new enrollment token
 
 Default address: 127.0.0.1:4242
+```
+
+### Client Options
+
+```bash
+cd client
+cargo run --release -- [OPTIONS] <addr> [username] [room]
+
+Options:
+  --verbose, -v         Enable verbose logging
+  --enroll <TOKEN>      Enroll with broker using token
+  --cert-dir <PATH>     Certificate directory
+
+Default username: $USER or "anon"
+Default room: "lobby"
 ```
 
 ### Client Options

@@ -636,7 +636,7 @@ Log SHA256 fingerprints at key moments for debugging:
 - [x] Ctrl+C signal handling with client notification
 - [x] /status command showing connected clients and rooms
 - [x] Tracing integration with configurable verbosity (--verbose)
-- [ ] Broker TUI for unified experience (match client UX style)
+- [x] Broker TUI for unified experience (match client UX style) ✅
 
 ### CI and Release
 - [ ] Fix GitHub Actions to run `cargo clippy`, `cargo test`, and `cargo build` for both `broker/` and `client/`
@@ -1302,17 +1302,17 @@ crossterm = "0.28"
 
 ### Migration Checklist
 
-- [ ] Phase 1: Workspace setup complete
-- [ ] Phase 2: Protocol extraction complete
-- [ ] Phase 3: TLS extraction complete
-- [ ] Phase 4: Utilities extraction complete
-- [ ] Phase 5: Cleanup complete
-- [ ] Phase 6: CI/CD updated
-- [ ] All existing tests pass
-- [ ] Documentation updated
-- [ ] README reflects new structure
-- [ ] No code duplication remains between broker and client
-- [ ] Common crate has >80% test coverage
+- [x] Phase 1: Workspace setup complete ✅
+- [x] Phase 2: Protocol extraction complete ✅
+- [x] Phase 3: TLS extraction complete ✅
+- [x] Phase 4: Utilities extraction complete ✅
+- [x] Phase 5: Cleanup complete ✅
+- [x] Phase 6: CI/CD updated ✅
+- [x] All existing tests pass ✅
+- [x] Documentation updated ✅
+- [x] README reflects new structure ✅
+- [x] No code duplication remains between broker and client ✅
+- [ ] Common crate has >80% test coverage (future goal)
 
 ### Risks and Mitigations
 
@@ -1332,3 +1332,51 @@ After workspace refactoring is complete, consider:
 - **Additional client implementations** - GUI client, web client, mobile client
 - **Plugin system** - Use common crate as foundation for broker plugins
 - **Protocol versioning** - Common crate can handle multiple protocol versions
+
+---
+
+## Feature Enhancement Backlog
+
+Ready-to-pick tasks organized by category. Select one and move it to "In Progress".
+
+### File Transfers
+- [ ] Auto-accept option (configurable per-user or per-room)
+- [ ] Transfer timeout (configurable, default 60s)
+- [ ] Resume support: `FILE_RESUME <transfer_id> <offset>` protocol message
+- [ ] Rate limiting per client
+- [ ] Max concurrent transfers per room
+
+### TLS/mTLS Enhancements
+- [ ] Add `--mtls` flag to require client certificates (no enrollment fallback)
+- [ ] Certificate CN binding to USER command (reject mismatch)
+- [ ] Certificate revocation list (CRL)
+- [ ] Automatic certificate renewal before expiration
+- [ ] Rate limiting for enrollment attempts
+- [ ] Enrollment audit logging
+- [ ] Hardware key storage support (PKCS#11/HSM)
+
+### TUI Improvements
+- [ ] Tab completion for commands (`/help`, `/join`, etc.)
+- [ ] Tab completion for usernames (in `/accept`)
+- [ ] Tab completion for room names (in `/join`)
+- [ ] Tab completion for filenames (in `/accept <user>`)
+- [ ] Click-and-drag text selection in messages
+- [ ] Click-and-drag text selection in input/command line
+- [ ] Visual selection highlight during drag operations
+- [ ] File transfer progress bars
+- [ ] Sidebar showing users in room (toggle with key)
+- [ ] Configuration file for TUI preferences
+- [ ] Command history persistence across restarts
+
+### Operational
+- [ ] Sunset `--no-tls` flag (require TLS for all connections)
+- [ ] Version stamping in build process (`--version` output)
+- [ ] Structured logging (JSON format option)
+- [ ] Metrics endpoint (Prometheus-compatible)
+- [ ] Health check endpoint
+
+### Documentation
+- [ ] Architecture decision records (ADRs)
+- [ ] API documentation for common crate
+- [ ] Deployment guides (Docker, systemd)
+- [ ] Security hardening guide

@@ -160,14 +160,12 @@ struct Args {
     addr: SocketAddr,
     username: String,
     room: String,
-    tls_disabled: bool,
     enroll_token: Option<String>,
     cert_dir: PathBuf,
 }
 
 fn parse_args() -> Result<Args, Box<dyn Error>> {
     let mut verbose = false;
-    let mut tls_disabled = false;
     let mut enroll_token: Option<String> = None;
     let mut cert_dir: Option<PathBuf> = None;
     let mut positional = Vec::new();
@@ -177,7 +175,6 @@ fn parse_args() -> Result<Args, Box<dyn Error>> {
     while let Some(arg) = args_iter.next() {
         match arg.as_str() {
             "--verbose" | "-v" => verbose = true,
-            "--no-tls" => tls_disabled = true,
             "--enroll" => {
                 enroll_token = Some(
                     args_iter
@@ -197,7 +194,6 @@ fn parse_args() -> Result<Args, Box<dyn Error>> {
                 eprintln!();
                 eprintln!("Options:");
                 eprintln!("  --verbose, -v           Enable verbose logging");
-                eprintln!("  --no-tls                Disable TLS (insecure, for testing)");
                 eprintln!("  --enroll <TOKEN>        Enroll with broker using token");
                 eprintln!("  --cert-dir <PATH>       Certificate directory");
                 eprintln!("                          (default: ~/.config/rustynaut/client)");
@@ -226,7 +222,6 @@ fn parse_args() -> Result<Args, Box<dyn Error>> {
         addr,
         username,
         room,
-        tls_disabled,
         enroll_token,
         cert_dir: cert_dir.unwrap_or_else(rustynaut_common::tls::default_client_cert_dir),
     })
@@ -245,12 +240,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     }
 
-    // Check if we need TLS and have certificates
-    let tls_enabled = !args.tls_disabled;
-    if tls_enabled && !tls::is_enrolled(&args.cert_dir) {
+    // Check if we have certificates
+    if !tls::is_enrolled(&args.cert_dir) {
         println!("{BANNER}");
         eprintln!("TLS is enabled by default but you are not enrolled.");
-        eprintln!("Use --enroll <token> to enroll first, or --no-tls for insecure mode.");
+        eprintln!("Use --enroll <token> to enroll first.");
         eprintln!("Certificates should be in: {:?}", args.cert_dir);
         return Err("Not enrolled for TLS".into());
     }
@@ -427,24 +421,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // Spawn network connection task
     let addr = args.addr;
     let cert_dir = args.cert_dir.clone();
-    let tls_disabled = args.tls_disabled;
     let verbose = args.verbose;
     
     tokio::spawn(async move {
-        if tls_disabled {
-            if let Err(e) = tcp::connect_with_channels(&addr, net_rx, ui_tx, verbose).await {
-                eprintln!("Connection error: {}", e);
+        match tls::init_tls_with_client_cert(&cert_dir) {
+            Ok(tls_config) => {
+                if let Err(e) = tls_transport::connect_with_channels(&addr, &tls_config, net_rx, ui_tx, verbose).await {
+                    eprintln!("TLS connection error: {}", e);
+                }
             }
-        } else {
-            match tls::init_tls_with_client_cert(&cert_dir) {
-                Ok(tls_config) => {
-                    if let Err(e) = tls_transport::connect_with_channels(&addr, &tls_config, net_rx, ui_tx, verbose).await {
-                        eprintln!("TLS connection error: {}", e);
-                    }
-                }
-                Err(e) => {
-                    eprintln!("TLS init error: {}", e);
-                }
+            Err(e) => {
+                eprintln!("TLS init error: {}", e);
             }
         }
     });

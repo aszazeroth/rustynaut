@@ -43,7 +43,6 @@ use tokio_util::codec::{Framed, LinesCodec};
 struct Args {
     verbose: bool,
     addr: String,
-    tls_disabled: bool,
     cert_dir: PathBuf,
     regenerate_token: bool,
 }
@@ -68,15 +67,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .with_writer(std::io::sink)
         .init();
 
-    let tls_config = if !args.tls_disabled {
-        let server_names = extract_server_names(&args.addr);
-        Some(Arc::new(
-            tls::init_tls(&args.cert_dir, &server_names, args.regenerate_token)
-                .map_err(|e| -> Box<dyn Error> { e })?,
-        ))
-    } else {
-        None
-    };
+    let server_names = extract_server_names(&args.addr);
+    let tls_config = Arc::new(
+        tls::init_tls(&args.cert_dir, &server_names, args.regenerate_token)
+            .map_err(|e| -> Box<dyn Error> { e })?,
+    );
 
     let state = Arc::new(Mutex::new(Shared::new()));
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
@@ -87,19 +82,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let (ui_tx, ui_rx) = mpsc::channel::<tui::Message>(100);
 
     let mut terminal = tui::setup_terminal()?;
-    let mut app = tui::App::new(args.addr.clone(), !args.tls_disabled);
+    let mut app = tui::App::new(args.addr.clone(), true);
     app.add_info(format!("Broker started on {}", &args.addr));
-    if !args.tls_disabled {
-        app.add_info("TLS enabled");
-        if let Some(ref tls_cfg) = tls_config {
-            app.enrollment_token = Some(tls_cfg.enrollment_token.clone());
-            app.add_info(format!("Enrollment token: {}", tls_cfg.enrollment_token));
-            app.add_info(format!("CA cert: {:?}", tls_cfg.ca_cert_path));
-            app.add_info("Use /copy to copy token to clipboard");
-        }
-    } else {
-        app.add_error("TLS disabled, connections will not be encrypted");
-    }
+    app.add_info("TLS enabled");
+    app.enrollment_token = Some(tls_config.enrollment_token.clone());
+    app.add_info(format!("Enrollment token: {}", tls_config.enrollment_token));
+    app.add_info(format!("CA cert: {:?}", tls_config.ca_cert_path));
+    app.add_info("Use /copy to copy token to clipboard");
     app.add_info("Type /help for broker commands, /quit to shutdown");
 
     let server_handle = tokio::spawn(run_server(
@@ -139,7 +128,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 async fn run_server(
     listener: TcpListener,
     state: Arc<Mutex<Shared>>,
-    tls_config: Option<Arc<tls::TlsConfig>>,
+    tls_config: Arc<tls::TlsConfig>,
     shutdown_tx: broadcast::Sender<()>,
     ui_tx: mpsc::Sender<tui::Message>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -155,21 +144,17 @@ async fn run_server(
 
                 tokio::spawn(async move {
                     let _ = ui_info(&ui_tx, format!("Accepted connection from {addr}")).await;
-                    let result = if let Some(ref tls_cfg) = tls_config {
-                        tracing::debug!("TLS: Starting handshake with {}...", addr);
-                        match tls_cfg.acceptor.accept(stream).await {
-                            Ok(tls_stream) => {
-                                tracing::debug!("TLS: Handshake complete with {}", addr);
-                                process_tls(state, tls_stream, addr, tls_cfg.clone(), ui_tx.clone()).await
-                            }
-                            Err(e) => {
-                                tracing::warn!("TLS handshake failed from {}: {:?}", addr, e);
-                                let _ = ui_error(&ui_tx, format!("TLS handshake failed from {addr}: {e:?}")).await;
-                                Ok(())
-                            }
+                    tracing::debug!("TLS: Starting handshake with {}...", addr);
+                    let result = match tls_config.acceptor.accept(stream).await {
+                        Ok(tls_stream) => {
+                            tracing::debug!("TLS: Handshake complete with {}", addr);
+                            process_tls(state, tls_stream, addr, tls_config, ui_tx.clone()).await
                         }
-                    } else {
-                        process(state, stream, addr, None, ui_tx.clone()).await
+                        Err(e) => {
+                            tracing::warn!("TLS handshake failed from {}: {:?}", addr, e);
+                            let _ = ui_error(&ui_tx, format!("TLS handshake failed from {addr}: {e:?}")).await;
+                            Ok(())
+                        }
                     };
 
                     if let Err(e) = result {
@@ -420,7 +405,6 @@ async fn ui_error(ui_tx: &mpsc::Sender<tui::Message>, text: impl Into<String>) {
 fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, Box<dyn Error>> {
     let mut verbose = false;
     let mut addr: Option<String> = None;
-    let mut tls_disabled = false;
     let mut cert_dir: Option<PathBuf> = None;
     let mut regenerate_token = false;
 
@@ -429,7 +413,6 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, Box<dyn Er
     while let Some(arg) = args_iter.next() {
         match arg.as_str() {
             "--verbose" | "-v" => verbose = true,
-            "--no-tls" => tls_disabled = true,
             "--regenerate-token" => regenerate_token = true,
             "--cert-dir" => {
                 cert_dir = Some(PathBuf::from(
@@ -443,7 +426,6 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, Box<dyn Er
                 eprintln!();
                 eprintln!("Options:");
                 eprintln!("  --verbose, -v       Enable verbose logging");
-                eprintln!("  --no-tls            Disable TLS (insecure, for testing)");
                 eprintln!(
                     "  --cert-dir <PATH>   Certificate directory (default: ~/.config/rustynaut)"
                 );
@@ -468,7 +450,6 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, Box<dyn Er
     Ok(Args {
         verbose,
         addr: addr.unwrap_or_else(|| "127.0.0.1:4242".to_string()),
-        tls_disabled,
         cert_dir: cert_dir.unwrap_or_else(default_broker_cert_dir),
         regenerate_token,
     })
@@ -884,7 +865,7 @@ async fn process_tls(
     tls_config: Arc<tls::TlsConfig>,
     ui_tx: mpsc::Sender<tui::Message>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    process(state, stream, addr, Some(tls_config), ui_tx).await
+    process(state, stream, addr, tls_config, ui_tx).await
 }
 
 /// Process an individual chat client
@@ -892,7 +873,7 @@ async fn process<S>(
     state: Arc<Mutex<Shared>>,
     stream: S,
     addr: SocketAddr,
-    tls_config: Option<Arc<tls::TlsConfig>>,
+    tls_config: Arc<tls::TlsConfig>,
     ui_tx: mpsc::Sender<tui::Message>,
 ) -> Result<(), Box<dyn Error + Send + Sync>>
 where
@@ -904,17 +885,9 @@ where
     // - New clients should send: `USER <name>` then optionally `JOIN <room>`.
     // - For legacy clients we still accept the first line as the username.
     // - For TLS enrollment: `ENROLL <token> <username>`
-    if tls_config.is_some() {
-        lines
-            .send("INFO rustynaut broker (TLS): send 'ENROLL <token> <username>' or 'USER <name>' then 'JOIN <room>'")
-            .await?;
-    } else {
-        lines
-            .send(
-                "INFO rustynaut broker: send 'USER <name>' then 'JOIN <room>' (defaults to lobby)",
-            )
-            .await?;
-    }
+    lines
+        .send("INFO rustynaut broker (TLS): send 'ENROLL <token> <username>' or 'USER <name>' then 'JOIN <room>'")
+        .await?;
 
     let first = match lines.next().await {
         Some(Ok(line)) => line,
@@ -929,46 +902,40 @@ where
 
     // Handle ENROLL command for TLS enrollment
     if let Some((token, enroll_username)) = parse_enroll(&first) {
-        if let Some(ref tls_cfg) = tls_config {
-            if token == tls_cfg.enrollment_token {
-                if !is_valid_name(enroll_username) {
+        if token == tls_config.enrollment_token {
+            if !is_valid_name(enroll_username) {
+                lines
+                    .send("ERR enrollment failed: invalid username (alphanumeric, _, - only, max 32 chars)")
+                    .await?;
+                return Ok(());
+            }
+
+            tracing::info!("Enrolling client '{}' from {}", enroll_username, addr);
+
+            // Generate client certificate
+            match tls::generate_client_cert(
+                &tls_config.ca_cert_pem,
+                &tls_config.ca_key,
+                enroll_username,
+            ) {
+                Ok(bundle) => {
+                    let response = rustynaut_common::tls::encode_enrolled_response(&bundle);
+                    lines.send(&response).await?;
+                    tracing::info!(
+                        "Enrolled '{}' - client should reconnect with certificate",
+                        enroll_username
+                    );
+                }
+                Err(e) => {
+                    tracing::error!("Failed to generate client certificate: {:?}", e);
                     lines
-                        .send("ERR enrollment failed: invalid username (alphanumeric, _, - only, max 32 chars)")
+                        .send("ERR enrollment failed: certificate generation error")
                         .await?;
-                    return Ok(());
                 }
-
-                tracing::info!("Enrolling client '{}' from {}", enroll_username, addr);
-
-                // Generate client certificate
-                match tls::generate_client_cert(
-                    &tls_cfg.ca_cert_pem,
-                    &tls_cfg.ca_key,
-                    enroll_username,
-                ) {
-                    Ok(bundle) => {
-                        let response = rustynaut_common::tls::encode_enrolled_response(&bundle);
-                        lines.send(&response).await?;
-                        tracing::info!(
-                            "Enrolled '{}' - client should reconnect with certificate",
-                            enroll_username
-                        );
-                    }
-                    Err(e) => {
-                        tracing::error!("Failed to generate client certificate: {:?}", e);
-                        lines
-                            .send("ERR enrollment failed: certificate generation error")
-                            .await?;
-                    }
-                }
-            } else {
-                tracing::warn!("Invalid enrollment token from {}", addr);
-                lines.send("ERR enrollment failed: invalid token").await?;
             }
         } else {
-            lines
-                .send("ERR enrollment not available (TLS not enabled)")
-                .await?;
+            tracing::warn!("Invalid enrollment token from {}", addr);
+            lines.send("ERR enrollment failed: invalid token").await?;
         }
         return Ok(());
     }
@@ -1434,7 +1401,6 @@ mod tests {
         let result = parse_args(args).unwrap();
         assert!(!result.verbose);
         assert_eq!(result.addr, "127.0.0.1:4242");
-        assert!(!result.tls_disabled); // TLS enabled by default
     }
 
     #[test]
@@ -1482,18 +1448,9 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_args_no_tls() {
-        let args = vec!["--no-tls".to_string()];
-        let result = parse_args(args).unwrap();
-        assert!(result.tls_disabled);
-        assert_eq!(result.addr, "127.0.0.1:4242");
-    }
-
-    #[test]
     fn test_parse_args_with_cert_dir() {
         let args = vec!["--cert-dir".to_string(), "/tmp/certs".to_string()];
         let result = parse_args(args).unwrap();
-        assert!(!result.tls_disabled); // TLS still enabled by default
         assert_eq!(result.cert_dir, std::path::PathBuf::from("/tmp/certs"));
     }
 }

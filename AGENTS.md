@@ -15,13 +15,12 @@ Rustynaut is a cross-platform clipboard sharing application with a broker (serve
 cd broker && cargo build --release
 cd client && cargo build --release
 
-# Run in development
+# Run in development (TLS required)
 cd broker && cargo run -- 0.0.0.0:4242
 cd client && cargo run -- 127.0.0.1:4242 alice lobby
 
-# TLS disabled (insecure, testing only)
-cd broker && cargo run -- --no-tls 127.0.0.1:4242
-cd client && cargo run -- --no-tls 127.0.0.1:4242 alice
+# Enroll first-time clients
+cd client && cargo run -- --enroll <TOKEN> <broker_addr> <username>
 ```
 
 ## Lint & Format
