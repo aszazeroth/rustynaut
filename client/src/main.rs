@@ -148,15 +148,18 @@ fn detect_file_path(content: &str) -> Option<(std::path::PathBuf, u64, bool)> {
     }
 }
 
-const BANNER: &str = r#"
-██████  ██      ██ ███████ ███    ██ ████████ 
-██      ██      ██ ██      ████   ██    ██    
-██      ██      ██ █████   ██ ██  ██    ██    
-██      ██      ██ ██      ██  ██ ██    ██    
-██████  ███████ ██ ███████ ██   ████    ██    
-                                              
-https://github.com/aszazeroth/rustynaut                                                
-"#;
+const BANNER: &str = concat!(
+    r#"
+ ██████  ██      ██ ███████ ███    ██ ████████ 
+ ██      ██      ██ ██      ████   ██    ██    
+ ██      ██      ██ █████   ██ ██  ██    ██    
+ ██      ██      ██ ██      ██  ██ ██    ██    
+ ██████  ███████ ██ ███████ ██   ████    ██    
+                                               
+ https://github.com/aszazeroth/rustynaut v"#,
+    env!("CARGO_PKG_VERSION"),
+    "\n"
+);
 
 /// Parsed command-line arguments
 struct Args {

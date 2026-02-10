@@ -19,7 +19,7 @@ use std::time::SystemTime;
 
 use crate::completion::{Completer, Completion, CompletionContext};
 
-const CLIENT_VERSION: &str = "0.1.0-dev";
+const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const COLOR_BG: Color = Color::Rgb(0x07, 0x36, 0x42);
 const COLOR_BG_SOFT: Color = Color::Rgb(0x00, 0x2B, 0x36);
@@ -568,66 +568,64 @@ impl App {
         self.draw_input(frame, main_layout[3]);
     }
 
-
     /// Draw the ASCII banner (explicit top padding, flat ANSI, no shadow)
-fn draw_banner(&self, frame: &mut Frame<'_>, area: Rect) {
-    // ORIGINAL art — do NOT modify spacing
-    let art = [
-        " ██████ ██      ██ ███████ ███    ██ ████████",
-        "██      ██      ██ ██      ████   ██    ██",
-        "██      ██      ██ █████   ██ ██  ██    ██",
-        "██      ██      ██ ██      ██  ██ ██    ██",
-        " ██████ ███████ ██ ███████ ██   ████    ██",
-    ];
+    fn draw_banner(&self, frame: &mut Frame<'_>, area: Rect) {
+        // ORIGINAL art — do NOT modify spacing
+        let art = [
+            " ██████ ██      ██ ███████ ███    ██ ████████",
+            "██      ██      ██ ██      ████   ██    ██",
+            "██      ██      ██ █████   ██ ██  ██    ██",
+            "██      ██      ██ ██      ██  ██ ██    ██",
+            " ██████ ███████ ██ ███████ ██   ████    ██",
+        ];
 
-    let meta_text = "https://github.com/aszazeroth/rustynaut";
-    let version_text = format!(" {}", CLIENT_VERSION);
+        let meta_text = "https://github.com/aszazeroth/rustynaut";
+        let version_text = format!(" {}", CLIENT_VERSION);
 
-    let max_art_width = art.iter().map(|l| l.chars().count()).max().unwrap_or(0);
-    let meta_width = meta_text.len() + version_text.len();
-    let content_width = max_art_width.max(meta_width);
+        let max_art_width = art.iter().map(|l| l.chars().count()).max().unwrap_or(0);
+        let meta_width = meta_text.len() + version_text.len();
+        let content_width = max_art_width.max(meta_width);
 
-    let area_width = area.width as usize;
-    let left_pad = area_width.saturating_sub(content_width) / 2;
+        let area_width = area.width as usize;
+        let left_pad = area_width.saturating_sub(content_width) / 2;
 
-    let mut lines: Vec<Line<'_>> = Vec::new();
+        let mut lines: Vec<Line<'_>> = Vec::new();
 
-    // ---- EXPLICIT vertical padding (this is what you were missing) ----
-    const TOP_PADDING_LINES: usize = 1;
+        // ---- EXPLICIT vertical padding (this is what you were missing) ----
+        const TOP_PADDING_LINES: usize = 1;
 
-    for _ in 0..TOP_PADDING_LINES {
-        lines.push(Line::from(Span::raw("")));
+        for _ in 0..TOP_PADDING_LINES {
+            lines.push(Line::from(Span::raw("")));
+        }
+
+        // ---- ASCII art (flat, single color, no shadow) ----
+        for line in art {
+            lines.push(Line::from(Span::styled(
+                format!("{:pad$}{}", "", line, pad = left_pad),
+                Style::default().fg(COLOR_ACCENT),
+            )));
+        }
+
+        // Tight spacing before URL (intentional)
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{:pad$}{}", "", meta_text, pad = left_pad),
+                Style::default().fg(COLOR_FG),
+            ),
+            Span::styled(version_text, Style::default().fg(COLOR_HILITE)),
+        ]));
+
+        let banner = Paragraph::new(lines)
+            .alignment(ratatui::layout::Alignment::Left)
+            .style(Style::default().bg(COLOR_BG))
+            .block(
+                Block::default()
+                    .borders(Borders::BOTTOM)
+                    .style(Style::default().fg(COLOR_ACCENT)),
+            );
+
+        frame.render_widget(banner, area);
     }
-
-    // ---- ASCII art (flat, single color, no shadow) ----
-    for line in art {
-        lines.push(Line::from(Span::styled(
-            format!("{:pad$}{}", "", line, pad = left_pad),
-            Style::default().fg(COLOR_ACCENT),
-        )));
-    }
-
-    // Tight spacing before URL (intentional)
-    lines.push(Line::from(vec![
-        Span::styled(
-            format!("{:pad$}{}", "", meta_text, pad = left_pad),
-            Style::default().fg(COLOR_FG),
-        ),
-        Span::styled(version_text, Style::default().fg(COLOR_HILITE)),
-    ]));
-
-    let banner = Paragraph::new(lines)
-        .alignment(ratatui::layout::Alignment::Left)
-        .style(Style::default().bg(COLOR_BG))
-        .block(
-            Block::default()
-                .borders(Borders::BOTTOM)
-                .style(Style::default().fg(COLOR_ACCENT)),
-        );
-
-    frame.render_widget(banner, area);
-}
-
 
     /// Draw the scrollable message area
     fn draw_messages(&self, frame: &mut Frame<'_>, area: Rect) {
