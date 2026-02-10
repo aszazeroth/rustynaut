@@ -11,12 +11,22 @@ env:
 
 jobs:
   build:
-
     runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        crate: [broker, client]
 
     steps:
     - uses: actions/checkout@v4
+    - name: Install clippy
+      run: rustup component add clippy
+    - name: Run clippy
+      run: cargo clippy --all-targets --all-features
+      working-directory: ${{ matrix.crate }}
     - name: Build
       run: cargo build --verbose
+      working-directory: ${{ matrix.crate }}
     - name: Run tests
       run: cargo test --verbose
+      working-directory: ${{ matrix.crate }}

@@ -16,12 +16,13 @@
 #![warn(rust_2018_idioms)]
 
 mod tls;
+mod tui;
 
 /// Maximum line length for the wire protocol (2MB to handle large base64 clipboard payloads)
 /// For files larger than ~1.5MB raw, use the sideband FILE_OFFER protocol instead.
 const MAX_LINE_LENGTH: usize = 2 * 1024 * 1024;
 
-use tokio::io::{self, AsyncBufReadExt, AsyncRead, AsyncWrite, BufReader};
+use tokio::io::{self, AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc, Mutex};
 use tokio_stream::StreamExt;
@@ -34,17 +35,7 @@ use std::error::Error;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
-
-const BANNER: &str = r#"
-██████  ██████   ██████  ██   ██ ███████ ██████  
-██   ██ ██   ██ ██    ██ ██  ██  ██      ██   ██ 
-██████  ██████  ██    ██ █████   █████   ██████  
-██   ██ ██   ██ ██    ██ ██  ██  ██      ██   ██ 
-██████  ██   ██  ██████  ██   ██ ███████ ██   ██ 
-                                                 
-https://github.com/aszazeroth/rustynaut                                                 
-"#;
+use std::time::{Instant, SystemTime};
 
 /// Parsed command-line arguments
 struct Args {
@@ -57,174 +48,339 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    println!("{BANNER}");
-
     // Args: broker [--verbose|-v] [--no-tls] [--cert-dir <path>] [--regenerate-token] [addr]
     let args = parse_args(env::args().skip(1))?;
 
     use tracing_subscriber::{fmt::format::FmtSpan, EnvFilter};
-    // Configure a `tracing` subscriber that logs traces emitted by the chat
-    // server.
     let default_directive = if args.verbose {
         "chat=debug"
     } else {
         "chat=info"
     };
     tracing_subscriber::fmt()
-        // Filter what traces are displayed based on the RUST_LOG environment
-        // variable.
-        //
-        // Traces emitted by the example code will always be displayed. You
-        // can set `RUST_LOG=tokio=trace` to enable additional traces emitted by
-        // Tokio itself.
         .with_env_filter(EnvFilter::from_default_env().add_directive(default_directive.parse()?))
-        // Log events when `tracing` spans are created, entered, exited, or
-        // closed. When Tokio's internal tracing support is enabled (as
-        // described above), this can be used to track the lifecycle of spawned
-        // tasks on the Tokio runtime.
         .with_span_events(FmtSpan::FULL)
-        // Set this subscriber as the default, to collect all traces emitted by
-        // the program.
         .init();
 
-    // Initialize TLS (enabled by default)
     let tls_config = if !args.tls_disabled {
-        // Extract hostname/IP from addr for certificate SANs
         let server_names = extract_server_names(&args.addr);
         Some(Arc::new(
             tls::init_tls(&args.cert_dir, &server_names, args.regenerate_token)
                 .map_err(|e| -> Box<dyn Error> { e })?,
         ))
     } else {
-        eprintln!("WARNING: TLS disabled, connections will not be encrypted!");
         None
     };
 
-    // Create the shared state. This is how all the peers communicate.
-    //
-    // The server task will hold a handle to this. For every new client, the
-    // `state` handle is cloned and passed into the task that processes the
-    // client connection.
     let state = Arc::new(Mutex::new(Shared::new()));
-
-    // Shutdown signal broadcast channel
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
 
-    println!("broker started on : {}", &args.addr);
-    if !args.tls_disabled {
-        println!("TLS enabled");
-    }
-    println!("Type /help for broker commands, /quit to shutdown");
-
-    // Bind a TCP listener to the socket address.
-    //
-    // Note that this is the Tokio TcpListener, which is fully async.
     let listener = TcpListener::bind(&args.addr).await?;
-
     tracing::info!("server running on {}", args.addr);
 
-    // Spawn stdin reader for broker commands
-    let stdin_state = Arc::clone(&state);
-    let stdin_shutdown = shutdown_tx.clone();
-    tokio::spawn(async move {
-        let stdin = BufReader::new(io::stdin());
-        let mut lines = stdin.lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            let trimmed = line.trim();
-            match trimmed {
-                "/quit" | "/exit" | "/shutdown" => {
-                    println!("Shutting down broker...");
-                    {
-                        let state = stdin_state.lock().await;
-                        for peer in state.peers.values() {
-                            let _ = peer.tx.send("INFO broker shutting down".to_string());
-                        }
-                    }
-                    let _ = stdin_shutdown.send(());
-                    break;
-                }
-                "/status" => {
-                    let state = stdin_state.lock().await;
-                    let peer_count = state.peers.len();
-                    let mut rooms: Vec<_> = state.peers.values().map(|p| p.room.as_str()).collect();
-                    rooms.sort_unstable();
-                    rooms.dedup();
-                    println!("Connected clients: {}", peer_count);
-                    println!("Active rooms: {}", rooms.join(", "));
-                }
-                "/help" => {
-                    println!("Broker commands:");
-                    println!("  /status   - Show connected clients and rooms");
-                    println!("  /quit     - Gracefully shutdown the broker");
-                }
-                "" => {}
-                _ => {
-                    println!("Unknown command: {trimmed}. Type /help for commands.");
-                }
-            }
-        }
-    });
+    let (ui_tx, ui_rx) = mpsc::channel::<tui::Message>(100);
 
-    // Set up signal handler for Ctrl+C
+    let mut terminal = tui::setup_terminal()?;
+    let mut app = tui::App::new(args.addr.clone(), !args.tls_disabled);
+    app.add_info(format!("Broker started on {}", &args.addr));
+    if !args.tls_disabled {
+        app.add_info("TLS enabled");
+    } else {
+        app.add_error("TLS disabled, connections will not be encrypted");
+    }
+    app.add_info("Type /help for broker commands, /quit to shutdown");
+
+    let server_handle = tokio::spawn(run_server(
+        listener,
+        Arc::clone(&state),
+        tls_config.clone(),
+        shutdown_tx.clone(),
+        ui_tx.clone(),
+    ));
+
     let signal_state = Arc::clone(&state);
     let signal_shutdown = shutdown_tx.clone();
+    let signal_ui = ui_tx.clone();
     tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
-            println!("\nReceived Ctrl+C, shutting down...");
-            {
-                let state = signal_state.lock().await;
-                for peer in state.peers.values() {
-                    let _ = peer.tx.send("INFO broker shutting down".to_string());
-                }
-            }
-            let _ = signal_shutdown.send(());
+            request_shutdown(&signal_state, &signal_shutdown, &signal_ui).await;
         }
     });
 
+    let result = run_tui_loop(
+        &mut terminal,
+        &mut app,
+        Arc::clone(&state),
+        shutdown_tx.clone(),
+        ui_tx.clone(),
+        ui_rx,
+    )
+    .await;
+
+    tui::restore_terminal()?;
+    let _ = shutdown_tx.send(());
+    let _ = server_handle.await;
+
+    result
+}
+
+async fn run_server(
+    listener: TcpListener,
+    state: Arc<Mutex<Shared>>,
+    tls_config: Option<Arc<tls::TlsConfig>>,
+    shutdown_tx: broadcast::Sender<()>,
+    ui_tx: mpsc::Sender<tui::Message>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut shutdown_rx = shutdown_tx.subscribe();
 
     loop {
         tokio::select! {
             result = listener.accept() => {
                 let (stream, addr) = result?;
-
-                // Clone a handle to the `Shared` state for the new connection.
                 let state = Arc::clone(&state);
                 let tls_config = tls_config.clone();
+                let ui_tx = ui_tx.clone();
 
-                // Spawn our handler to be run asynchronously.
                 tokio::spawn(async move {
-                    tracing::debug!("TCP: Accepted connection from {}", addr);
+                    let _ = ui_info(&ui_tx, format!("Accepted connection from {addr}")).await;
                     let result = if let Some(ref tls_cfg) = tls_config {
-                        // TLS connection
                         tracing::debug!("TLS: Starting handshake with {}...", addr);
                         match tls_cfg.acceptor.accept(stream).await {
                             Ok(tls_stream) => {
                                 tracing::debug!("TLS: Handshake complete with {}", addr);
-                                process_tls(state, tls_stream, addr, tls_cfg.clone()).await
+                                process_tls(state, tls_stream, addr, tls_cfg.clone(), ui_tx.clone()).await
                             }
                             Err(e) => {
                                 tracing::warn!("TLS handshake failed from {}: {:?}", addr, e);
+                                let _ = ui_error(&ui_tx, format!("TLS handshake failed from {addr}: {e:?}")).await;
                                 Ok(())
                             }
                         }
                     } else {
-                        // Plain TCP connection
-                        process(state, stream, addr, None).await
+                        process(state, stream, addr, None, ui_tx.clone()).await
                     };
+
                     if let Err(e) = result {
                         tracing::info!("an error occurred; error = {:?}", e);
+                        let _ = ui_error(&ui_tx, format!("Connection error: {e}"))
+                            .await;
                     }
                 });
             }
             _ = shutdown_rx.recv() => {
-                println!("Broker shutdown complete.");
+                let _ = ui_info(&ui_tx, "Broker shutdown complete.").await;
                 break;
             }
         }
     }
 
     Ok(())
+}
+
+async fn run_tui_loop(
+    terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
+    app: &mut tui::App,
+    state: Arc<Mutex<Shared>>,
+    shutdown_tx: broadcast::Sender<()>,
+    ui_tx: mpsc::Sender<tui::Message>,
+    mut ui_rx: mpsc::Receiver<tui::Message>,
+) -> Result<(), Box<dyn Error>> {
+    let mut shutdown_rx = shutdown_tx.subscribe();
+    let mut shutdown_requested = false;
+
+    loop {
+        terminal.draw(|frame| app.draw(frame))?;
+
+        while let Ok(msg) = ui_rx.try_recv() {
+            app.handle_message(msg);
+        }
+
+        match shutdown_rx.try_recv() {
+            Ok(_) | Err(broadcast::error::TryRecvError::Lagged(_)) => {
+                shutdown_requested = true;
+                app.should_quit = true;
+            }
+            Err(broadcast::error::TryRecvError::Empty) => {}
+            Err(broadcast::error::TryRecvError::Closed) => {
+                shutdown_requested = true;
+                app.should_quit = true;
+            }
+        }
+
+        if crossterm::event::poll(std::time::Duration::from_millis(10))? {
+            if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
+                if key.kind == crossterm::event::KeyEventKind::Press {
+                    match key.code {
+                        crossterm::event::KeyCode::Char('c')
+                            if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) =>
+                        {
+                            shutdown_requested = true;
+                            request_shutdown(&state, &shutdown_tx, &ui_tx).await;
+                            app.should_quit = true;
+                        }
+                        crossterm::event::KeyCode::Char(c) => {
+                            if !app.current_completions.is_empty() {
+                                app.cancel_completion();
+                            }
+                            if let Some(cmd) = app.handle_input(c) {
+                                let should_quit =
+                                    handle_broker_command(cmd, &state, &shutdown_tx, &ui_tx)
+                                        .await?;
+                                if should_quit {
+                                    shutdown_requested = true;
+                                    app.should_quit = true;
+                                }
+                            }
+                        }
+                        crossterm::event::KeyCode::Backspace => app.handle_backspace(),
+                        crossterm::event::KeyCode::Delete => app.handle_delete(),
+                        crossterm::event::KeyCode::Left => app.cursor_left(),
+                        crossterm::event::KeyCode::Right => app.cursor_right(),
+                        crossterm::event::KeyCode::Home => app.cursor_home(),
+                        crossterm::event::KeyCode::End => app.cursor_end(),
+                        crossterm::event::KeyCode::Up => app.history_previous(),
+                        crossterm::event::KeyCode::Down => app.history_next(),
+                        crossterm::event::KeyCode::PageUp => {
+                            for _ in 0..5 {
+                                app.scroll_up();
+                            }
+                        }
+                        crossterm::event::KeyCode::PageDown => {
+                            for _ in 0..5 {
+                                app.scroll_down();
+                            }
+                        }
+                        crossterm::event::KeyCode::Tab => app.handle_tab(),
+                        crossterm::event::KeyCode::Enter => {
+                            if !app.current_completions.is_empty() {
+                                app.apply_completion();
+                            } else if let Some(cmd) = app.handle_input('\n') {
+                                let should_quit =
+                                    handle_broker_command(cmd, &state, &shutdown_tx, &ui_tx)
+                                        .await?;
+                                if should_quit {
+                                    shutdown_requested = true;
+                                    app.should_quit = true;
+                                }
+                            }
+                        }
+                        crossterm::event::KeyCode::F(1) => app.toggle_sidebar(),
+                        crossterm::event::KeyCode::Esc => {
+                            if !app.current_completions.is_empty() {
+                                app.cancel_completion();
+                            } else {
+                                app.should_quit = true;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        if app.should_quit {
+            break;
+        }
+    }
+
+    if !shutdown_requested {
+        request_shutdown(&state, &shutdown_tx, &ui_tx).await;
+    }
+
+    Ok(())
+}
+
+async fn handle_broker_command(
+    cmd: String,
+    state: &Arc<Mutex<Shared>>,
+    shutdown_tx: &broadcast::Sender<()>,
+    ui_tx: &mpsc::Sender<tui::Message>,
+) -> Result<bool, Box<dyn Error>> {
+    let trimmed = cmd.trim();
+    match trimmed {
+        "/quit" | "/exit" | "/shutdown" => {
+            request_shutdown(state, shutdown_tx, ui_tx).await;
+            Ok(true)
+        }
+        "/status" => {
+            let (peer_count, rooms) = collect_stats(state).await;
+            let rooms_display = if rooms.is_empty() {
+                "none".to_string()
+            } else {
+                rooms.join(", ")
+            };
+            ui_info(ui_tx, format!("Connected clients: {peer_count}")).await;
+            ui_info(ui_tx, format!("Active rooms: {rooms_display}")).await;
+            let _ = ui_tx
+                .send(tui::Message::Stats { peer_count, rooms })
+                .await;
+            Ok(false)
+        }
+        "/help" => {
+            ui_info(ui_tx, "Broker commands:").await;
+            ui_info(ui_tx, "  /status   - Show connected clients and rooms").await;
+            ui_info(ui_tx, "  /quit     - Gracefully shutdown the broker").await;
+            Ok(false)
+        }
+        "" => Ok(false),
+        _ => {
+            ui_error(
+                ui_tx,
+                format!("Unknown command: {trimmed}. Type /help for commands."),
+            )
+            .await;
+            Ok(false)
+        }
+    }
+}
+
+async fn request_shutdown(
+    state: &Arc<Mutex<Shared>>,
+    shutdown_tx: &broadcast::Sender<()>,
+    ui_tx: &mpsc::Sender<tui::Message>,
+) {
+    ui_info(ui_tx, "Shutting down broker...").await;
+    {
+        let state = state.lock().await;
+        for peer in state.peers.values() {
+            let _ = peer.tx.send("INFO broker shutting down".to_string());
+        }
+    }
+    let _ = shutdown_tx.send(());
+}
+
+async fn collect_stats(state: &Arc<Mutex<Shared>>) -> (usize, Vec<String>) {
+    let state = state.lock().await;
+    let peer_count = state.peers.len();
+    let mut rooms: Vec<String> = state.peers.values().map(|p| p.room.clone()).collect();
+    rooms.sort_unstable();
+    rooms.dedup();
+    (peer_count, rooms)
+}
+
+async fn send_stats(state: &Arc<Mutex<Shared>>, ui_tx: &mpsc::Sender<tui::Message>) {
+    let (peer_count, rooms) = collect_stats(state).await;
+    let _ = ui_tx
+        .send(tui::Message::Stats { peer_count, rooms })
+        .await;
+}
+
+async fn ui_info(ui_tx: &mpsc::Sender<tui::Message>, text: impl Into<String>) {
+    let _ = ui_tx
+        .send(tui::Message::Info {
+            text: text.into(),
+            timestamp: SystemTime::now(),
+        })
+        .await;
+}
+
+async fn ui_error(ui_tx: &mpsc::Sender<tui::Message>, text: impl Into<String>) {
+    let _ = ui_tx
+        .send(tui::Message::Error {
+            text: text.into(),
+            timestamp: SystemTime::now(),
+        })
+        .await;
 }
 
 fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, Box<dyn Error>> {
@@ -795,8 +951,9 @@ async fn process_tls(
     stream: tokio_rustls::server::TlsStream<TcpStream>,
     addr: SocketAddr,
     tls_config: Arc<tls::TlsConfig>,
+    ui_tx: mpsc::Sender<tui::Message>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    process(state, stream, addr, Some(tls_config)).await
+    process(state, stream, addr, Some(tls_config), ui_tx).await
 }
 
 /// Process an individual chat client
@@ -805,6 +962,7 @@ async fn process<S>(
     stream: S,
     addr: SocketAddr,
     tls_config: Option<Arc<tls::TlsConfig>>,
+    ui_tx: mpsc::Sender<tui::Message>,
 ) -> Result<(), Box<dyn Error + Send + Sync>>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -908,6 +1066,8 @@ where
         tracing::info!("{}", msg);
         state.broadcast(addr, &msg).await;
     }
+    ui_info(&ui_tx, format!("{username} joined {room}")).await;
+    send_stats(&state, &ui_tx).await;
 
     // Process incoming messages until our stream is exhausted by a disconnect.
     loop {
@@ -928,12 +1088,16 @@ where
                         }
                         room = new_room.to_string();
 
-                        let mut state = state.lock().await;
-                        if let Some(peer_info) = state.peers.get_mut(&addr) {
-                            peer_info.room = room.clone();
+                        {
+                            let mut shared = state.lock().await;
+                            if let Some(peer_info) = shared.peers.get_mut(&addr) {
+                                peer_info.room = room.clone();
+                            }
                         }
 
                         peer.lines.send(format!("INFO joined {room}")).await?;
+                        ui_info(&ui_tx, format!("{username} joined {room}")).await;
+                        send_stats(&state, &ui_tx).await;
                         continue;
                     }
 
@@ -1275,6 +1439,8 @@ where
         tracing::info!("{}", msg);
         state.broadcast(addr, &msg).await;
     }
+    ui_info(&ui_tx, format!("{username} left")).await;
+    send_stats(&state, &ui_tx).await;
 
     Ok(())
 }

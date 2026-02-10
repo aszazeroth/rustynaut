@@ -636,6 +636,11 @@ Log SHA256 fingerprints at key moments for debugging:
 - [x] Ctrl+C signal handling with client notification
 - [x] /status command showing connected clients and rooms
 - [x] Tracing integration with configurable verbosity (--verbose)
+- [ ] Broker TUI for unified experience (match client UX style)
+
+### CI and Release
+- [ ] Fix GitHub Actions to run `cargo clippy`, `cargo test`, and `cargo build` for both `broker/` and `client/`
+- [ ] Stamp a version in the build process (visible in `--version` output and/or build metadata)
 
 ### Future Enhancements
 - [ ] **TUI Client with Tab Completion** - Replace raw terminal with ratatui + tui-prompts. Provides better UI (no scrolling issues), built-in tab completion for commands/usernames/filenames, and visual polish. See detailed planning below.
