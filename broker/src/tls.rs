@@ -24,6 +24,8 @@ pub struct TlsConfig {
     pub ca_cert_pem: String,
     pub ca_key: Arc<KeyPair>,
     pub enrollment_token: String,
+    /// CA certificate path for display in TUI
+    pub ca_cert_path: PathBuf,
 }
 
 /// Result of generating a client certificate
@@ -368,10 +370,6 @@ pub fn init_tls(
         load_or_generate_token(cert_dir)?
     };
 
-    println!("Enrollment token: {}", enrollment_token);
-    println!("Share this token with clients for first-time enrollment");
-    println!("CA cert: {:?}", ca_cert_path);
-
     // Build TLS acceptor
     let server_certs = load_certs(&server_cert_path)?;
     let server_key = load_private_key(&server_key_path)?;
@@ -399,6 +397,7 @@ pub fn init_tls(
         ca_cert_pem,
         ca_key: Arc::new(ca_key),
         enrollment_token,
+        ca_cert_path,
     })
 }
 

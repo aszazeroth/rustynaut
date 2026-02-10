@@ -51,6 +51,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // Args: broker [--verbose|-v] [--no-tls] [--cert-dir <path>] [--regenerate-token] [addr]
     let args = parse_args(env::args().skip(1))?;
 
+    // NOTE: Tracing to stdout is disabled when TUI is active to avoid screen corruption.
+    // Important events are routed through the TUI message channel instead.
     use tracing_subscriber::{fmt::format::FmtSpan, EnvFilter};
     let default_directive = if args.verbose {
         "chat=debug"
@@ -60,6 +62,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env().add_directive(default_directive.parse()?))
         .with_span_events(FmtSpan::FULL)
+        // Use std::io::sink() to prevent stdout/stderr writes that break the TUI
+        .with_writer(std::io::sink)
         .init();
 
     let tls_config = if !args.tls_disabled {
@@ -85,6 +89,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     app.add_info(format!("Broker started on {}", &args.addr));
     if !args.tls_disabled {
         app.add_info("TLS enabled");
+        if let Some(ref tls_cfg) = tls_config {
+            app.add_info(format!("Enrollment token: {}", tls_cfg.enrollment_token));
+            app.add_info(format!("CA cert: {:?}", tls_cfg.ca_cert_path));
+        }
     } else {
         app.add_error("TLS disabled, connections will not be encrypted");
     }
@@ -491,8 +499,6 @@ fn extract_server_names(addr: &str) -> Vec<String> {
             names.push(ip);
         }
     }
-
-    eprintln!("Certificate SANs: {:?}", names);
 
     names
 }
