@@ -10,10 +10,6 @@ mod tls;
 mod tui;
 mod completion;
 
-/// Maximum line length for the wire protocol (2MB to handle large base64 clipboard payloads)
-/// For files larger than ~1.5MB raw, use the sideband FILE_OFFER protocol instead.
-const MAX_LINE_LENGTH: usize = 2 * 1024 * 1024;
-
 use tokio::sync::mpsc;
 use tokio::time::{self, Duration};
 
@@ -25,15 +21,12 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::exit;
 
-use base64::{engine::general_purpose, Engine as _};
-
+use rustynaut_common::constants::{FILE_CHUNK_SIZE, MAX_LINE_LENGTH};
+use rustynaut_common::utils::{decode_base64, encode_base64};
 use std::path::Path;
 use std::sync::Mutex;
 
 use lazy_static::lazy_static;
-
-/// Chunk size for file transfers (64KB)
-const FILE_CHUNK_SIZE: usize = 64 * 1024;
 
 fn resolve_download_dir() -> PathBuf {
     if let Some(downloads) = dirs::download_dir() {
@@ -235,7 +228,7 @@ fn parse_args() -> Result<Args, Box<dyn Error>> {
         room,
         tls_disabled,
         enroll_token,
-        cert_dir: cert_dir.unwrap_or_else(tls::default_cert_dir),
+        cert_dir: cert_dir.unwrap_or_else(rustynaut_common::tls::default_client_cert_dir),
     })
 }
 
@@ -319,7 +312,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     .file_name()
                                     .and_then(|n| n.to_str())
                                     .unwrap_or("unknown");
-                                let filename_b64 = general_purpose::STANDARD.encode(filename);
+                let filename_b64 = encode_base64(filename);
 
                                 if let Ok(mut pending) = PENDING_OUTGOING.lock() {
                                     pending.insert(filename_b64.clone(), PendingOutgoingFile {
@@ -382,7 +375,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             .file_name()
                             .and_then(|n| n.to_str())
                             .unwrap_or("unknown");
-                        let filename_b64 = general_purpose::STANDARD.encode(filename);
+                        let filename_b64 = encode_base64(filename);
 
                         if let Ok(mut pending) = PENDING_OUTGOING.lock() {
                             pending.insert(filename_b64.clone(), PendingOutgoingFile {
@@ -402,7 +395,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     }
                 }
 
-                let encoded = general_purpose::STANDARD.encode(&current_content);
+                let encoded = encode_base64(&current_content);
                 if clipboard_tx
                     .send(format!("CLIP {room_for_clipboard} {encoded}"))
                     .await
@@ -572,12 +565,9 @@ async fn run_tui_loop(
                     }
                 }
                 crossterm::event::Event::Mouse(mouse_event) => {
-                    match mouse_event.kind {
-                        crossterm::event::MouseEventKind::Down(_) => {
-                            // Handle mouse click in message area
-                            app.handle_mouse_click(mouse_event.row);
-                        }
-                        _ => {}
+                    if let crossterm::event::MouseEventKind::Down(_) = mouse_event.kind {
+                        // Handle mouse click in message area
+                        app.handle_mouse_click(mouse_event.row);
                     }
                 }
                 _ => {}
@@ -654,7 +644,8 @@ async fn enroll(
     if let Some(Ok(line)) = framed.next().await {
         if line.starts_with("ENROLLED ") {
             let bundle =
-                tls::parse_enrolled_response(&line).map_err(|e| -> Box<dyn Error> { e })?;
+                rustynaut_common::tls::parse_enrolled_response(&line)
+                    .map_err(|e| -> Box<dyn Error> { e })?;
             tls::save_enrolled_certs(cert_dir, &bundle).map_err(|e| -> Box<dyn Error> { e })?;
 
             println!("Enrollment successful!");
@@ -679,7 +670,7 @@ fn get_current_clipboard() -> arboard::Clipboard {
 }
 
 fn replace_clipboard_content(content: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let decoded = general_purpose::STANDARD.decode(content)?;
+    let decoded = decode_base64(content)?;
     let decoded_string = String::from_utf8(decoded)?;
 
     // Skip empty content
@@ -709,98 +700,6 @@ fn default_username() -> String {
     env::var("USER")
         .or_else(|_| env::var("USERNAME"))
         .unwrap_or_else(|_| "anon".to_string())
-}
-
-fn parse_clip_fields(line: &str) -> Option<(&str, &str, Option<&str>)> {
-    let mut parts = line.splitn(4, ' ');
-    match (parts.next()?, parts.next()?, parts.next()?) {
-        ("CLIP", room, b64) => Some((room, b64, parts.next())),
-        _ => None,
-    }
-}
-
-/// Parse FILE_OFFER from broker: FILE_OFFER <room> <username> <filename_b64> <size>
-fn parse_file_offer_fields(line: &str) -> Option<(&str, &str, &str, &str)> {
-    let mut parts = line.splitn(5, ' ');
-    match (
-        parts.next()?,
-        parts.next()?,
-        parts.next()?,
-        parts.next()?,
-        parts.next()?,
-    ) {
-        ("FILE_OFFER", room, username, filename_b64, size) => {
-            Some((room, username, filename_b64, size))
-        }
-        _ => None,
-    }
-}
-
-/// Parse FILE_START from broker: FILE_START <transfer_id> <filename_b64> <acceptor_count>
-fn parse_file_start_fields(line: &str) -> Option<(&str, &str, &str)> {
-    let mut parts = line.splitn(4, ' ');
-    match (parts.next()?, parts.next()?, parts.next()?, parts.next()?) {
-        ("FILE_START", transfer_id, filename_b64, acceptor_count) => {
-            Some((transfer_id, filename_b64, acceptor_count))
-        }
-        _ => None,
-    }
-}
-
-/// Parse FILE_INCOMING from broker: FILE_INCOMING <transfer_id> <filename_b64> <size>
-fn parse_file_incoming_fields(line: &str) -> Option<(&str, &str, &str)> {
-    let mut parts = line.splitn(4, ' ');
-    match (parts.next()?, parts.next()?, parts.next()?, parts.next()?) {
-        ("FILE_INCOMING", transfer_id, filename_b64, size) => {
-            Some((transfer_id, filename_b64, size))
-        }
-        _ => None,
-    }
-}
-
-/// Parse FILE_CANCELLED from broker: FILE_CANCELLED <transfer_id> <reason>
-fn parse_file_cancelled_fields(line: &str) -> Option<(&str, &str)> {
-    let rest = line.strip_prefix("FILE_CANCELLED ")?;
-    let mut parts = rest.splitn(2, ' ');
-    let transfer_id = parts.next()?;
-    let reason = parts.next().unwrap_or("unknown");
-    Some((transfer_id, reason))
-}
-
-/// Parse FILE_CHUNK from broker: FILE_CHUNK <transfer_id> <offset> <chunk_b64>
-fn parse_file_chunk_fields(line: &str) -> Option<(&str, &str, &str)> {
-    let mut parts = line.splitn(4, ' ');
-    match (parts.next()?, parts.next()?, parts.next()?, parts.next()?) {
-        ("FILE_CHUNK", transfer_id, offset, chunk_b64) => Some((transfer_id, offset, chunk_b64)),
-        _ => None,
-    }
-}
-
-/// Parse FILE_DONE from broker: FILE_DONE <transfer_id> <sha256>
-fn parse_file_done_fields(line: &str) -> Option<(&str, &str)> {
-    let mut parts = line.splitn(3, ' ');
-    match (parts.next()?, parts.next()?, parts.next()?) {
-        ("FILE_DONE", transfer_id, sha256) => Some((transfer_id, sha256)),
-        _ => None,
-    }
-}
-
-/// Parse FILE_SENT from broker: FILE_SENT <transfer_id> <count>
-fn parse_file_sent_fields(line: &str) -> Option<(&str, &str)> {
-    let mut parts = line.splitn(3, ' ');
-    match (parts.next()?, parts.next()?, parts.next()?) {
-        ("FILE_SENT", transfer_id, count) => Some((transfer_id, count)),
-        _ => None,
-    }
-}
-
-/// Parse SAY from broker: SAY <user> <text>
-fn parse_say_fields(line: &str) -> Option<(&str, &str)> {
-    let mut parts = line.splitn(3, ' ');
-    match (parts.next()?, parts.next()?, parts.next()?) {
-        ("SAY", user, text) => Some((user, text)),
-        _ => None,
-    }
 }
 
 /// Generate FILE_CHUNK messages for a file transfer
@@ -839,7 +738,7 @@ fn generate_file_chunks(filename_b64: &str, transfer_id: &str) -> Vec<String> {
     // Generate chunks
     let mut offset: u64 = 0;
     for chunk in file_data.chunks(FILE_CHUNK_SIZE) {
-        let chunk_b64 = general_purpose::STANDARD.encode(chunk);
+        let chunk_b64 = encode_base64(chunk);
         messages.push(format!("FILE_CHUNK {transfer_id} {offset} {chunk_b64}"));
         offset += chunk.len() as u64;
     }
@@ -875,7 +774,7 @@ fn prepare_incoming_transfer(transfer_id: u64, filename: &str, _size: u64) -> Re
 
 /// Handle incoming FILE_CHUNK - write bytes to temp file
 fn handle_file_chunk(transfer_id: u64, _offset: u64, chunk_b64: &str) -> Result<(), String> {
-    let chunk_data = general_purpose::STANDARD.decode(chunk_b64)
+    let chunk_data = decode_base64(chunk_b64)
         .map_err(|e| format!("Invalid base64: {}", e))?;
 
     let mut transfers = INCOMING_TRANSFERS.lock().map_err(|e| format!("Lock failed: {}", e))?;
@@ -920,26 +819,15 @@ fn finalize_transfer(transfer_id: u64, _expected_sha256: &str) -> Result<String,
     Ok(final_path.display().to_string())
 }
 
-/// Format a byte size for human-readable display
-fn format_size(size: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = KB * 1024;
-    const GB: u64 = MB * 1024;
-
-    if size >= GB {
-        format!("{:.1} GB", size as f64 / GB as f64)
-    } else if size >= MB {
-        format!("{:.1} MB", size as f64 / MB as f64)
-    } else if size >= KB {
-        format!("{:.1} KB", size as f64 / KB as f64)
-    } else {
-        format!("{} bytes", size)
-    }
-}
-
 mod tcp {
-    use base64::Engine;
     use futures::{future, Sink, SinkExt, Stream, StreamExt};
+    use rustynaut_common::constants::MAX_LINE_LENGTH;
+    use rustynaut_common::parsing::{
+        parse_clip_fields, parse_file_cancelled_fields, parse_file_chunk_fields,
+        parse_file_done_fields, parse_file_incoming_fields, parse_file_offer_fields,
+        parse_file_sent_fields, parse_file_start_fields, parse_say_fields,
+    };
+    use rustynaut_common::utils::{decode_base64, format_size};
     use std::{error::Error, net::SocketAddr};
     use tokio::net::TcpStream;
     use tokio::sync::mpsc;
@@ -955,10 +843,10 @@ mod tcp {
         let mut stream = TcpStream::connect(addr).await?;
         let (r, w) = stream.split();
         
-        let mut sink = FramedWrite::new(w, LinesCodec::new_with_max_length(crate::MAX_LINE_LENGTH));
+        let mut sink = FramedWrite::new(w, LinesCodec::new_with_max_length(MAX_LINE_LENGTH));
         let mut stream_reader = FramedRead::new(
             r,
-            LinesCodec::new_with_max_length(crate::MAX_LINE_LENGTH),
+            LinesCodec::new_with_max_length(MAX_LINE_LENGTH),
         );
 
         // Send initial connection message
@@ -1012,7 +900,7 @@ mod tcp {
         verbose: bool,
     ) -> Result<(), String> {
         // Apply clipboard updates silently (avoid printing base64 payloads).
-        if let Some((room, clipboard_b64, id)) = crate::parse_clip_fields(message) {
+        if let Some((room, clipboard_b64, id)) = parse_clip_fields(message) {
             let err_msg = if let Err(err) = crate::replace_clipboard_content(clipboard_b64) {
                 Some(format!("could not replace the clipboard content, {}", err))
             } else {
@@ -1038,15 +926,14 @@ mod tcp {
 
         // Handle FILE_OFFER: display as a user-friendly message
         if let Some((room, username, filename_b64, size_str)) =
-            crate::parse_file_offer_fields(message)
+            parse_file_offer_fields(message)
         {
-            let filename = base64::engine::general_purpose::STANDARD
-                .decode(filename_b64)
+            let filename = decode_base64(filename_b64)
                 .ok()
                 .and_then(|bytes| String::from_utf8(bytes).ok())
                 .unwrap_or_else(|| "<unknown>".to_string());
             let size: u64 = size_str.parse().unwrap_or(0);
-            let size_display = crate::format_size(size);
+            let size_display = format_size(size);
             
             let _ = ui_tx.send(crate::tui::Message::FileOffer {
                 room: room.to_string(),
@@ -1060,10 +947,9 @@ mod tcp {
 
         // Handle FILE_START: sender should begin transfer
         if let Some((transfer_id, filename_b64, acceptor_count)) =
-            crate::parse_file_start_fields(message)
+            parse_file_start_fields(message)
         {
-            let filename = base64::engine::general_purpose::STANDARD
-                .decode(filename_b64)
+            let filename = decode_base64(filename_b64)
                 .ok()
                 .and_then(|bytes| String::from_utf8(bytes).ok())
                 .unwrap_or_else(|| "<unknown>".to_string());
@@ -1096,10 +982,9 @@ mod tcp {
 
         // Handle FILE_INCOMING: receiver should prepare to receive
         if let Some((transfer_id, filename_b64, size_str)) =
-            crate::parse_file_incoming_fields(message)
+            parse_file_incoming_fields(message)
         {
-            let filename = base64::engine::general_purpose::STANDARD
-                .decode(filename_b64)
+            let filename = decode_base64(filename_b64)
                 .ok()
                 .and_then(|bytes| String::from_utf8(bytes).ok())
                 .unwrap_or_else(|| "<unknown>".to_string());
@@ -1121,7 +1006,7 @@ mod tcp {
         }
 
         // Handle FILE_CHUNK: write chunk to temp file
-        if let Some((transfer_id, offset, chunk_b64)) = crate::parse_file_chunk_fields(message) {
+        if let Some((transfer_id, offset, chunk_b64)) = parse_file_chunk_fields(message) {
             let tid: u64 = transfer_id.parse().unwrap_or(0);
             let off: u64 = offset.parse().unwrap_or(0);
             if let Err(e) = crate::handle_file_chunk(tid, off, chunk_b64) {
@@ -1131,7 +1016,7 @@ mod tcp {
         }
 
         // Handle FILE_DONE: finalize the transfer
-        if let Some((transfer_id, sha256)) = crate::parse_file_done_fields(message) {
+        if let Some((transfer_id, sha256)) = parse_file_done_fields(message) {
             let tid: u64 = transfer_id.parse().unwrap_or(0);
             match crate::finalize_transfer(tid, sha256) {
                 Ok(final_path) => {
@@ -1151,7 +1036,7 @@ mod tcp {
         }
 
         // Handle FILE_SENT: sender confirmation
-        if let Some((transfer_id, count)) = crate::parse_file_sent_fields(message) {
+        if let Some((transfer_id, count)) = parse_file_sent_fields(message) {
             let _ = ui_tx.send(crate::tui::Message::FileTransfer {
                 text: format!(
                     "File sent successfully (transfer_id={}, {} receiver(s))",
@@ -1163,7 +1048,7 @@ mod tcp {
         }
 
         // Handle FILE_CANCELLED
-        if let Some((transfer_id, reason)) = crate::parse_file_cancelled_fields(message) {
+        if let Some((transfer_id, reason)) = parse_file_cancelled_fields(message) {
             let _ = ui_tx.send(crate::tui::Message::FileTransfer {
                 text: format!("File transfer {} cancelled: {}", transfer_id, reason),
                 timestamp: std::time::SystemTime::now()
@@ -1172,7 +1057,7 @@ mod tcp {
         }
 
          // Handle SAY messages
-    if let Some((user, text)) = crate::parse_say_fields(message) {
+    if let Some((user, text)) = parse_say_fields(message) {
         let _ = ui_tx.send(crate::tui::Message::Chat {
             user: user.to_string(),
             text: text.to_string(),
@@ -1205,15 +1090,15 @@ mod tcp {
     ) -> Result<(), Box<dyn Error>> {
         let mut stream = TcpStream::connect(addr).await?;
         let (r, w) = stream.split();
-        let mut sink = FramedWrite::new(w, LinesCodec::new_with_max_length(crate::MAX_LINE_LENGTH));
+        let mut sink = FramedWrite::new(w, LinesCodec::new_with_max_length(MAX_LINE_LENGTH));
         let mut stream = FramedRead::new(
             r,
-            LinesCodec::new_with_max_length(crate::MAX_LINE_LENGTH),
+            LinesCodec::new_with_max_length(MAX_LINE_LENGTH),
         )
         .filter_map(|i| match i {
             Ok(message) => {
                 // Apply clipboard updates silently (avoid printing base64 payloads).
-                if let Some((room, clipboard_b64, id)) = crate::parse_clip_fields(&message) {
+                if let Some((room, clipboard_b64, id)) = parse_clip_fields(&message) {
                     if let Err(err) = crate::replace_clipboard_content(clipboard_b64) {
                         eprintln!("could not replace the clipboard content, {}", err)
                     }
@@ -1230,16 +1115,15 @@ mod tcp {
 
                 // Handle FILE_OFFER: display as a user-friendly message
                 if let Some((room, username, filename_b64, size_str)) =
-                    crate::parse_file_offer_fields(&message)
+                    parse_file_offer_fields(&message)
                 {
                     // Decode filename from base64
-                    let filename = base64::engine::general_purpose::STANDARD
-                        .decode(filename_b64)
+                    let filename = decode_base64(filename_b64)
                         .ok()
                         .and_then(|bytes| String::from_utf8(bytes).ok())
                         .unwrap_or_else(|| "<unknown>".to_string());
                     let size: u64 = size_str.parse().unwrap_or(0);
-                    let size_display = crate::format_size(size);
+                    let size_display = format_size(size);
                     // Display the file offer to the user with accept hint
                     let display_msg = format!(
                         "INFO [{room}] {username} offers file: {filename} ({size_display}) - use /accept {username} {filename} to receive"
@@ -1249,10 +1133,9 @@ mod tcp {
 
                 // Handle FILE_START: sender should begin transfer
                 if let Some((transfer_id, filename_b64, acceptor_count)) =
-                    crate::parse_file_start_fields(&message)
+                    parse_file_start_fields(&message)
                 {
-                    let filename = base64::engine::general_purpose::STANDARD
-                        .decode(filename_b64)
+                    let filename = decode_base64(filename_b64)
                         .ok()
                         .and_then(|bytes| String::from_utf8(bytes).ok())
                         .unwrap_or_else(|| "<unknown>".to_string());
@@ -1282,15 +1165,14 @@ mod tcp {
 
                 // Handle FILE_INCOMING: receiver should prepare to receive
                 if let Some((transfer_id, filename_b64, size_str)) =
-                    crate::parse_file_incoming_fields(&message)
+                    parse_file_incoming_fields(&message)
                 {
-                    let filename = base64::engine::general_purpose::STANDARD
-                        .decode(filename_b64)
+                    let filename = decode_base64(filename_b64)
                         .ok()
                         .and_then(|bytes| String::from_utf8(bytes).ok())
                         .unwrap_or_else(|| "<unknown>".to_string());
                     let size: u64 = size_str.parse().unwrap_or(0);
-                    let size_display = crate::format_size(size);
+                    let size_display = format_size(size);
                     
                     // Prepare to receive the file
                     let tid: u64 = transfer_id.parse().unwrap_or(0);
@@ -1306,7 +1188,7 @@ mod tcp {
 
                 // Handle FILE_CHUNK: write chunk to temp file
                 if let Some((transfer_id, offset, chunk_b64)) =
-                    crate::parse_file_chunk_fields(&message)
+                    parse_file_chunk_fields(&message)
                 {
                     let tid: u64 = transfer_id.parse().unwrap_or(0);
                     let off: u64 = offset.parse().unwrap_or(0);
@@ -1319,7 +1201,7 @@ mod tcp {
 
                 // Handle FILE_DONE: finalize the transfer
                 if let Some((transfer_id, sha256)) =
-                    crate::parse_file_done_fields(&message)
+                    parse_file_done_fields(&message)
                 {
                     let tid: u64 = transfer_id.parse().unwrap_or(0);
                     match crate::finalize_transfer(tid, sha256) {
@@ -1340,7 +1222,7 @@ mod tcp {
 
                 // Handle FILE_SENT: sender confirmation
                 if let Some((transfer_id, count)) =
-                    crate::parse_file_sent_fields(&message)
+                    parse_file_sent_fields(&message)
                 {
                     let display_msg = format!(
                         "INFO File sent successfully (transfer_id={transfer_id}, {count} receiver(s))"
@@ -1350,7 +1232,7 @@ mod tcp {
 
                 // Handle FILE_CANCELLED
                 if let Some((transfer_id, reason)) =
-                    crate::parse_file_cancelled_fields(&message)
+                    parse_file_cancelled_fields(&message)
                 {
                     let display_msg = format!(
                         "INFO File transfer {transfer_id} cancelled: {reason}"
@@ -1374,8 +1256,14 @@ mod tcp {
 }
 
 mod tls_transport {
-    use base64::Engine;
     use futures::{future, Sink, SinkExt, Stream, StreamExt};
+    use rustynaut_common::constants::MAX_LINE_LENGTH;
+    use rustynaut_common::parsing::{
+        parse_clip_fields, parse_file_cancelled_fields, parse_file_chunk_fields,
+        parse_file_done_fields, parse_file_incoming_fields, parse_file_offer_fields,
+        parse_file_sent_fields, parse_file_start_fields,
+    };
+    use rustynaut_common::utils::{decode_base64, format_size};
     use std::{error::Error, net::SocketAddr};
     use tokio::net::TcpStream;
     use tokio::sync::mpsc;
@@ -1398,10 +1286,10 @@ mod tls_transport {
             .map_err(|e| -> Box<dyn Error> { e })?;
 
         let (r, w) = tokio::io::split(tls_stream);
-        let mut sink = FramedWrite::new(w, LinesCodec::new_with_max_length(crate::MAX_LINE_LENGTH));
+        let mut sink = FramedWrite::new(w, LinesCodec::new_with_max_length(MAX_LINE_LENGTH));
         let mut stream_reader = FramedRead::new(
             r,
-            LinesCodec::new_with_max_length(crate::MAX_LINE_LENGTH),
+            LinesCodec::new_with_max_length(MAX_LINE_LENGTH),
         );
 
         // Send initial connection message
@@ -1465,15 +1353,15 @@ mod tls_transport {
             .map_err(|e| -> Box<dyn Error> { e })?;
 
         let (r, w) = tokio::io::split(tls_stream);
-        let mut sink = FramedWrite::new(w, LinesCodec::new_with_max_length(crate::MAX_LINE_LENGTH));
+        let mut sink = FramedWrite::new(w, LinesCodec::new_with_max_length(MAX_LINE_LENGTH));
         let mut stream = FramedRead::new(
             r,
-            LinesCodec::new_with_max_length(crate::MAX_LINE_LENGTH),
+            LinesCodec::new_with_max_length(MAX_LINE_LENGTH),
         )
         .filter_map(|i| match i {
             Ok(message) => {
                 // Apply clipboard updates silently (avoid printing base64 payloads).
-                if let Some((room, clipboard_b64, id)) = crate::parse_clip_fields(&message) {
+                if let Some((room, clipboard_b64, id)) = parse_clip_fields(&message) {
                     if let Err(err) = crate::replace_clipboard_content(clipboard_b64) {
                         eprintln!("could not replace the clipboard content, {}", err)
                     }
@@ -1490,16 +1378,15 @@ mod tls_transport {
 
                 // Handle FILE_OFFER: display as a user-friendly message
                 if let Some((room, username, filename_b64, size_str)) =
-                    crate::parse_file_offer_fields(&message)
+                    parse_file_offer_fields(&message)
                 {
                     // Decode filename from base64
-                    let filename = base64::engine::general_purpose::STANDARD
-                        .decode(filename_b64)
+                    let filename = decode_base64(filename_b64)
                         .ok()
                         .and_then(|bytes| String::from_utf8(bytes).ok())
                         .unwrap_or_else(|| "<unknown>".to_string());
                     let size: u64 = size_str.parse().unwrap_or(0);
-                    let size_display = crate::format_size(size);
+                    let size_display = format_size(size);
                     // Display the file offer to the user with accept hint
                     let display_msg = format!(
                         "INFO [{room}] {username} offers file: {filename} ({size_display}) - use /accept {username} {filename} to receive"
@@ -1509,10 +1396,9 @@ mod tls_transport {
 
                 // Handle FILE_START: sender should begin transfer
                 if let Some((transfer_id, filename_b64, acceptor_count)) =
-                    crate::parse_file_start_fields(&message)
+                    parse_file_start_fields(&message)
                 {
-                    let filename = base64::engine::general_purpose::STANDARD
-                        .decode(filename_b64)
+                    let filename = decode_base64(filename_b64)
                         .ok()
                         .and_then(|bytes| String::from_utf8(bytes).ok())
                         .unwrap_or_else(|| "<unknown>".to_string());
@@ -1542,15 +1428,14 @@ mod tls_transport {
 
                 // Handle FILE_INCOMING: receiver should prepare to receive
                 if let Some((transfer_id, filename_b64, size_str)) =
-                    crate::parse_file_incoming_fields(&message)
+                    parse_file_incoming_fields(&message)
                 {
-                    let filename = base64::engine::general_purpose::STANDARD
-                        .decode(filename_b64)
+                    let filename = decode_base64(filename_b64)
                         .ok()
                         .and_then(|bytes| String::from_utf8(bytes).ok())
                         .unwrap_or_else(|| "<unknown>".to_string());
                     let size: u64 = size_str.parse().unwrap_or(0);
-                    let size_display = crate::format_size(size);
+                    let size_display = format_size(size);
                     
                     // Prepare to receive the file
                     let tid: u64 = transfer_id.parse().unwrap_or(0);
@@ -1566,7 +1451,7 @@ mod tls_transport {
 
                 // Handle FILE_CHUNK: write chunk to temp file
                 if let Some((transfer_id, offset, chunk_b64)) =
-                    crate::parse_file_chunk_fields(&message)
+                    parse_file_chunk_fields(&message)
                 {
                     let tid: u64 = transfer_id.parse().unwrap_or(0);
                     let off: u64 = offset.parse().unwrap_or(0);
@@ -1579,7 +1464,7 @@ mod tls_transport {
 
                 // Handle FILE_DONE: finalize the transfer
                 if let Some((transfer_id, sha256)) =
-                    crate::parse_file_done_fields(&message)
+                    parse_file_done_fields(&message)
                 {
                     let tid: u64 = transfer_id.parse().unwrap_or(0);
                     match crate::finalize_transfer(tid, sha256) {
@@ -1600,7 +1485,7 @@ mod tls_transport {
 
                 // Handle FILE_SENT: sender confirmation
                 if let Some((transfer_id, count)) =
-                    crate::parse_file_sent_fields(&message)
+                    parse_file_sent_fields(&message)
                 {
                     let display_msg = format!(
                         "INFO File sent successfully (transfer_id={transfer_id}, {count} receiver(s))"
@@ -1610,7 +1495,7 @@ mod tls_transport {
 
                 // Handle FILE_CANCELLED
                 if let Some((transfer_id, reason)) =
-                    crate::parse_file_cancelled_fields(&message)
+                    parse_file_cancelled_fields(&message)
                 {
                     let display_msg = format!(
                         "INFO File transfer {transfer_id} cancelled: {reason}"
@@ -1630,69 +1515,5 @@ mod tls_transport {
             (Err(e), _) | (_, Err(e)) => Err(e.into()),
             _ => Ok(()),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // ==================== parse_clip_fields tests ====================
-
-    #[test]
-    fn test_parse_clip_fields_with_id() {
-        let result = parse_clip_fields("CLIP lobby SGVsbG8= 42");
-        assert_eq!(result, Some(("lobby", "SGVsbG8=", Some("42"))));
-    }
-
-    #[test]
-    fn test_parse_clip_fields_without_id() {
-        let result = parse_clip_fields("CLIP lobby SGVsbG8=");
-        assert_eq!(result, Some(("lobby", "SGVsbG8=", None)));
-    }
-
-    #[test]
-    fn test_parse_clip_fields_different_room() {
-        let result = parse_clip_fields("CLIP room-1 dGVzdA== 123");
-        assert_eq!(result, Some(("room-1", "dGVzdA==", Some("123"))));
-    }
-
-    #[test]
-    fn test_parse_clip_fields_missing_parts() {
-        assert_eq!(parse_clip_fields("CLIP lobby"), None);
-        assert_eq!(parse_clip_fields("CLIP"), None);
-        assert_eq!(parse_clip_fields(""), None);
-    }
-
-    #[test]
-    fn test_parse_clip_fields_wrong_prefix() {
-        assert_eq!(parse_clip_fields("JOIN lobby SGVsbG8="), None);
-        assert_eq!(parse_clip_fields("INFO some text"), None);
-    }
-
-    // ==================== base64 roundtrip test ====================
-
-    #[test]
-    fn test_base64_roundtrip() {
-        use base64::{engine::general_purpose, Engine as _};
-
-        let original = "Hello, World!\nLine 2";
-        let encoded = general_purpose::STANDARD.encode(original);
-        let decoded_bytes = general_purpose::STANDARD.decode(&encoded).unwrap();
-        let decoded = String::from_utf8(decoded_bytes).unwrap();
-
-        assert_eq!(original, decoded);
-    }
-
-    #[test]
-    fn test_base64_with_special_chars() {
-        use base64::{engine::general_purpose, Engine as _};
-
-        let original = "{\n  \"name\": \"test\",\n  \"value\": 123\n}";
-        let encoded = general_purpose::STANDARD.encode(original);
-        let decoded_bytes = general_purpose::STANDARD.decode(&encoded).unwrap();
-        let decoded = String::from_utf8(decoded_bytes).unwrap();
-
-        assert_eq!(original, decoded);
     }
 }

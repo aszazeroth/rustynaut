@@ -650,22 +650,20 @@ impl App {
 
         if self.input.is_empty() {
             spans.push(Span::styled(" ", Style::default().bg(COLOR_BG)));
-        } else {
-            if self.cursor_pos < self.input.len() {
-                let before = &self.input[..self.cursor_pos];
-                let at_cursor = &self.input[self.cursor_pos..self.cursor_pos + 1];
-                let after = &self.input[self.cursor_pos + 1..];
+        } else if self.cursor_pos < self.input.len() {
+            let before = &self.input[..self.cursor_pos];
+            let at_cursor = &self.input[self.cursor_pos..self.cursor_pos + 1];
+            let after = &self.input[self.cursor_pos + 1..];
 
-                spans.push(Span::raw(before.to_string()));
-                spans.push(Span::styled(
-                    at_cursor,
-                    Style::default().bg(COLOR_FG).fg(COLOR_BG_SOFT),
-                ));
-                spans.push(Span::raw(after.to_string()));
-            } else {
-                spans.push(Span::raw(self.input.clone()));
-                spans.push(Span::styled(" ", Style::default().bg(COLOR_BG)));
-            }
+            spans.push(Span::raw(before.to_string()));
+            spans.push(Span::styled(
+                at_cursor,
+                Style::default().bg(COLOR_FG).fg(COLOR_BG_SOFT),
+            ));
+            spans.push(Span::raw(after.to_string()));
+        } else {
+            spans.push(Span::raw(self.input.clone()));
+            spans.push(Span::styled(" ", Style::default().bg(COLOR_BG)));
         }
 
         let input = Paragraph::new(Line::from(spans))

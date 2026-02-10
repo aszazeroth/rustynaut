@@ -17,18 +17,6 @@
 
 mod tls;
 mod tui;
-
-/// Maximum line length for the wire protocol (2MB to handle large base64 clipboard payloads)
-/// For files larger than ~1.5MB raw, use the sideband FILE_OFFER protocol instead.
-const MAX_LINE_LENGTH: usize = 2 * 1024 * 1024;
-
-use tokio::io::{self, AsyncRead, AsyncWrite};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{broadcast, mpsc, Mutex};
-use tokio_stream::StreamExt;
-use tokio_util::codec::{Framed, LinesCodec};
-
-use futures::SinkExt;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::error::Error;
@@ -36,6 +24,20 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime};
+
+use futures::SinkExt;
+use rustynaut_common::constants::{MAX_FILE_SIZE, MAX_LINE_LENGTH, MAX_RECENT_CLIPS_PER_ROOM};
+use rustynaut_common::tls::default_broker_cert_dir;
+use rustynaut_common::parsing::{
+    parse_cmd, parse_clip, parse_enroll, parse_file_accept, parse_file_cancel, parse_file_chunk,
+    parse_file_end, parse_file_offer, parse_join, parse_say, parse_user,
+};
+use rustynaut_common::utils::{decode_base64, encode_base64, format_size};
+use tokio::io::{self, AsyncRead, AsyncWrite};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{broadcast, mpsc, Mutex};
+use tokio_stream::StreamExt;
+use tokio_util::codec::{Framed, LinesCodec};
 
 /// Parsed command-line arguments
 struct Args {
@@ -467,7 +469,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, Box<dyn Er
         verbose,
         addr: addr.unwrap_or_else(|| "127.0.0.1:4242".to_string()),
         tls_disabled,
-        cert_dir: cert_dir.unwrap_or_else(tls::default_cert_dir),
+        cert_dir: cert_dir.unwrap_or_else(default_broker_cert_dir),
         regenerate_token,
     })
 }
@@ -532,12 +534,6 @@ type Tx = mpsc::UnboundedSender<String>;
 
 /// Shorthand for the receive half of the message channel.
 type Rx = mpsc::UnboundedReceiver<String>;
-
-/// Maximum number of recent clip hashes to track per room for deduplication
-const MAX_RECENT_CLIPS_PER_ROOM: usize = 20;
-
-/// Maximum file size for transfer (1GB)
-const MAX_FILE_SIZE: u64 = 1024 * 1024 * 1024;
 
 /// State of a file transfer
 #[derive(Debug, Clone, PartialEq)]
@@ -871,18 +867,6 @@ where
     }
 }
 
-fn parse_user(line: &str) -> Option<&str> {
-    line.strip_prefix("USER ")
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-}
-
-fn parse_join(line: &str) -> Option<&str> {
-    line.strip_prefix("JOIN ")
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-}
-
 /// Validate a username or room name.
 /// Allowed: alphanumeric, underscore, hyphen. Max 32 chars.
 fn is_valid_name(s: &str) -> bool {
@@ -890,89 +874,6 @@ fn is_valid_name(s: &str) -> bool {
         && s.len() <= 32
         && s.chars()
             .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
-}
-
-fn parse_clip(line: &str) -> Option<(&str, &str)> {
-    let mut parts = line.splitn(4, ' ');
-    match (parts.next()?, parts.next()?, parts.next()?) {
-        ("CLIP", room, b64) => Some((room, b64)),
-        _ => None,
-    }
-}
-
-/// Parse FILE_OFFER command: FILE_OFFER <room> <filename_b64> <size>
-/// Returns (room, filename_b64, size)
-fn parse_file_offer(line: &str) -> Option<(&str, &str, &str)> {
-    let mut parts = line.splitn(4, ' ');
-    match (parts.next()?, parts.next()?, parts.next()?, parts.next()?) {
-        ("FILE_OFFER", room, filename_b64, size) => Some((room, filename_b64, size)),
-        _ => None,
-    }
-}
-
-/// Parse FILE_ACCEPT command: FILE_ACCEPT <room> <sender_username> <filename_b64>
-/// Returns (room, sender_username, filename_b64)
-fn parse_file_accept(line: &str) -> Option<(&str, &str, &str)> {
-    let mut parts = line.splitn(4, ' ');
-    match (parts.next()?, parts.next()?, parts.next()?, parts.next()?) {
-        ("FILE_ACCEPT", room, sender_username, filename_b64) => {
-            Some((room, sender_username, filename_b64))
-        }
-        _ => None,
-    }
-}
-
-/// Parse FILE_CANCEL command: FILE_CANCEL <transfer_id>
-/// Returns transfer_id
-fn parse_file_cancel(line: &str) -> Option<u64> {
-    let rest = line.strip_prefix("FILE_CANCEL ")?;
-    rest.trim().parse().ok()
-}
-
-/// Parse FILE_CHUNK command: FILE_CHUNK <transfer_id> <offset> <chunk_b64>
-/// Returns (transfer_id, offset, chunk_b64)
-fn parse_file_chunk(line: &str) -> Option<(u64, u64, &str)> {
-    let mut parts = line.splitn(4, ' ');
-    match (parts.next()?, parts.next()?, parts.next()?, parts.next()?) {
-        ("FILE_CHUNK", tid, offset, chunk_b64) => {
-            Some((tid.parse().ok()?, offset.parse().ok()?, chunk_b64))
-        }
-        _ => None,
-    }
-}
-
-/// Parse FILE_END command: FILE_END <transfer_id> <sha256>
-/// Returns (transfer_id, sha256)
-fn parse_file_end(line: &str) -> Option<(u64, &str)> {
-    let mut parts = line.splitn(3, ' ');
-    match (parts.next()?, parts.next()?, parts.next()?) {
-        ("FILE_END", tid, sha256) => Some((tid.parse().ok()?, sha256)),
-        _ => None,
-    }
-}
-
-fn parse_cmd(line: &str) -> Option<&str> {
-    line.strip_prefix("CMD ")
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-}
-
-fn parse_say(line: &str) -> Option<&str> {
-    line.strip_prefix("SAY ")
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-}
-
-/// Parse ENROLL command: ENROLL <token> <username>
-fn parse_enroll(line: &str) -> Option<(&str, &str)> {
-    let rest = line.strip_prefix("ENROLL ")?;
-    let mut parts = rest.splitn(2, ' ');
-    let token = parts.next()?.trim();
-    let username = parts.next()?.trim();
-    if token.is_empty() || username.is_empty() {
-        return None;
-    }
-    Some((token, username))
 }
 
 /// Process a TLS connection
@@ -1046,7 +947,7 @@ where
                     enroll_username,
                 ) {
                     Ok(bundle) => {
-                        let response = tls::encode_enrolled_response(&bundle);
+                        let response = rustynaut_common::tls::encode_enrolled_response(&bundle);
                         lines.send(&response).await?;
                         tracing::info!(
                             "Enrolled '{}' - client should reconnect with certificate",
@@ -1145,21 +1046,13 @@ where
                                 if offers.is_empty() {
                                     peer.lines.send(format!("INFO no pending file offers in {room}")).await?;
                                 } else {
-                                    use base64::{engine::general_purpose, Engine as _};
                                     let mut lines = vec![format!("INFO pending file offers in {room}:")];
                                     for (username, filename_b64, size) in offers {
-                                        let filename = general_purpose::STANDARD
-                                            .decode(filename_b64)
+                                        let filename = decode_base64(filename_b64)
                                             .ok()
-                                            .and_then(|b| String::from_utf8(b).ok())
+                                            .and_then(|bytes| String::from_utf8(bytes).ok())
                                             .unwrap_or_else(|| "<unknown>".to_string());
-                                        let size_display = if size >= 1024 * 1024 {
-                                            format!("{:.1} MB", size as f64 / (1024.0 * 1024.0))
-                                        } else if size >= 1024 {
-                                            format!("{:.1} KB", size as f64 / 1024.0)
-                                        } else {
-                                            format!("{} bytes", size)
-                                        };
+                                        let size_display = format_size(size);
                                         lines.push(format!("INFO   {username}: {filename} ({size_display})"));
                                     }
                                     for line in lines {
@@ -1198,7 +1091,15 @@ where
                             _ if cmd.starts_with("/accept ") => {
                                 // Parse /accept <username> [filename]
                                 // If filename is omitted, accept the most recent offer from that user
-                                let rest = cmd.strip_prefix("/accept ").unwrap().trim();
+                                let rest = match cmd.strip_prefix("/accept ") {
+                                    Some(rest) => rest.trim(),
+                                    None => {
+                                        peer.lines
+                                            .send("ERR usage: /accept <username> [filename]".to_string())
+                                            .await?;
+                                        continue;
+                                    }
+                                };
                                 let parts: Vec<&str> = rest.splitn(2, ' ').collect();
                                 if parts.is_empty() || parts[0].is_empty() {
                                     peer.lines.send("ERR usage: /accept <username> [filename]").await?;
@@ -1206,14 +1107,12 @@ where
                                 }
                                 let sender_username = parts[0];
 
-                                use base64::{engine::general_purpose, Engine as _};
-
                                 let mut state = state.lock().await;
 
                                 // Get filename_b64 - either from argument or find latest offer
                                 let filename_b64 = if parts.len() >= 2 {
                                     // Explicit filename provided - base64 encode it
-                                    general_purpose::STANDARD.encode(parts[1])
+                                    encode_base64(parts[1])
                                 } else {
                                     // No filename - find the most recent offer from this user
                                     match state.find_latest_offer(&room, sender_username) {
@@ -1226,8 +1125,18 @@ where
                                 };
 
                                 // Try to accept the offer
-                                if let Some((transfer_id, sender_addr)) = state.accept_offer(addr, &room, sender_username, &filename_b64) {
-                                    let transfer = state.get_transfer(transfer_id).unwrap();
+                                if let Some((transfer_id, sender_addr)) =
+                                    state.accept_offer(addr, &room, sender_username, &filename_b64)
+                                {
+                                    let transfer = match state.get_transfer(transfer_id) {
+                                        Some(transfer) => transfer,
+                                        None => {
+                                            peer.lines
+                                                .send("ERR transfer state missing".to_string())
+                                                .await?;
+                                            continue;
+                                        }
+                                    };
                                     let size = transfer.size;
                                     let acceptor_count = transfer.acceptors.len();
 
@@ -1249,7 +1158,15 @@ where
                             }
                             _ if cmd.starts_with("/cancel ") => {
                                 // Parse /cancel <transfer_id>
-                                let rest = cmd.strip_prefix("/cancel ").unwrap().trim();
+                                let rest = match cmd.strip_prefix("/cancel ") {
+                                    Some(rest) => rest.trim(),
+                                    None => {
+                                        peer.lines
+                                            .send("ERR usage: /cancel <transfer_id>".to_string())
+                                            .await?;
+                                        continue;
+                                    }
+                                };
                                 if let Ok(transfer_id) = rest.parse::<u64>() {
                                     let mut state = state.lock().await;
 
@@ -1338,8 +1255,18 @@ where
                         let mut state = state.lock().await;
 
                         // Try to accept the offer
-                        if let Some((transfer_id, sender_addr)) = state.accept_offer(addr, &room, sender_username, filename_b64) {
-                            let transfer = state.get_transfer(transfer_id).unwrap();
+                        if let Some((transfer_id, sender_addr)) =
+                            state.accept_offer(addr, &room, sender_username, filename_b64)
+                        {
+                            let transfer = match state.get_transfer(transfer_id) {
+                                Some(transfer) => transfer,
+                                None => {
+                                    peer.lines
+                                        .send("ERR transfer state missing".to_string())
+                                        .await?;
+                                    continue;
+                                }
+                            };
                             let size = transfer.size;
                             let acceptor_count = transfer.acceptors.len();
 
@@ -1479,55 +1406,6 @@ where
 mod tests {
     use super::*;
 
-    // ==================== parse_user tests ====================
-
-    #[test]
-    fn test_parse_user_valid() {
-        assert_eq!(parse_user("USER alice"), Some("alice"));
-        assert_eq!(parse_user("USER bob_123"), Some("bob_123"));
-    }
-
-    #[test]
-    fn test_parse_user_with_whitespace() {
-        assert_eq!(parse_user("USER   alice  "), Some("alice"));
-    }
-
-    #[test]
-    fn test_parse_user_empty() {
-        assert_eq!(parse_user("USER "), None);
-        assert_eq!(parse_user("USER"), None);
-    }
-
-    #[test]
-    fn test_parse_user_wrong_prefix() {
-        assert_eq!(parse_user("JOIN alice"), None);
-        assert_eq!(parse_user("alice"), None);
-    }
-
-    // ==================== parse_join tests ====================
-
-    #[test]
-    fn test_parse_join_valid() {
-        assert_eq!(parse_join("JOIN lobby"), Some("lobby"));
-        assert_eq!(parse_join("JOIN room-1"), Some("room-1"));
-    }
-
-    #[test]
-    fn test_parse_join_with_whitespace() {
-        assert_eq!(parse_join("JOIN   lobby  "), Some("lobby"));
-    }
-
-    #[test]
-    fn test_parse_join_empty() {
-        assert_eq!(parse_join("JOIN "), None);
-        assert_eq!(parse_join("JOIN"), None);
-    }
-
-    #[test]
-    fn test_parse_join_wrong_prefix() {
-        assert_eq!(parse_join("USER lobby"), None);
-    }
-
     // ==================== is_valid_name tests ====================
 
     #[test]
@@ -1546,82 +1424,6 @@ mod tests {
         assert!(!is_valid_name("alice@host")); // special char
         assert!(!is_valid_name("room/lobby")); // slash
         assert!(!is_valid_name("123456789012345678901234567890123")); // 33 chars
-    }
-
-    // ==================== parse_clip tests ====================
-
-    #[test]
-    fn test_parse_clip_valid() {
-        assert_eq!(
-            parse_clip("CLIP lobby SGVsbG8="),
-            Some(("lobby", "SGVsbG8="))
-        );
-        assert_eq!(
-            parse_clip("CLIP room-1 dGVzdA=="),
-            Some(("room-1", "dGVzdA=="))
-        );
-    }
-
-    #[test]
-    fn test_parse_clip_with_extra_spaces_in_payload() {
-        // The b64 part might have trailing content (like id) - we only take first 3 parts
-        let result = parse_clip("CLIP lobby SGVsbG8= extra");
-        assert_eq!(result, Some(("lobby", "SGVsbG8=")));
-    }
-
-    #[test]
-    fn test_parse_clip_missing_parts() {
-        assert_eq!(parse_clip("CLIP lobby"), None);
-        assert_eq!(parse_clip("CLIP"), None);
-    }
-
-    #[test]
-    fn test_parse_clip_wrong_prefix() {
-        assert_eq!(parse_clip("JOIN lobby SGVsbG8="), None);
-    }
-
-    // ==================== parse_cmd tests ====================
-
-    #[test]
-    fn test_parse_cmd_valid() {
-        assert_eq!(parse_cmd("CMD /help"), Some("/help"));
-        assert_eq!(parse_cmd("CMD /rooms"), Some("/rooms"));
-        assert_eq!(parse_cmd("CMD /who"), Some("/who"));
-    }
-
-    #[test]
-    fn test_parse_cmd_with_args() {
-        assert_eq!(parse_cmd("CMD /join lobby"), Some("/join lobby"));
-    }
-
-    #[test]
-    fn test_parse_cmd_empty() {
-        assert_eq!(parse_cmd("CMD "), None);
-        assert_eq!(parse_cmd("CMD"), None);
-    }
-
-    #[test]
-    fn test_parse_cmd_wrong_prefix() {
-        assert_eq!(parse_cmd("/help"), None);
-    }
-
-    // ==================== parse_say tests ====================
-
-    #[test]
-    fn test_parse_say_valid() {
-        assert_eq!(parse_say("SAY hello world"), Some("hello world"));
-        assert_eq!(parse_say("SAY hi"), Some("hi"));
-    }
-
-    #[test]
-    fn test_parse_say_empty() {
-        assert_eq!(parse_say("SAY "), None);
-        assert_eq!(parse_say("SAY"), None);
-    }
-
-    #[test]
-    fn test_parse_say_wrong_prefix() {
-        assert_eq!(parse_say("CMD hello"), None);
     }
 
     // ==================== parse_args tests ====================

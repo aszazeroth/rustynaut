@@ -3,20 +3,20 @@
 //! The broker acts as a Certificate Authority (CA), generating and signing
 //! certificates for itself (server) and clients (via enrollment).
 
-use base64::{engine::general_purpose, Engine as _};
 use rcgen::{
     BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
     KeyUsagePurpose, SanType, PKCS_ECDSA_P256_SHA256,
 };
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use sha2::{Digest, Sha256};
 use std::fs;
-use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use time::{Duration, OffsetDateTime};
 use tokio_rustls::TlsAcceptor;
 use uuid::Uuid;
+
+use rustynaut_common::tls::{
+    cert_fingerprint, load_certs, load_private_key, save_pem, EnrolledCertBundle,
+};
 
 /// TLS configuration for the broker
 pub struct TlsConfig {
@@ -26,32 +26,6 @@ pub struct TlsConfig {
     pub enrollment_token: String,
     /// CA certificate path for display in TUI
     pub ca_cert_path: PathBuf,
-}
-
-/// Result of generating a client certificate
-pub struct ClientCertBundle {
-    pub cert_pem: String,
-    pub key_pem: String,
-    pub ca_cert_pem: String,
-}
-
-/// Get the default certificate directory
-pub fn default_cert_dir() -> PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("rustynaut")
-}
-
-/// Compute SHA256 fingerprint of a certificate (hex-encoded with colons)
-pub fn cert_fingerprint(cert_der: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(cert_der);
-    let result = hasher.finalize();
-    result
-        .iter()
-        .map(|b| format!("{:02X}", b))
-        .collect::<Vec<_>>()
-        .join(":")
 }
 
 /// Generate a CA certificate and keypair
@@ -141,7 +115,7 @@ pub fn generate_client_cert(
     ca_cert_pem: &str,
     ca_key: &KeyPair,
     username: &str,
-) -> Result<ClientCertBundle, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<EnrolledCertBundle, Box<dyn std::error::Error + Send + Sync>> {
     let mut params = CertificateParams::default();
 
     // Distinguished Name - include username for identification
@@ -172,62 +146,11 @@ pub fn generate_client_cert(
     // Sign with CA
     let cert = params.signed_by(&key_pair, &issuer)?;
 
-    Ok(ClientCertBundle {
+    Ok(EnrolledCertBundle {
         cert_pem: cert.pem(),
         key_pem: key_pair.serialize_pem(),
         ca_cert_pem: ca_cert_pem.to_string(),
     })
-}
-
-/// Save a certificate and key to PEM files
-fn save_pem(
-    cert_pem: &str,
-    key_pem: &str,
-    cert_path: &Path,
-    key_path: &Path,
-) -> std::io::Result<()> {
-    // Create parent directories
-    if let Some(parent) = cert_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    if let Some(parent) = key_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
-    // Write certificate
-    fs::write(cert_path, cert_pem)?;
-
-    // Write private key
-    fs::write(key_path, key_pem)?;
-
-    // Set restrictive permissions on key file (Unix)
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(key_path, fs::Permissions::from_mode(0o600))?;
-    }
-
-    Ok(())
-}
-
-/// Load certificate chain from PEM file
-fn load_certs(
-    path: &Path,
-) -> Result<Vec<CertificateDer<'static>>, Box<dyn std::error::Error + Send + Sync>> {
-    let file = fs::File::open(path)?;
-    let mut reader = BufReader::new(file);
-    let certs = rustls_pemfile::certs(&mut reader).collect::<Result<Vec<_>, _>>()?;
-    Ok(certs)
-}
-
-/// Load private key from PEM file
-fn load_private_key(
-    path: &Path,
-) -> Result<PrivateKeyDer<'static>, Box<dyn std::error::Error + Send + Sync>> {
-    let file = fs::File::open(path)?;
-    let mut reader = BufReader::new(file);
-    let key = rustls_pemfile::private_key(&mut reader)?.ok_or("No private key found")?;
-    Ok(key)
 }
 
 /// Load keypair from PEM file (for rcgen operations)
@@ -399,12 +322,4 @@ pub fn init_tls(
         enrollment_token,
         ca_cert_path,
     })
-}
-
-/// Encode a client cert bundle for the ENROLLED response
-pub fn encode_enrolled_response(bundle: &ClientCertBundle) -> String {
-    let cert_b64 = general_purpose::STANDARD.encode(&bundle.cert_pem);
-    let key_b64 = general_purpose::STANDARD.encode(&bundle.key_pem);
-    let ca_b64 = general_purpose::STANDARD.encode(&bundle.ca_cert_pem);
-    format!("ENROLLED {} {} {}", cert_b64, key_b64, ca_b64)
 }

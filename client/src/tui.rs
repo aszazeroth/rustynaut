@@ -739,11 +739,6 @@ impl App {
         frame.render_widget(messages_list, area);
     }
 
-    /// Format a message for display
-    fn format_message<'a>(&self, msg: &'a Message) -> ListItem<'a> {
-        self.format_message_with_selection(msg, false)
-    }
-
     /// Format a message for display with optional selection highlighting
     fn format_message_with_selection<'a>(
         &self,

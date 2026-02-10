@@ -1043,7 +1043,7 @@ rustynaut/
 #### Phase 1: Setup Workspace Structure
 **Goal:** Create the workspace foundation without breaking existing code
 
-- [ ] **Create workspace root `Cargo.toml`**
+- [x] **Create workspace root `Cargo.toml`**
   ```toml
   [workspace]
   members = ["common", "broker", "client"]
@@ -1057,17 +1057,17 @@ rustynaut/
   repository = "https://github.com/aszazeroth/rustynaut"
   ```
 
-- [ ] **Create `common/` directory structure**
+- [x] **Create `common/` directory structure**
   - Create `common/Cargo.toml`
   - Create `common/src/lib.rs` with module declarations
   - Set up basic crate structure
 
-- [ ] **Move shared dependencies to workspace level**
+- [x] **Move shared dependencies to workspace level**
   - Identify common dependencies (tokio, tracing, base64, etc.)
   - Define in workspace `Cargo.toml` `[workspace.dependencies]`
   - Reference in individual crates with `dep = { workspace = true }`
 
-- [ ] **Verify existing crates still build**
+- [x] **Verify existing crates still build**
   - Ensure broker and client compile independently
   - Run tests on both
   - This is a checkpoint - everything should work as before
@@ -1075,19 +1075,19 @@ rustynaut/
 #### Phase 2: Extract Protocol Layer
 **Goal:** Move protocol messages and parsing to common crate
 
-- [ ] **Create `common/src/protocol.rs`**
+- [x] **Create `common/src/protocol.rs`**
   - Define all protocol message types as enums
   - Implement `Display` for serialization
   - Implement `FromStr` or parsing functions for deserialization
   - Add comprehensive tests
 
-- [ ] **Create `common/src/types.rs`**
+- [x] **Create `common/src/types.rs`**
   - Move shared `Message` enum
   - Move transfer ID types
   - Move room-related types
   - Ensure serde compatibility if needed
 
-- [ ] **Create `common/src/constants.rs`**
+- [x] **Create `common/src/constants.rs`**
   - Move all protocol constants
   - MAX_LINE_LENGTH
   - MAX_FILE_SIZE
@@ -1095,7 +1095,7 @@ rustynaut/
   - MAX_RECENT_CLIPS_PER_ROOM
   - etc.
 
-- [ ] **Create `common/src/parsing.rs`**
+- [x] **Create `common/src/parsing.rs`**
   - Move all parse_* functions
   - parse_clip_fields
   - parse_file_offer_fields
@@ -1111,13 +1111,13 @@ rustynaut/
   - parse_command_response
   - Add unit tests for each parser
 
-- [ ] **Update broker to use common::protocol**
+- [x] **Update broker to use common::protocol**
   - Replace local protocol functions with common exports
   - Update imports
   - Remove duplicate code
   - Verify broker still builds and works
 
-- [ ] **Update client to use common::protocol**
+- [x] **Update client to use common::protocol**
   - Replace local protocol functions with common exports
   - Update imports
   - Remove duplicate code
@@ -1126,80 +1126,84 @@ rustynaut/
 #### Phase 3: Extract TLS Utilities
 **Goal:** Move shared TLS code to common crate
 
-- [ ] **Analyze TLS code duplication**
+- [x] **Analyze TLS code duplication**
   - Review broker/src/tls.rs
   - Review client/src/tls.rs
   - Identify truly shared vs. crate-specific code
 
-- [ ] **Create `common/src/tls/mod.rs`**
+- [x] **Create `common/src/tls/mod.rs`**
   - Define shared TLS types and traits
   - Export common functionality
 
-- [ ] **Create `common/src/tls/certs.rs`**
+- [x] **Create `common/src/tls/certs.rs`**
   - Move certificate generation logic (rcgen)
   - Certificate loading/saving
   - PEM encoding/decoding helpers
   - Keep broker-specific and client-specific logic minimal
 
-- [ ] **Create `common/src/tls/paths.rs`**
+- [x] **Create `common/src/tls/paths.rs`**
   - Certificate directory utilities
   - Path resolution
   - Platform-specific path handling
 
-- [ ] **Refactor broker TLS**
+- [x] **Refactor broker TLS**
   - Use common::tls for shared functionality
   - Keep broker-specific code (acceptor config, etc.)
 
-- [ ] **Refactor client TLS**
+- [x] **Refactor client TLS**
   - Use common::tls for shared functionality
   - Keep client-specific code (connector config, enrollment, etc.)
 
 #### Phase 4: Extract Utility Functions
 **Goal:** Move general utilities to common crate
 
-- [ ] **Create `common/src/utils.rs`**
+- [x] **Create `common/src/utils.rs`**
   - Base64 encoding/decoding wrappers
   - Formatting utilities (format_size, etc.)
   - Timestamp formatting
   - SHA256 helpers
   - Any other shared utilities
 
-- [ ] **Move base64 helpers**
+- [x] **Move base64 helpers**
   - encode_clipboard_content
   - decode_clipboard_content
   - encode_filename
   - decode_filename
 
-- [ ] **Move formatting helpers**
+- [x] **Move formatting helpers**
   - format_size (human-readable file sizes)
   - format_timestamp
 
-- [ ] **Update broker and client**
+- [x] **Update broker and client**
   - Replace local utility calls with common::utils
   - Remove duplicate implementations
 
 #### Phase 5: Cleanup and Optimization
 **Goal:** Remove all duplicate code, optimize imports
 
-- [ ] **Audit for remaining duplication**
+- [x] **Audit for remaining duplication**
   - Search for similar function implementations
   - Check for duplicate types
   - Review error handling patterns
 
-- [ ] **Standardize error types**
+- [x] **Standardize error types**
   - Consider creating common error types
   - Use `thiserror` or similar for consistent error handling
 
-- [ ] **Optimize imports**
+- [x] **Optimize imports**
   - Use `pub use` in common/lib.rs for clean re-exports
   - Update broker and client to use clean import paths
 
-- [ ] **Add documentation**
+- [x] **Add documentation**
   - Document all public APIs in common crate
   - Add examples in doc comments
   - Update top-level README with workspace structure
+  - Add per-crate README files:
+    - broker/README.md (server usage, flags, examples)
+    - client/README.md (client usage, TUI controls, enrollment)
+    - common/README.md (shared API overview)
 
-- [ ] **Add tests to common crate**
+- [x] **Add tests to common crate**
   - Protocol parsing tests
   - Type conversion tests
   - Utility function tests
@@ -1208,17 +1212,17 @@ rustynaut/
 #### Phase 6: CI/CD Updates
 **Goal:** Ensure CI works with new workspace structure
 
-- [ ] **Update GitHub Actions workflow**
+- [x] **Update GitHub Actions workflow**
   - Change from building individual crates to `cargo build --workspace`
   - Update test commands to `cargo test --workspace`
   - Update clippy to `cargo clippy --workspace`
 
-- [ ] **Add workspace-level checks**
+- [x] **Add workspace-level checks**
   - Ensure all crates compile
   - Run tests across all crates
   - Check for unused dependencies
 
-- [ ] **Version management**
+- [x] **Version management**
   - Decide on versioning strategy (single version vs. independent)
   - Update workspace Cargo.toml with version
 
