@@ -1,0 +1,17 @@
+pub const USER_PREFIX: &str = "USER ";
+pub const JOIN_PREFIX: &str = "JOIN ";
+pub const CLIP_PREFIX: &str = "CLIP ";
+pub const CMD_PREFIX: &str = "CMD ";
+pub const SAY_PREFIX: &str = "SAY ";
+pub const ENROLL_PREFIX: &str = "ENROLL ";
+pub const FILE_OFFER_PREFIX: &str = "FILE_OFFER ";
+pub const FILE_ACCEPT_PREFIX: &str = "FILE_ACCEPT ";
+pub const FILE_CANCEL_PREFIX: &str = "FILE_CANCEL ";
+pub const FILE_CHUNK_PREFIX: &str = "FILE_CHUNK ";
+pub const FILE_END_PREFIX: &str = "FILE_END ";
+pub const FILE_START_PREFIX: &str = "FILE_START ";
+pub const FILE_INCOMING_PREFIX: &str = "FILE_INCOMING ";
+pub const FILE_CANCELLED_PREFIX: &str = "FILE_CANCELLED ";
+pub const FILE_DONE_PREFIX: &str = "FILE_DONE ";
+pub const FILE_SENT_PREFIX: &str = "FILE_SENT ";
+pub const ENROLLED_PREFIX: &str = "ENROLLED ";

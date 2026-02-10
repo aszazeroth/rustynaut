@@ -16,35 +16,28 @@
 #![warn(rust_2018_idioms)]
 
 mod tls;
-
-/// Maximum line length for the wire protocol (2MB to handle large base64 clipboard payloads)
-/// For files larger than ~1.5MB raw, use the sideband FILE_OFFER protocol instead.
-const MAX_LINE_LENGTH: usize = 2 * 1024 * 1024;
-
-use tokio::io::{self, AsyncBufReadExt, AsyncRead, AsyncWrite, BufReader};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{broadcast, mpsc, Mutex};
-use tokio_stream::StreamExt;
-use tokio_util::codec::{Framed, LinesCodec};
-
-use futures::SinkExt;
+mod tui;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::error::Error;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
-const BANNER: &str = r#"
-██████  ██████   ██████  ██   ██ ███████ ██████  
-██   ██ ██   ██ ██    ██ ██  ██  ██      ██   ██ 
-██████  ██████  ██    ██ █████   █████   ██████  
-██   ██ ██   ██ ██    ██ ██  ██  ██      ██   ██ 
-██████  ██   ██  ██████  ██   ██ ███████ ██   ██ 
-                                                 
-https://github.com/aszazeroth/rustynaut                                                 
-"#;
+use futures::SinkExt;
+use rustynaut_common::constants::{MAX_FILE_SIZE, MAX_LINE_LENGTH, MAX_RECENT_CLIPS_PER_ROOM};
+use rustynaut_common::tls::default_broker_cert_dir;
+use rustynaut_common::parsing::{
+    parse_cmd, parse_clip, parse_enroll, parse_file_accept, parse_file_cancel, parse_file_chunk,
+    parse_file_end, parse_file_offer, parse_join, parse_say, parse_user,
+};
+use rustynaut_common::utils::{decode_base64, encode_base64, format_size};
+use tokio::io::{self, AsyncRead, AsyncWrite};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{broadcast, mpsc, Mutex};
+use tokio_stream::StreamExt;
+use tokio_util::codec::{Framed, LinesCodec};
 
 /// Parsed command-line arguments
 struct Args {
@@ -57,174 +50,371 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    println!("{BANNER}");
-
     // Args: broker [--verbose|-v] [--no-tls] [--cert-dir <path>] [--regenerate-token] [addr]
     let args = parse_args(env::args().skip(1))?;
 
+    // NOTE: Tracing to stdout is disabled when TUI is active to avoid screen corruption.
+    // Important events are routed through the TUI message channel instead.
     use tracing_subscriber::{fmt::format::FmtSpan, EnvFilter};
-    // Configure a `tracing` subscriber that logs traces emitted by the chat
-    // server.
     let default_directive = if args.verbose {
         "chat=debug"
     } else {
         "chat=info"
     };
     tracing_subscriber::fmt()
-        // Filter what traces are displayed based on the RUST_LOG environment
-        // variable.
-        //
-        // Traces emitted by the example code will always be displayed. You
-        // can set `RUST_LOG=tokio=trace` to enable additional traces emitted by
-        // Tokio itself.
         .with_env_filter(EnvFilter::from_default_env().add_directive(default_directive.parse()?))
-        // Log events when `tracing` spans are created, entered, exited, or
-        // closed. When Tokio's internal tracing support is enabled (as
-        // described above), this can be used to track the lifecycle of spawned
-        // tasks on the Tokio runtime.
         .with_span_events(FmtSpan::FULL)
-        // Set this subscriber as the default, to collect all traces emitted by
-        // the program.
+        // Use std::io::sink() to prevent stdout/stderr writes that break the TUI
+        .with_writer(std::io::sink)
         .init();
 
-    // Initialize TLS (enabled by default)
     let tls_config = if !args.tls_disabled {
-        // Extract hostname/IP from addr for certificate SANs
         let server_names = extract_server_names(&args.addr);
         Some(Arc::new(
             tls::init_tls(&args.cert_dir, &server_names, args.regenerate_token)
                 .map_err(|e| -> Box<dyn Error> { e })?,
         ))
     } else {
-        eprintln!("WARNING: TLS disabled, connections will not be encrypted!");
         None
     };
 
-    // Create the shared state. This is how all the peers communicate.
-    //
-    // The server task will hold a handle to this. For every new client, the
-    // `state` handle is cloned and passed into the task that processes the
-    // client connection.
     let state = Arc::new(Mutex::new(Shared::new()));
-
-    // Shutdown signal broadcast channel
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
 
-    println!("broker started on : {}", &args.addr);
-    if !args.tls_disabled {
-        println!("TLS enabled");
-    }
-    println!("Type /help for broker commands, /quit to shutdown");
-
-    // Bind a TCP listener to the socket address.
-    //
-    // Note that this is the Tokio TcpListener, which is fully async.
     let listener = TcpListener::bind(&args.addr).await?;
-
     tracing::info!("server running on {}", args.addr);
 
-    // Spawn stdin reader for broker commands
-    let stdin_state = Arc::clone(&state);
-    let stdin_shutdown = shutdown_tx.clone();
-    tokio::spawn(async move {
-        let stdin = BufReader::new(io::stdin());
-        let mut lines = stdin.lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            let trimmed = line.trim();
-            match trimmed {
-                "/quit" | "/exit" | "/shutdown" => {
-                    println!("Shutting down broker...");
-                    {
-                        let state = stdin_state.lock().await;
-                        for peer in state.peers.values() {
-                            let _ = peer.tx.send("INFO broker shutting down".to_string());
-                        }
-                    }
-                    let _ = stdin_shutdown.send(());
-                    break;
-                }
-                "/status" => {
-                    let state = stdin_state.lock().await;
-                    let peer_count = state.peers.len();
-                    let mut rooms: Vec<_> = state.peers.values().map(|p| p.room.as_str()).collect();
-                    rooms.sort_unstable();
-                    rooms.dedup();
-                    println!("Connected clients: {}", peer_count);
-                    println!("Active rooms: {}", rooms.join(", "));
-                }
-                "/help" => {
-                    println!("Broker commands:");
-                    println!("  /status   - Show connected clients and rooms");
-                    println!("  /quit     - Gracefully shutdown the broker");
-                }
-                "" => {}
-                _ => {
-                    println!("Unknown command: {trimmed}. Type /help for commands.");
-                }
-            }
-        }
-    });
+    let (ui_tx, ui_rx) = mpsc::channel::<tui::Message>(100);
 
-    // Set up signal handler for Ctrl+C
+    let mut terminal = tui::setup_terminal()?;
+    let mut app = tui::App::new(args.addr.clone(), !args.tls_disabled);
+    app.add_info(format!("Broker started on {}", &args.addr));
+    if !args.tls_disabled {
+        app.add_info("TLS enabled");
+        if let Some(ref tls_cfg) = tls_config {
+            app.enrollment_token = Some(tls_cfg.enrollment_token.clone());
+            app.add_info(format!("Enrollment token: {}", tls_cfg.enrollment_token));
+            app.add_info(format!("CA cert: {:?}", tls_cfg.ca_cert_path));
+            app.add_info("Use /copy to copy token to clipboard");
+        }
+    } else {
+        app.add_error("TLS disabled, connections will not be encrypted");
+    }
+    app.add_info("Type /help for broker commands, /quit to shutdown");
+
+    let server_handle = tokio::spawn(run_server(
+        listener,
+        Arc::clone(&state),
+        tls_config.clone(),
+        shutdown_tx.clone(),
+        ui_tx.clone(),
+    ));
+
     let signal_state = Arc::clone(&state);
     let signal_shutdown = shutdown_tx.clone();
+    let signal_ui = ui_tx.clone();
     tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
-            println!("\nReceived Ctrl+C, shutting down...");
-            {
-                let state = signal_state.lock().await;
-                for peer in state.peers.values() {
-                    let _ = peer.tx.send("INFO broker shutting down".to_string());
-                }
-            }
-            let _ = signal_shutdown.send(());
+            request_shutdown(&signal_state, &signal_shutdown, &signal_ui).await;
         }
     });
 
+    let result = run_tui_loop(
+        &mut terminal,
+        &mut app,
+        Arc::clone(&state),
+        shutdown_tx.clone(),
+        ui_tx.clone(),
+        ui_rx,
+    )
+    .await;
+
+    tui::restore_terminal()?;
+    let _ = shutdown_tx.send(());
+    let _ = server_handle.await;
+
+    result
+}
+
+async fn run_server(
+    listener: TcpListener,
+    state: Arc<Mutex<Shared>>,
+    tls_config: Option<Arc<tls::TlsConfig>>,
+    shutdown_tx: broadcast::Sender<()>,
+    ui_tx: mpsc::Sender<tui::Message>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut shutdown_rx = shutdown_tx.subscribe();
 
     loop {
         tokio::select! {
             result = listener.accept() => {
                 let (stream, addr) = result?;
-
-                // Clone a handle to the `Shared` state for the new connection.
                 let state = Arc::clone(&state);
                 let tls_config = tls_config.clone();
+                let ui_tx = ui_tx.clone();
 
-                // Spawn our handler to be run asynchronously.
                 tokio::spawn(async move {
-                    tracing::debug!("TCP: Accepted connection from {}", addr);
+                    let _ = ui_info(&ui_tx, format!("Accepted connection from {addr}")).await;
                     let result = if let Some(ref tls_cfg) = tls_config {
-                        // TLS connection
                         tracing::debug!("TLS: Starting handshake with {}...", addr);
                         match tls_cfg.acceptor.accept(stream).await {
                             Ok(tls_stream) => {
                                 tracing::debug!("TLS: Handshake complete with {}", addr);
-                                process_tls(state, tls_stream, addr, tls_cfg.clone()).await
+                                process_tls(state, tls_stream, addr, tls_cfg.clone(), ui_tx.clone()).await
                             }
                             Err(e) => {
                                 tracing::warn!("TLS handshake failed from {}: {:?}", addr, e);
+                                let _ = ui_error(&ui_tx, format!("TLS handshake failed from {addr}: {e:?}")).await;
                                 Ok(())
                             }
                         }
                     } else {
-                        // Plain TCP connection
-                        process(state, stream, addr, None).await
+                        process(state, stream, addr, None, ui_tx.clone()).await
                     };
+
                     if let Err(e) = result {
                         tracing::info!("an error occurred; error = {:?}", e);
+                        let _ = ui_error(&ui_tx, format!("Connection error: {e}"))
+                            .await;
                     }
                 });
             }
             _ = shutdown_rx.recv() => {
-                println!("Broker shutdown complete.");
+                let _ = ui_info(&ui_tx, "Broker shutdown complete.").await;
                 break;
             }
         }
     }
 
     Ok(())
+}
+
+async fn run_tui_loop(
+    terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
+    app: &mut tui::App,
+    state: Arc<Mutex<Shared>>,
+    shutdown_tx: broadcast::Sender<()>,
+    ui_tx: mpsc::Sender<tui::Message>,
+    mut ui_rx: mpsc::Receiver<tui::Message>,
+) -> Result<(), Box<dyn Error>> {
+    let mut shutdown_rx = shutdown_tx.subscribe();
+    let mut shutdown_requested = false;
+
+    loop {
+        terminal.draw(|frame| app.draw(frame))?;
+
+        while let Ok(msg) = ui_rx.try_recv() {
+            app.handle_message(msg);
+        }
+
+        match shutdown_rx.try_recv() {
+            Ok(_) | Err(broadcast::error::TryRecvError::Lagged(_)) => {
+                shutdown_requested = true;
+                app.should_quit = true;
+            }
+            Err(broadcast::error::TryRecvError::Empty) => {}
+            Err(broadcast::error::TryRecvError::Closed) => {
+                shutdown_requested = true;
+                app.should_quit = true;
+            }
+        }
+
+        if crossterm::event::poll(std::time::Duration::from_millis(10))? {
+            if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
+                if key.kind == crossterm::event::KeyEventKind::Press {
+                    match key.code {
+                        crossterm::event::KeyCode::Char('c')
+                            if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) =>
+                        {
+                            shutdown_requested = true;
+                            request_shutdown(&state, &shutdown_tx, &ui_tx).await;
+                            app.should_quit = true;
+                        }
+                        crossterm::event::KeyCode::Char(c) => {
+                            if !app.current_completions.is_empty() {
+                                app.cancel_completion();
+                            }
+                            if let Some(cmd) = app.handle_input(c) {
+                                let should_quit =
+                                    handle_broker_command(cmd, &state, &shutdown_tx, &ui_tx, app)
+                                        .await?;
+                                if should_quit {
+                                    shutdown_requested = true;
+                                    app.should_quit = true;
+                                }
+                            }
+                        }
+                        crossterm::event::KeyCode::Backspace => app.handle_backspace(),
+                        crossterm::event::KeyCode::Delete => app.handle_delete(),
+                        crossterm::event::KeyCode::Left => app.cursor_left(),
+                        crossterm::event::KeyCode::Right => app.cursor_right(),
+                        crossterm::event::KeyCode::Home => app.cursor_home(),
+                        crossterm::event::KeyCode::End => app.cursor_end(),
+                        crossterm::event::KeyCode::Up => app.history_previous(),
+                        crossterm::event::KeyCode::Down => app.history_next(),
+                        crossterm::event::KeyCode::PageUp => {
+                            for _ in 0..5 {
+                                app.scroll_up();
+                            }
+                        }
+                        crossterm::event::KeyCode::PageDown => {
+                            for _ in 0..5 {
+                                app.scroll_down();
+                            }
+                        }
+                        crossterm::event::KeyCode::Tab => app.handle_tab(),
+                        crossterm::event::KeyCode::Enter => {
+                            if !app.current_completions.is_empty() {
+                                app.apply_completion();
+                            } else if let Some(cmd) = app.handle_input('\n') {
+                                let should_quit =
+                                    handle_broker_command(cmd, &state, &shutdown_tx, &ui_tx, app)
+                                        .await?;
+                                if should_quit {
+                                    shutdown_requested = true;
+                                    app.should_quit = true;
+                                }
+                            }
+                        }
+                        crossterm::event::KeyCode::F(1) => app.toggle_sidebar(),
+                        crossterm::event::KeyCode::Esc => {
+                            if !app.current_completions.is_empty() {
+                                app.cancel_completion();
+                            } else {
+                                app.should_quit = true;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        if app.should_quit {
+            break;
+        }
+    }
+
+    if !shutdown_requested {
+        request_shutdown(&state, &shutdown_tx, &ui_tx).await;
+    }
+
+    Ok(())
+}
+
+async fn handle_broker_command(
+    cmd: String,
+    state: &Arc<Mutex<Shared>>,
+    shutdown_tx: &broadcast::Sender<()>,
+    ui_tx: &mpsc::Sender<tui::Message>,
+    app: &tui::App,
+) -> Result<bool, Box<dyn Error>> {
+    let trimmed = cmd.trim();
+    match trimmed {
+        "/quit" | "/exit" | "/shutdown" => {
+            request_shutdown(state, shutdown_tx, ui_tx).await;
+            Ok(true)
+        }
+        "/status" => {
+            let (peer_count, rooms) = collect_stats(state).await;
+            let rooms_display = if rooms.is_empty() {
+                "none".to_string()
+            } else {
+                rooms.join(", ")
+            };
+            ui_info(ui_tx, format!("Connected clients: {peer_count}")).await;
+            ui_info(ui_tx, format!("Active rooms: {rooms_display}")).await;
+            let _ = ui_tx
+                .send(tui::Message::Stats { peer_count, rooms })
+                .await;
+            Ok(false)
+        }
+        "/token" => {
+            if let Some(ref token) = app.enrollment_token {
+                ui_info(ui_tx, format!("Enrollment token: {token}")).await;
+            } else {
+                ui_error(ui_tx, "No enrollment token available (TLS not enabled)").await;
+            }
+            Ok(false)
+        }
+        "/copy" => {
+            if let Some(ref token) = app.enrollment_token {
+                match app.copy_to_clipboard(token) {
+                    Ok(_) => ui_info(ui_tx, "Enrollment token copied to clipboard").await,
+                    Err(e) => ui_error(ui_tx, format!("Failed to copy: {e}")).await,
+                }
+            } else {
+                ui_error(ui_tx, "No enrollment token available (TLS not enabled)").await;
+            }
+            Ok(false)
+        }
+        "/help" => {
+            ui_info(ui_tx, "Broker commands:").await;
+            ui_info(ui_tx, "  /status   - Show connected clients and rooms").await;
+            ui_info(ui_tx, "  /token    - Show enrollment token").await;
+            ui_info(ui_tx, "  /copy     - Copy enrollment token to clipboard").await;
+            ui_info(ui_tx, "  /quit     - Gracefully shutdown the broker").await;
+            Ok(false)
+        }
+        "" => Ok(false),
+        _ => {
+            ui_error(
+                ui_tx,
+                format!("Unknown command: {trimmed}. Type /help for commands."),
+            )
+            .await;
+            Ok(false)
+        }
+    }
+}
+
+async fn request_shutdown(
+    state: &Arc<Mutex<Shared>>,
+    shutdown_tx: &broadcast::Sender<()>,
+    ui_tx: &mpsc::Sender<tui::Message>,
+) {
+    ui_info(ui_tx, "Shutting down broker...").await;
+    {
+        let state = state.lock().await;
+        for peer in state.peers.values() {
+            let _ = peer.tx.send("INFO broker shutting down".to_string());
+        }
+    }
+    let _ = shutdown_tx.send(());
+}
+
+async fn collect_stats(state: &Arc<Mutex<Shared>>) -> (usize, Vec<String>) {
+    let state = state.lock().await;
+    let peer_count = state.peers.len();
+    let mut rooms: Vec<String> = state.peers.values().map(|p| p.room.clone()).collect();
+    rooms.sort_unstable();
+    rooms.dedup();
+    (peer_count, rooms)
+}
+
+async fn send_stats(state: &Arc<Mutex<Shared>>, ui_tx: &mpsc::Sender<tui::Message>) {
+    let (peer_count, rooms) = collect_stats(state).await;
+    let _ = ui_tx
+        .send(tui::Message::Stats { peer_count, rooms })
+        .await;
+}
+
+async fn ui_info(ui_tx: &mpsc::Sender<tui::Message>, text: impl Into<String>) {
+    let _ = ui_tx
+        .send(tui::Message::Info {
+            text: text.into(),
+            timestamp: SystemTime::now(),
+        })
+        .await;
+}
+
+async fn ui_error(ui_tx: &mpsc::Sender<tui::Message>, text: impl Into<String>) {
+    let _ = ui_tx
+        .send(tui::Message::Error {
+            text: text.into(),
+            timestamp: SystemTime::now(),
+        })
+        .await;
 }
 
 fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, Box<dyn Error>> {
@@ -279,7 +469,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, Box<dyn Er
         verbose,
         addr: addr.unwrap_or_else(|| "127.0.0.1:4242".to_string()),
         tls_disabled,
-        cert_dir: cert_dir.unwrap_or_else(tls::default_cert_dir),
+        cert_dir: cert_dir.unwrap_or_else(default_broker_cert_dir),
         regenerate_token,
     })
 }
@@ -336,8 +526,6 @@ fn extract_server_names(addr: &str) -> Vec<String> {
         }
     }
 
-    eprintln!("Certificate SANs: {:?}", names);
-
     names
 }
 
@@ -346,12 +534,6 @@ type Tx = mpsc::UnboundedSender<String>;
 
 /// Shorthand for the receive half of the message channel.
 type Rx = mpsc::UnboundedReceiver<String>;
-
-/// Maximum number of recent clip hashes to track per room for deduplication
-const MAX_RECENT_CLIPS_PER_ROOM: usize = 20;
-
-/// Maximum file size for transfer (1GB)
-const MAX_FILE_SIZE: u64 = 1024 * 1024 * 1024;
 
 /// State of a file transfer
 #[derive(Debug, Clone, PartialEq)]
@@ -685,18 +867,6 @@ where
     }
 }
 
-fn parse_user(line: &str) -> Option<&str> {
-    line.strip_prefix("USER ")
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-}
-
-fn parse_join(line: &str) -> Option<&str> {
-    line.strip_prefix("JOIN ")
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-}
-
 /// Validate a username or room name.
 /// Allowed: alphanumeric, underscore, hyphen. Max 32 chars.
 fn is_valid_name(s: &str) -> bool {
@@ -706,97 +876,15 @@ fn is_valid_name(s: &str) -> bool {
             .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
 }
 
-fn parse_clip(line: &str) -> Option<(&str, &str)> {
-    let mut parts = line.splitn(4, ' ');
-    match (parts.next()?, parts.next()?, parts.next()?) {
-        ("CLIP", room, b64) => Some((room, b64)),
-        _ => None,
-    }
-}
-
-/// Parse FILE_OFFER command: FILE_OFFER <room> <filename_b64> <size>
-/// Returns (room, filename_b64, size)
-fn parse_file_offer(line: &str) -> Option<(&str, &str, &str)> {
-    let mut parts = line.splitn(4, ' ');
-    match (parts.next()?, parts.next()?, parts.next()?, parts.next()?) {
-        ("FILE_OFFER", room, filename_b64, size) => Some((room, filename_b64, size)),
-        _ => None,
-    }
-}
-
-/// Parse FILE_ACCEPT command: FILE_ACCEPT <room> <sender_username> <filename_b64>
-/// Returns (room, sender_username, filename_b64)
-fn parse_file_accept(line: &str) -> Option<(&str, &str, &str)> {
-    let mut parts = line.splitn(4, ' ');
-    match (parts.next()?, parts.next()?, parts.next()?, parts.next()?) {
-        ("FILE_ACCEPT", room, sender_username, filename_b64) => {
-            Some((room, sender_username, filename_b64))
-        }
-        _ => None,
-    }
-}
-
-/// Parse FILE_CANCEL command: FILE_CANCEL <transfer_id>
-/// Returns transfer_id
-fn parse_file_cancel(line: &str) -> Option<u64> {
-    let rest = line.strip_prefix("FILE_CANCEL ")?;
-    rest.trim().parse().ok()
-}
-
-/// Parse FILE_CHUNK command: FILE_CHUNK <transfer_id> <offset> <chunk_b64>
-/// Returns (transfer_id, offset, chunk_b64)
-fn parse_file_chunk(line: &str) -> Option<(u64, u64, &str)> {
-    let mut parts = line.splitn(4, ' ');
-    match (parts.next()?, parts.next()?, parts.next()?, parts.next()?) {
-        ("FILE_CHUNK", tid, offset, chunk_b64) => {
-            Some((tid.parse().ok()?, offset.parse().ok()?, chunk_b64))
-        }
-        _ => None,
-    }
-}
-
-/// Parse FILE_END command: FILE_END <transfer_id> <sha256>
-/// Returns (transfer_id, sha256)
-fn parse_file_end(line: &str) -> Option<(u64, &str)> {
-    let mut parts = line.splitn(3, ' ');
-    match (parts.next()?, parts.next()?, parts.next()?) {
-        ("FILE_END", tid, sha256) => Some((tid.parse().ok()?, sha256)),
-        _ => None,
-    }
-}
-
-fn parse_cmd(line: &str) -> Option<&str> {
-    line.strip_prefix("CMD ")
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-}
-
-fn parse_say(line: &str) -> Option<&str> {
-    line.strip_prefix("SAY ")
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-}
-
-/// Parse ENROLL command: ENROLL <token> <username>
-fn parse_enroll(line: &str) -> Option<(&str, &str)> {
-    let rest = line.strip_prefix("ENROLL ")?;
-    let mut parts = rest.splitn(2, ' ');
-    let token = parts.next()?.trim();
-    let username = parts.next()?.trim();
-    if token.is_empty() || username.is_empty() {
-        return None;
-    }
-    Some((token, username))
-}
-
 /// Process a TLS connection
 async fn process_tls(
     state: Arc<Mutex<Shared>>,
     stream: tokio_rustls::server::TlsStream<TcpStream>,
     addr: SocketAddr,
     tls_config: Arc<tls::TlsConfig>,
+    ui_tx: mpsc::Sender<tui::Message>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    process(state, stream, addr, Some(tls_config)).await
+    process(state, stream, addr, Some(tls_config), ui_tx).await
 }
 
 /// Process an individual chat client
@@ -805,6 +893,7 @@ async fn process<S>(
     stream: S,
     addr: SocketAddr,
     tls_config: Option<Arc<tls::TlsConfig>>,
+    ui_tx: mpsc::Sender<tui::Message>,
 ) -> Result<(), Box<dyn Error + Send + Sync>>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -858,7 +947,7 @@ where
                     enroll_username,
                 ) {
                     Ok(bundle) => {
-                        let response = tls::encode_enrolled_response(&bundle);
+                        let response = rustynaut_common::tls::encode_enrolled_response(&bundle);
                         lines.send(&response).await?;
                         tracing::info!(
                             "Enrolled '{}' - client should reconnect with certificate",
@@ -908,6 +997,8 @@ where
         tracing::info!("{}", msg);
         state.broadcast(addr, &msg).await;
     }
+    ui_info(&ui_tx, format!("{username} joined {room}")).await;
+    send_stats(&state, &ui_tx).await;
 
     // Process incoming messages until our stream is exhausted by a disconnect.
     loop {
@@ -928,12 +1019,16 @@ where
                         }
                         room = new_room.to_string();
 
-                        let mut state = state.lock().await;
-                        if let Some(peer_info) = state.peers.get_mut(&addr) {
-                            peer_info.room = room.clone();
+                        {
+                            let mut shared = state.lock().await;
+                            if let Some(peer_info) = shared.peers.get_mut(&addr) {
+                                peer_info.room = room.clone();
+                            }
                         }
 
                         peer.lines.send(format!("INFO joined {room}")).await?;
+                        ui_info(&ui_tx, format!("{username} joined {room}")).await;
+                        send_stats(&state, &ui_tx).await;
                         continue;
                     }
 
@@ -951,21 +1046,13 @@ where
                                 if offers.is_empty() {
                                     peer.lines.send(format!("INFO no pending file offers in {room}")).await?;
                                 } else {
-                                    use base64::{engine::general_purpose, Engine as _};
                                     let mut lines = vec![format!("INFO pending file offers in {room}:")];
                                     for (username, filename_b64, size) in offers {
-                                        let filename = general_purpose::STANDARD
-                                            .decode(filename_b64)
+                                        let filename = decode_base64(filename_b64)
                                             .ok()
-                                            .and_then(|b| String::from_utf8(b).ok())
+                                            .and_then(|bytes| String::from_utf8(bytes).ok())
                                             .unwrap_or_else(|| "<unknown>".to_string());
-                                        let size_display = if size >= 1024 * 1024 {
-                                            format!("{:.1} MB", size as f64 / (1024.0 * 1024.0))
-                                        } else if size >= 1024 {
-                                            format!("{:.1} KB", size as f64 / 1024.0)
-                                        } else {
-                                            format!("{} bytes", size)
-                                        };
+                                        let size_display = format_size(size);
                                         lines.push(format!("INFO   {username}: {filename} ({size_display})"));
                                     }
                                     for line in lines {
@@ -1004,7 +1091,15 @@ where
                             _ if cmd.starts_with("/accept ") => {
                                 // Parse /accept <username> [filename]
                                 // If filename is omitted, accept the most recent offer from that user
-                                let rest = cmd.strip_prefix("/accept ").unwrap().trim();
+                                let rest = match cmd.strip_prefix("/accept ") {
+                                    Some(rest) => rest.trim(),
+                                    None => {
+                                        peer.lines
+                                            .send("ERR usage: /accept <username> [filename]".to_string())
+                                            .await?;
+                                        continue;
+                                    }
+                                };
                                 let parts: Vec<&str> = rest.splitn(2, ' ').collect();
                                 if parts.is_empty() || parts[0].is_empty() {
                                     peer.lines.send("ERR usage: /accept <username> [filename]").await?;
@@ -1012,14 +1107,12 @@ where
                                 }
                                 let sender_username = parts[0];
 
-                                use base64::{engine::general_purpose, Engine as _};
-
                                 let mut state = state.lock().await;
 
                                 // Get filename_b64 - either from argument or find latest offer
                                 let filename_b64 = if parts.len() >= 2 {
                                     // Explicit filename provided - base64 encode it
-                                    general_purpose::STANDARD.encode(parts[1])
+                                    encode_base64(parts[1])
                                 } else {
                                     // No filename - find the most recent offer from this user
                                     match state.find_latest_offer(&room, sender_username) {
@@ -1032,8 +1125,18 @@ where
                                 };
 
                                 // Try to accept the offer
-                                if let Some((transfer_id, sender_addr)) = state.accept_offer(addr, &room, sender_username, &filename_b64) {
-                                    let transfer = state.get_transfer(transfer_id).unwrap();
+                                if let Some((transfer_id, sender_addr)) =
+                                    state.accept_offer(addr, &room, sender_username, &filename_b64)
+                                {
+                                    let transfer = match state.get_transfer(transfer_id) {
+                                        Some(transfer) => transfer,
+                                        None => {
+                                            peer.lines
+                                                .send("ERR transfer state missing".to_string())
+                                                .await?;
+                                            continue;
+                                        }
+                                    };
                                     let size = transfer.size;
                                     let acceptor_count = transfer.acceptors.len();
 
@@ -1055,7 +1158,15 @@ where
                             }
                             _ if cmd.starts_with("/cancel ") => {
                                 // Parse /cancel <transfer_id>
-                                let rest = cmd.strip_prefix("/cancel ").unwrap().trim();
+                                let rest = match cmd.strip_prefix("/cancel ") {
+                                    Some(rest) => rest.trim(),
+                                    None => {
+                                        peer.lines
+                                            .send("ERR usage: /cancel <transfer_id>".to_string())
+                                            .await?;
+                                        continue;
+                                    }
+                                };
                                 if let Ok(transfer_id) = rest.parse::<u64>() {
                                     let mut state = state.lock().await;
 
@@ -1144,8 +1255,18 @@ where
                         let mut state = state.lock().await;
 
                         // Try to accept the offer
-                        if let Some((transfer_id, sender_addr)) = state.accept_offer(addr, &room, sender_username, filename_b64) {
-                            let transfer = state.get_transfer(transfer_id).unwrap();
+                        if let Some((transfer_id, sender_addr)) =
+                            state.accept_offer(addr, &room, sender_username, filename_b64)
+                        {
+                            let transfer = match state.get_transfer(transfer_id) {
+                                Some(transfer) => transfer,
+                                None => {
+                                    peer.lines
+                                        .send("ERR transfer state missing".to_string())
+                                        .await?;
+                                    continue;
+                                }
+                            };
                             let size = transfer.size;
                             let acceptor_count = transfer.acceptors.len();
 
@@ -1275,6 +1396,8 @@ where
         tracing::info!("{}", msg);
         state.broadcast(addr, &msg).await;
     }
+    ui_info(&ui_tx, format!("{username} left")).await;
+    send_stats(&state, &ui_tx).await;
 
     Ok(())
 }
@@ -1282,55 +1405,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ==================== parse_user tests ====================
-
-    #[test]
-    fn test_parse_user_valid() {
-        assert_eq!(parse_user("USER alice"), Some("alice"));
-        assert_eq!(parse_user("USER bob_123"), Some("bob_123"));
-    }
-
-    #[test]
-    fn test_parse_user_with_whitespace() {
-        assert_eq!(parse_user("USER   alice  "), Some("alice"));
-    }
-
-    #[test]
-    fn test_parse_user_empty() {
-        assert_eq!(parse_user("USER "), None);
-        assert_eq!(parse_user("USER"), None);
-    }
-
-    #[test]
-    fn test_parse_user_wrong_prefix() {
-        assert_eq!(parse_user("JOIN alice"), None);
-        assert_eq!(parse_user("alice"), None);
-    }
-
-    // ==================== parse_join tests ====================
-
-    #[test]
-    fn test_parse_join_valid() {
-        assert_eq!(parse_join("JOIN lobby"), Some("lobby"));
-        assert_eq!(parse_join("JOIN room-1"), Some("room-1"));
-    }
-
-    #[test]
-    fn test_parse_join_with_whitespace() {
-        assert_eq!(parse_join("JOIN   lobby  "), Some("lobby"));
-    }
-
-    #[test]
-    fn test_parse_join_empty() {
-        assert_eq!(parse_join("JOIN "), None);
-        assert_eq!(parse_join("JOIN"), None);
-    }
-
-    #[test]
-    fn test_parse_join_wrong_prefix() {
-        assert_eq!(parse_join("USER lobby"), None);
-    }
 
     // ==================== is_valid_name tests ====================
 
@@ -1350,82 +1424,6 @@ mod tests {
         assert!(!is_valid_name("alice@host")); // special char
         assert!(!is_valid_name("room/lobby")); // slash
         assert!(!is_valid_name("123456789012345678901234567890123")); // 33 chars
-    }
-
-    // ==================== parse_clip tests ====================
-
-    #[test]
-    fn test_parse_clip_valid() {
-        assert_eq!(
-            parse_clip("CLIP lobby SGVsbG8="),
-            Some(("lobby", "SGVsbG8="))
-        );
-        assert_eq!(
-            parse_clip("CLIP room-1 dGVzdA=="),
-            Some(("room-1", "dGVzdA=="))
-        );
-    }
-
-    #[test]
-    fn test_parse_clip_with_extra_spaces_in_payload() {
-        // The b64 part might have trailing content (like id) - we only take first 3 parts
-        let result = parse_clip("CLIP lobby SGVsbG8= extra");
-        assert_eq!(result, Some(("lobby", "SGVsbG8=")));
-    }
-
-    #[test]
-    fn test_parse_clip_missing_parts() {
-        assert_eq!(parse_clip("CLIP lobby"), None);
-        assert_eq!(parse_clip("CLIP"), None);
-    }
-
-    #[test]
-    fn test_parse_clip_wrong_prefix() {
-        assert_eq!(parse_clip("JOIN lobby SGVsbG8="), None);
-    }
-
-    // ==================== parse_cmd tests ====================
-
-    #[test]
-    fn test_parse_cmd_valid() {
-        assert_eq!(parse_cmd("CMD /help"), Some("/help"));
-        assert_eq!(parse_cmd("CMD /rooms"), Some("/rooms"));
-        assert_eq!(parse_cmd("CMD /who"), Some("/who"));
-    }
-
-    #[test]
-    fn test_parse_cmd_with_args() {
-        assert_eq!(parse_cmd("CMD /join lobby"), Some("/join lobby"));
-    }
-
-    #[test]
-    fn test_parse_cmd_empty() {
-        assert_eq!(parse_cmd("CMD "), None);
-        assert_eq!(parse_cmd("CMD"), None);
-    }
-
-    #[test]
-    fn test_parse_cmd_wrong_prefix() {
-        assert_eq!(parse_cmd("/help"), None);
-    }
-
-    // ==================== parse_say tests ====================
-
-    #[test]
-    fn test_parse_say_valid() {
-        assert_eq!(parse_say("SAY hello world"), Some("hello world"));
-        assert_eq!(parse_say("SAY hi"), Some("hi"));
-    }
-
-    #[test]
-    fn test_parse_say_empty() {
-        assert_eq!(parse_say("SAY "), None);
-        assert_eq!(parse_say("SAY"), None);
-    }
-
-    #[test]
-    fn test_parse_say_wrong_prefix() {
-        assert_eq!(parse_say("CMD hello"), None);
     }
 
     // ==================== parse_args tests ====================

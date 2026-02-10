@@ -2,67 +2,20 @@
 //!
 //! Handles certificate storage, enrollment, and TLS connection setup.
 
-use base64::{engine::general_purpose, Engine as _};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
-use sha2::{Digest, Sha256};
+use rustls::pki_types::{CertificateDer, ServerName};
 use std::fs;
-use std::io::BufReader;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio_rustls::{client::TlsStream, TlsConnector};
+
+use rustynaut_common::tls::{cert_fingerprint, load_certs, load_private_key, EnrolledCertBundle};
 
 /// TLS configuration for the client
 pub struct TlsClientConfig {
     pub connector: TlsConnector,
 }
 
-/// Client certificate bundle received during enrollment
-pub struct ClientCertBundle {
-    pub cert_pem: String,
-    pub key_pem: String,
-    pub ca_cert_pem: String,
-}
-
-/// Get the default certificate directory for client
-pub fn default_cert_dir() -> PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("rustynaut")
-        .join("client")
-}
-
-/// Compute SHA256 fingerprint of a certificate (hex-encoded with colons)
-pub fn cert_fingerprint(cert_der: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(cert_der);
-    let result = hasher.finalize();
-    result
-        .iter()
-        .map(|b| format!("{:02X}", b))
-        .collect::<Vec<_>>()
-        .join(":")
-}
-
-/// Load certificate chain from PEM file
-fn load_certs(
-    path: &Path,
-) -> Result<Vec<CertificateDer<'static>>, Box<dyn std::error::Error + Send + Sync>> {
-    let file = fs::File::open(path)?;
-    let mut reader = BufReader::new(file);
-    let certs = rustls_pemfile::certs(&mut reader).collect::<Result<Vec<_>, _>>()?;
-    Ok(certs)
-}
-
-/// Load private key from PEM file
-fn load_private_key(
-    path: &Path,
-) -> Result<PrivateKeyDer<'static>, Box<dyn std::error::Error + Send + Sync>> {
-    let file = fs::File::open(path)?;
-    let mut reader = BufReader::new(file);
-    let key = rustls_pemfile::private_key(&mut reader)?.ok_or("No private key found")?;
-    Ok(key)
-}
 
 /// Check if client is enrolled (has valid certificates)
 pub fn is_enrolled(cert_dir: &Path) -> bool {
@@ -90,7 +43,7 @@ pub fn clear_certs(cert_dir: &Path) -> Result<(), Box<dyn std::error::Error + Se
 /// Save the certificate bundle received during enrollment
 pub fn save_enrolled_certs(
     cert_dir: &Path,
-    bundle: &ClientCertBundle,
+    bundle: &EnrolledCertBundle,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     fs::create_dir_all(cert_dir)?;
 
@@ -110,31 +63,6 @@ pub fn save_enrolled_certs(
     }
 
     Ok(())
-}
-
-/// Parse the ENROLLED response from the broker
-/// Format: ENROLLED <cert_b64> <key_b64> <ca_b64>
-pub fn parse_enrolled_response(
-    line: &str,
-) -> Result<ClientCertBundle, Box<dyn std::error::Error + Send + Sync>> {
-    let rest = line
-        .strip_prefix("ENROLLED ")
-        .ok_or("Invalid ENROLLED response")?;
-
-    let mut parts = rest.splitn(3, ' ');
-    let cert_b64 = parts.next().ok_or("Missing cert in ENROLLED response")?;
-    let key_b64 = parts.next().ok_or("Missing key in ENROLLED response")?;
-    let ca_b64 = parts.next().ok_or("Missing CA in ENROLLED response")?;
-
-    let cert_pem = String::from_utf8(general_purpose::STANDARD.decode(cert_b64)?)?;
-    let key_pem = String::from_utf8(general_purpose::STANDARD.decode(key_b64)?)?;
-    let ca_cert_pem = String::from_utf8(general_purpose::STANDARD.decode(ca_b64)?)?;
-
-    Ok(ClientCertBundle {
-        cert_pem,
-        key_pem,
-        ca_cert_pem,
-    })
 }
 
 /// Initialize TLS for enrollment (no client cert, accepts any server cert)

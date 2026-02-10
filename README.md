@@ -15,6 +15,22 @@ Rustynaut is a small TCP, line-framed broker that relays clipboard updates and f
 
 Rooms are the "pub/sub" unit: **one shared clipboard per room**.
 
+## Workspace Layout
+
+This repository is a Cargo workspace with three crates:
+
+- `broker/` — server/broker (Tokio + TLS + TUI)
+- `client/` — CLI/TUI client
+- `common/` — shared protocol, parsing, TLS helpers, and utilities
+
+See per-crate docs:
+
+- `broker/README.md`
+- `client/README.md`
+- `common/README.md`
+
+You can still run from each crate directory, or from the workspace root with `-p`.
+
 ## Quick Start
 
 ### 1. Start the Broker
@@ -22,6 +38,12 @@ Rooms are the "pub/sub" unit: **one shared clipboard per room**.
 ```bash
 cd broker
 cargo run --release -- 0.0.0.0:4242
+```
+
+Or from workspace root:
+
+```bash
+cargo run -p broker --release -- 0.0.0.0:4242
 ```
 
 On first run, the broker:
@@ -44,6 +66,12 @@ cd client
 cargo run --release -- --enroll <TOKEN> <broker_address> [username] [room]
 ```
 
+Or from workspace root:
+
+```bash
+cargo run -p client --release -- --enroll <TOKEN> <broker_address> [username] [room]
+```
+
 Example:
 ```bash
 cargo run --release -- --enroll a1b2c3d4-e5f6-7890-abcd-ef1234567890 192.168.1.100:4242 alice lobby
@@ -61,6 +89,12 @@ After enrollment, just connect normally:
 
 ```bash
 cargo run --release -- 192.168.1.100:4242 alice lobby
+```
+
+Or from workspace root:
+
+```bash
+cargo run -p client --release -- 192.168.1.100:4242 alice lobby
 ```
 
 ## TLS & Certificates
