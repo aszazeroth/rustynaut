@@ -1,5 +1,7 @@
 # AGENTS.md - Rustynaut Developer Guide
 
+## Please use ENGLISH as the communication language as the code is written in ENGLISH
+
 ## Project Overview
 
 Rustynaut is a cross-platform clipboard sharing application with a broker (server) and CLI client, written in Rust using Tokio. Features TLS/mTLS encryption, room-based pub/sub, and file transfers.
