@@ -12,6 +12,7 @@ Rustynaut is a small TCP, line-framed broker that relays clipboard updates and f
 - The **clients** run on machines/VMs and publish/subscribe by **room**.
 - **TLS encryption** is enabled by default with automatic certificate enrollment.
 - **File transfers** up to 1GB via broker-mediated streaming (no P2P/NAT issues).
+- **Auto-reconnection** - clients automatically reconnect on broker restart or network interruption.
 
 Rooms are the "pub/sub" unit: **one shared clipboard per room**.
 
@@ -80,7 +81,7 @@ cargo run --release -- --enroll a1b2c3d4-e5f6-7890-abcd-ef1234567890 192.168.1.1
 The client:
 - Connects to the broker
 - Receives a signed client certificate
-- Saves certs to \`~/.config/rustynaut/client/\` (Linux) or \`~/Library/Application Support/rustynaut/client/\` (macOS)
+- Saves certs to `~/.config/rustynaut/client/` (Linux) or `~/Library/Application Support/rustynaut/client/` (macOS)
 - Auto-connects with mTLS
 
 ### 3. Subsequent Connections
@@ -97,6 +98,47 @@ Or from workspace root:
 cargo run -p client --release -- 192.168.1.100:4242 alice lobby
 ```
 
+## Key Features
+
+### Auto-Reconnection
+
+Clients automatically reconnect when the broker restarts or the network is interrupted:
+
+- **Exponential backoff**: 1s → 2s → 4s (max 8s)
+- **3 retry attempts** before giving up
+- **State restoration**: Automatically re-joins the same room with the same username
+- **Manual retry**: Press Enter after "Reconnection failed" to retry immediately
+
+This works only for enrolled clients (those with certificates). The connection status is shown in the TUI:
+- "Disconnected from broker" - connection lost
+- "Reconnecting in Xs... (attempt Y/3)" - retry scheduled
+- "Reconnected to broker" - successfully reconnected
+
+### Configuration System
+
+Configuration is managed via TOML files in platform-appropriate locations:
+
+```toml
+# ~/.config/rustynaut/client/config.toml
+[ui]
+scrollback_limit = 1000
+show_timestamps = true
+
+[connection]
+reconnect.enabled = true
+reconnect.max_attempts = 3
+reconnect.base_delay_seconds = 1
+reconnect.max_delay_seconds = 8
+```
+
+Configuration priority (highest to lowest):
+1. CLI flags
+2. Environment variables
+3. Config file
+4. Defaults
+
+See `client/README.md` for full configuration options.
+
 ## TLS & Certificates
 
 ### Certificate Storage
@@ -105,9 +147,9 @@ Certificates are stored in platform-appropriate locations:
 
 | Platform | Broker | Client |
 |----------|--------|--------|
-| **Linux** | \`~/.config/rustynaut/\` | \`~/.config/rustynaut/client/\` |
-| **macOS** | \`~/Library/Application Support/rustynaut/\` | \`~/Library/Application Support/rustynaut/client/\` |
-| **Windows** | \`%APPDATA%\\rustynaut\\\` | \`%APPDATA%\\rustynaut\\client\\\` |
+| **Linux** | `~/.config/rustynaut/` | `~/.config/rustynaut/client/` |
+| **macOS** | `~/Library/Application Support/rustynaut/` | `~/Library/Application Support/rustynaut/client/` |
+| **Windows** | `%APPDATA%\rustynaut\` | `%APPDATA%\rustynaut\client\` |
 
 **Cross-platform note:** The broker's storage location doesn't matter to clients. Certificates are transferred over the wire during enrollment, so each platform stores them in its native location.
 
@@ -128,7 +170,8 @@ Certificates are stored in platform-appropriate locations:
 ~/.config/rustynaut/client/
 ├── client.crt           # Client certificate
 ├── client.key           # Client private key
-└── ca.crt               # CA certificate (for verifying broker)
+├── ca.crt               # CA certificate (for verifying broker)
+└── config.toml          # Client configuration (optional)
 ```
 
 ### Custom Certificate Directory
@@ -229,30 +272,25 @@ Options:
   --verbose, -v         Enable verbose logging
   --enroll <TOKEN>      Enroll with broker using token
   --cert-dir <PATH>     Certificate directory
+  --config <PATH>       Configuration file path
 
 Default username: $USER or "anon"
 Default room: "lobby"
 ```
 
-### Client Options
+## TUI Controls
 
-```bash
-cd client
-cargo run --release -- [OPTIONS] <addr> [username] [room]
+The client provides a rich terminal UI:
 
-Options:
-  --verbose, -v         Enable verbose logging
-  --no-tls              Disable TLS (insecure, for testing)
-  --enroll <TOKEN>      Enroll with broker using token
-  --cert-dir <PATH>     Certificate directory
-
-Default username: \$USER or "anon"
-Default room: "lobby"
-```
+- **Click** a message to select it
+- **Drag** to select text in messages or input area
+- **Press `y`** to copy selected message to clipboard
+- **Press `Esc`** to deselect
+- **Press `F1`** to toggle sidebar showing users in room
 
 ## Slash Commands
 
-Type commands into the client stdin:
+Type commands into the client:
 
 | Command | Description |
 |---------|-------------|
@@ -327,6 +365,19 @@ Now changing the system clipboard on one client replicates to the other.
 # File is downloaded to ~/Downloads/report.pdf
 ```
 
+### Testing Auto-Reconnection
+
+```bash
+# Terminal 1: Start broker
+cd broker && cargo run --release -- 0.0.0.0:4242
+
+# Terminal 2: Connect client
+cd client && cargo run --release -- 127.0.0.1:4242 alice lobby
+
+# Terminal 1: Stop broker (Ctrl+C), then restart it
+# Terminal 2: Watch client auto-reconnect with exponential backoff
+```
+
 ## Debugging
 
 Enable verbose logging:
@@ -335,7 +386,7 @@ cd broker && cargo run --release -- --verbose 0.0.0.0:4242
 cd client && cargo run --release -- --verbose 127.0.0.1:4242 alice
 ```
 
-Override with \`RUST_LOG\`:
+Override with `RUST_LOG`:
 ```bash
 RUST_LOG="chat=trace" cargo run --release -- 0.0.0.0:4242
 ```
@@ -343,6 +394,19 @@ RUST_LOG="chat=trace" cargo run --release -- 0.0.0.0:4242
 Test broker without client (plaintext mode only):
 ```bash
 printf "USER alice\nJOIN lobby\nCMD /rooms\nCMD /who\n" | nc -w 1 127.0.0.1 4242
+```
+
+## Development
+
+```bash
+# Run clippy
+cargo clippy --workspace --all-targets --all-features
+
+# Run tests
+cargo test --workspace
+
+# Run specific test
+cargo test -p client reconnect
 ```
 
 ## Credits

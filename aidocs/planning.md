@@ -997,13 +997,12 @@ async fn main() -> Result<()> {
   - Useful for extracting specific conversations
 
 **Implementation Notes:**
-- Requires tracking mouse down position and drag coordinates
-- Need to map screen coordinates to text positions within messages
-- Consider using terminal's native selection where possible (e.g., hold Shift for terminal selection)
-- Balance between TUI-managed selection and terminal-native selection
+- Basic implementation uses click-to-select entire messages
+- 'y' key copies selected message via `arboard` crate
+- ESC key deselects currently selected message
+- Selection state tracked in TUI App struct with visual highlighting
 - Cross-platform clipboard handling via `arboard` crate
-- Performance: Efficient text position mapping for large message history
-- Accessibility: Ensure keyboard-only workflows work well
+- Future enhancements: drag-to-select partial text, multi-select, format options
 
 ---
 
@@ -1426,12 +1425,15 @@ Ready-to-pick tasks organized by category. Select one and move it to "In Progres
   - Restore username and room membership after reconnect ✅ COMPLETE
 
 ### Configuration Management
-- [x] **Unified configuration system** - See "Configuration Management" section below for detailed plan
+- [x] **Unified configuration system** - ✅ COMPLETE
   - [x] TOML config files in OS-appropriate locations (~/.config/rustynaut/ on Linux, etc.)
   - [x] Layered config: CLI flags > Env vars > Config file > Defaults
-  - [ ] Hot-reload support for logging levels and UI settings (deferred)
   - [x] Validation with helpful error messages
   - [x] Config migration between versions
+  - [x] Client config: UI preferences, connection settings, reconnection settings
+  - [x] `--config <PATH>` CLI override for custom config location
+  - [x] `--dump-config` to print default configuration
+  - [ ] Hot-reload support (future)
 
 ### File Transfers
 - [ ] Auto-accept option (configurable per-user or per-room)
@@ -1454,15 +1456,16 @@ Ready-to-pick tasks organized by category. Select one and move it to "In Progres
 - [ ] Tab completion for usernames (in `/accept`)
 - [ ] Tab completion for room names (in `/join`)
 - [ ] Tab completion for filenames (in `/accept <user>`)
-- [ ] **Text Selection & Copy** - See "TUI Text Selection & Copy" section below for detailed roadmap
-  - Click-and-drag text selection in messages and input area
-  - Multi-message selection, select all, keyboard navigation
-  - Copy format options (plain, with timestamps, markdown)
-  - Context menu on right-click
-  - Search and copy functionality
+- [x] **Text Selection & Copy** - Basic implementation complete
+  - [x] Click to select entire messages
+  - [x] Press 'y' to copy selected message to clipboard
+  - [x] Press 'Esc' to deselect
+  - [ ] Click-and-drag text selection (future)
+  - [ ] Multi-message selection (future)
+  - [ ] Copy format options (future)
 - [ ] File transfer progress bars
-- [ ] Sidebar showing users in room (toggle with key)
-- [ ] Configuration file for TUI preferences
+- [x] Sidebar showing users in room (toggle with F1 key) ✅ IMPLEMENTED
+- [x] Configuration file for TUI preferences ✅ IMPLEMENTED (config.toml support)
 - [ ] Command history persistence across restarts
 
 ### Operational
@@ -1589,6 +1592,8 @@ Formula: `delay = min(base * 2^(attempt-1), max_delay)`
 - [ ] Add CLI flags to override config (future)
 
 #### Phase 6: Edge Cases
+- [x] Non-blocking backoff (uses spawned task for sleep)
+- [x] Connection status events properly wired between network and TUI
 - [ ] Handle broker IP change (re-resolve DNS)
 - [ ] Handle certificate expiration during reconnect
 - [ ] Cancel reconnection on Ctrl+C during wait
@@ -1597,33 +1602,43 @@ Formula: `delay = min(base * 2^(attempt-1), max_delay)`
 
 #### Phase 7: Testing
 - [x] Unit: Backoff calculation (tests in client/src/reconnect.rs)
-- [ ] Unit: Eligibility checks
-- [ ] Integration: Broker restart, client reconnects
+- [x] Unit: Eligibility checks
+- [x] Integration: Broker restart, client reconnects
 - [ ] Integration: Network drop (iptables -j DROP)
-- [ ] Integration: 3 failures, manual retry succeeds
-- [ ] Integration: Non-enrolled client exits immediately
-- [ ] Integration: Graceful quit doesn't trigger reconnect
+- [x] Integration: 3 failures, manual retry succeeds (press Enter)
+- [x] Integration: Non-enrolled client exits immediately
+- [x] Integration: Graceful quit doesn't trigger reconnect
 
 ### Current Implementation Status (2026-02-15)
 
 **Completed:**
-- `common/src/config/types.rs`: `ReconnectConfig` struct with fields: enabled, max_attempts, base_delay_seconds, max_delay_seconds, min_connection_seconds
-- `client/src/reconnect.rs`: `ReconnectionManager` with:
-  - `ConnectionState` enum (Connected, Disconnected, Reconnecting)
-  - `DisconnectReason` enum (Intentional, BrokerRestart, NetworkError, Timeout, Unknown)
-  - `ReconnectContext` struct (broker_addr, username, room)
+- Full auto-reconnection implementation working:
+  - `ReconnectionManager` with proper state tracking
   - Exponential backoff: 1s → 2s → 4s, capped at 8s
-  - `should_reconnect()` checks: enabled, max_attempts, min_connection_seconds, intentional disconnect
-  - Unit tests for backoff logic
-- Network task sends `ConnectionState::Disconnected` on connection errors
-- TUI displays status messages on connection state changes
+  - Non-blocking backoff using spawned async task
+  - Single connection status channel (no more split channels)
+  - Automatic state restoration (USER/JOIN re-sent)
+  - Manual retry support (press Enter after max attempts)
+  - Clipboard forwarding restored after reconnect
+  - Global FILE_TX updated for file transfers on reconnect
+- 7 unit tests passing for reconnection logic
+- UI shows proper status messages throughout reconnection process
 
-**Not Yet Implemented:**
-- Actual reconnection retry loop (needs to recreate network channels and sender/receiver pairs)
-- State restoration after reconnect (re-send USER and JOIN)
-- Manual retry prompt after max attempts
+**Implementation Details:**
+- Uses `start_backoff()` instead of `wait_backoff()` for non-blocking operation
+- Connection status broadcast channel shared between network task and TUI
+- Reconnection triggered by `DisconnectReason::NetworkError` on `Disconnected` event
+- `reconnect_scheduled` flag prevents duplicate reconnection attempts
+- `reconnect_trigger_rx` channel allows async backoff without blocking UI
+- State restoration happens automatically on `Connected` event
+- Manual retry resets attempt counter and schedules new reconnection
 
-**Key Insight:** The reconnection infrastructure is in place, but completing the full auto-reconnect requires more complex channel management - the network sender (`net_tx`) and receiver (`net_rx`) need to be recreated on each reconnection attempt.
+**Testing Notes:**
+- Tested: Broker restart causes client to auto-reconnect with backoff
+- Tested: First connection does NOT trigger reconnection (waits for disconnect)
+- Tested: Max attempts reached shows retry prompt, Enter key triggers retry
+- Works only for enrolled clients (with certificates)
+- Graceful quit (/quit, /exit) does not trigger reconnection
 
 ### Configuration
 
