@@ -102,6 +102,13 @@ impl ReconnectionManager {
         sleep(delay).await;
     }
 
+    pub fn start_backoff(&mut self) -> Duration {
+        let delay = self.calculate_backoff();
+        self.attempt += 1;
+        self.state = ConnectionState::Reconnecting;
+        delay
+    }
+
     pub fn reset(&mut self) {
         self.attempt = 0;
     }

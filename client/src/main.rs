@@ -539,9 +539,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         &mut app,
         ui_tx,
         ui_rx,
+        conn_status_tx,
         conn_status_rx,
+        clipboard_rx,
         config,
-        args.addr.clone(),
+        args.addr,
         tls_config,
         args.username.clone(),
         args.room.clone(),
@@ -560,7 +562,9 @@ async fn run_tui_loop(
     app: &mut tui::App,
     ui_tx: mpsc::Sender<tui::Message>,
     mut ui_rx: mpsc::Receiver<tui::Message>,
+    conn_status_tx: broadcast::Sender<ConnectionState>,
     mut conn_status_rx: broadcast::Receiver<ConnectionState>,
+    mut clipboard_rx: mpsc::Receiver<String>,
     config: ClientConfig,
     broker_addr: SocketAddr,
     tls_config: tls::TlsClientConfig,
@@ -572,9 +576,16 @@ async fn run_tui_loop(
     let tick_rate = tokio::time::Duration::from_millis(100);
 
     // Connection state - channels for network communication
-    let (conn_status_tx, _) = broadcast::channel::<ConnectionState>(8);
-    let (net_tx, mut net_rx) = mpsc::channel::<String>(100);
-    let mut net_tx_opt: Option<mpsc::Sender<String>> = Some(net_tx);
+    let (net_tx, net_rx) = mpsc::channel::<String>(100);
+    let mut net_tx_opt: Option<mpsc::Sender<String>> = Some(net_tx.clone());
+
+    // Store net_tx globally so message handlers can send file chunks
+    if let Ok(mut guard) = FILE_TX.lock() {
+        *guard = Some(net_tx.clone());
+    }
+
+    let (reconnect_trigger_tx, mut reconnect_trigger_rx) = mpsc::channel::<()>(1);
+    let mut reconnect_scheduled = false;
     
     // Reconnection manager
     let reconnect_config = config.connection.reconnect.clone();
@@ -619,17 +630,46 @@ async fn run_tui_loop(
             }
         }
 
+        // Forward clipboard updates to the network
+        while let Ok(msg) = clipboard_rx.try_recv() {
+            if let Some(ref tx) = net_tx_opt {
+                let _ = tx.send(msg).await;
+            }
+        }
+
         // Check for connection status changes
         let mut reconnected = false;
         while let Ok(state) = conn_status_rx.try_recv() {
             match state {
                 ConnectionState::Disconnected => {
                     app.add_info("Disconnected from broker");
+                    let should_reconnect = reconnect_mgr.should_reconnect(DisconnectReason::NetworkError);
                     reconnect_mgr.set_disconnected();
+
+                    if should_reconnect && !reconnect_scheduled {
+                        let delay = reconnect_mgr.start_backoff();
+                        reconnect_scheduled = true;
+                        let _ = conn_status_tx.send(ConnectionState::Reconnecting);
+                        app.add_info(format!(
+                            "Reconnecting in {}s... (attempt {}/{})",
+                            delay.as_secs(),
+                            reconnect_mgr.attempt(),
+                            reconnect_mgr.max_attempts()
+                        ));
+
+                        let reconnect_trigger_tx = reconnect_trigger_tx.clone();
+                        tokio::spawn(async move {
+                            time::sleep(delay).await;
+                            let _ = reconnect_trigger_tx.send(()).await;
+                        });
+                    } else if reconnect_mgr.attempt() >= reconnect_mgr.max_attempts() {
+                        app.add_info("Reconnection failed. Press Enter to retry, Ctrl+C to exit");
+                    }
                 }
                 ConnectionState::Connected => {
                     app.add_info("Reconnected to broker");
                     reconnect_mgr.set_connected();
+                    reconnect_scheduled = false;
                     reconnected = true;
                 }
                 ConnectionState::Reconnecting => {
@@ -640,53 +680,34 @@ async fn run_tui_loop(
 
         // If we just reconnected, re-send USER and JOIN
         if reconnected {
-            reconnect_mgr.set_connected();
             if let Some(ref tx) = net_tx_opt {
                 let _ = tx.send(format!("USER {}", username)).await;
                 let _ = tx.send(format!("JOIN {}", room)).await;
             }
         }
 
-        // Check if we need to reconnect
-        if reconnect_mgr.state() == ConnectionState::Disconnected && reconnect_mgr.is_enabled() {
-            if reconnect_mgr.should_reconnect(DisconnectReason::NetworkError) {
-                let delay = reconnect_mgr.calculate_backoff();
-                app.add_info(format!("Reconnecting in {}s... (attempt {}/{})", 
-                    delay.as_secs(),
-                    reconnect_mgr.attempt() + 1,
-                    reconnect_mgr.max_attempts()));
-                
-                // Wait for backoff
-                reconnect_mgr.wait_backoff().await;
+        // Execute a scheduled reconnect without blocking the UI
+        while reconnect_trigger_rx.try_recv().is_ok() {
+            reconnect_scheduled = false;
 
-                // Create new channel and spawn new network connection
-                let (new_tx, new_rx) = mpsc::channel::<String>(100);
-                let new_tx_for_sender = new_tx.clone();
+            let (new_tx, new_rx) = mpsc::channel::<String>(100);
+            net_tx_opt = Some(new_tx.clone());
 
-                // Update global FILE_TX for file transfers
-                if let Ok(mut guard) = FILE_TX.lock() {
-                    *guard = Some(new_tx.clone());
-                }
-
-                // Update our sender reference
-                net_tx_opt = Some(new_tx_for_sender);
-
-                // Spawn new network task with new receiver
-                spawn_network_connection(
-                    broker_addr,
-                    tls_config.clone(),
-                    ui_tx.clone(),
-                    conn_status_tx.clone(),
-                    verbose,
-                    new_rx,
-                );
-
-                // Re-send USER and JOIN using new_tx
-                let _ = new_tx.send(format!("USER {}", username)).await;
-                let _ = new_tx.send(format!("JOIN {}", room)).await;
-            } else if reconnect_mgr.attempt() >= reconnect_mgr.max_attempts() {
-                app.add_info("Reconnection failed. Press Enter to retry, Ctrl+C to exit");
+            if let Ok(mut guard) = FILE_TX.lock() {
+                *guard = Some(new_tx.clone());
             }
+
+            spawn_network_connection(
+                broker_addr,
+                tls_config.clone(),
+                ui_tx.clone(),
+                conn_status_tx.clone(),
+                verbose,
+                new_rx,
+            );
+
+            let _ = new_tx.send(format!("USER {}", username)).await;
+            let _ = new_tx.send(format!("JOIN {}", room)).await;
         }
 
         // Poll for events with timeout
@@ -736,7 +757,28 @@ async fn run_tui_loop(
                                 app.handle_tab();
                             }
                             crossterm::event::KeyCode::Enter => {
-                                if !app.current_completions.is_empty() {
+                                if app.input.is_empty()
+                                    && reconnect_mgr.state() == ConnectionState::Disconnected
+                                    && reconnect_mgr.attempt() >= reconnect_mgr.max_attempts()
+                                    && !reconnect_scheduled
+                                {
+                                    reconnect_mgr.reset();
+                                    let delay = reconnect_mgr.start_backoff();
+                                    reconnect_scheduled = true;
+                                    let _ = conn_status_tx.send(ConnectionState::Reconnecting);
+                                    app.add_info(format!(
+                                        "Reconnecting in {}s... (attempt {}/{})",
+                                        delay.as_secs(),
+                                        reconnect_mgr.attempt(),
+                                        reconnect_mgr.max_attempts()
+                                    ));
+
+                                    let reconnect_trigger_tx = reconnect_trigger_tx.clone();
+                                    tokio::spawn(async move {
+                                        time::sleep(delay).await;
+                                        let _ = reconnect_trigger_tx.send(()).await;
+                                    });
+                                } else if !app.current_completions.is_empty() {
                                     app.apply_completion();
                                 } else if let Some(cmd) = app.handle_input('\n') {
                                     if cmd == "/quit" || cmd == "/exit" {
