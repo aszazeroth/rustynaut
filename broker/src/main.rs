@@ -1001,8 +1001,8 @@ where
     // A client has connected, let's let everyone know.
     {
         let mut state = state.lock().await;
-        let msg = format!("INFO {username} joined");
-        tracing::info!("{}", msg);
+        let msg = format!("SAY {username} joined");
+        tracing::info!("{} joined", username);
         state.broadcast(addr, &msg).await;
     }
     ui_info(&ui_tx, format!("{username} joined {room}")).await;
@@ -1400,8 +1400,8 @@ where
         let mut state = state.lock().await;
         state.peers.remove(&addr);
 
-        let msg = format!("INFO {username} left");
-        tracing::info!("{}", msg);
+        let msg = format!("SAY {username} left");
+        tracing::info!("{} left", username);
         state.broadcast(addr, &msg).await;
     }
     ui_info(&ui_tx, format!("{username} left")).await;
