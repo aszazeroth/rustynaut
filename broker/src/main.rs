@@ -26,8 +26,8 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime};
 
 use futures::SinkExt;
+use rustynaut_common::config::{BrokerConfig, ConfigLoader};
 use rustynaut_common::constants::{MAX_FILE_SIZE, MAX_LINE_LENGTH, MAX_RECENT_CLIPS_PER_ROOM};
-use rustynaut_common::tls::default_broker_cert_dir;
 use rustynaut_common::parsing::{
     parse_cmd, parse_clip, parse_enroll, parse_file_accept, parse_file_cancel, parse_file_chunk,
     parse_file_end, parse_file_offer, parse_join, parse_say, parse_user,
@@ -45,12 +45,22 @@ struct Args {
     addr: String,
     cert_dir: PathBuf,
     regenerate_token: bool,
+    #[allow(dead_code)]
+    config_path: Option<String>,
+    dump_config: bool,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    // Args: broker [--verbose|-v] [--no-tls] [--cert-dir <path>] [--regenerate-token] [addr]
-    let args = parse_args(env::args().skip(1))?;
+    // Args: broker [--verbose|-v] [--no-tls] [--cert-dir <path>] [--regenerate-token] [--config <path>] [--dump-config] [addr]
+    let (args, config) = parse_args(env::args().skip(1))?;
+
+    // Handle --dump-config
+    if args.dump_config {
+        let toml = ConfigLoader::to_toml_string(&config)?;
+        println!("{}", toml);
+        std::process::exit(0);
+    }
 
     // NOTE: Tracing to stdout is disabled when TUI is active to avoid screen corruption.
     // Important events are routed through the TUI message channel instead.
@@ -263,11 +273,13 @@ async fn run_tui_loop(
                         }
                         crossterm::event::KeyCode::F(1) => app.toggle_sidebar(),
                         crossterm::event::KeyCode::Esc => {
-                            if !app.current_completions.is_empty() {
+                            // Only clear selection or cancel completions - never quit via ESC
+                            if app.text_selection.is_some() {
+                                app.clear_text_selection();
+                            } else if !app.current_completions.is_empty() {
                                 app.cancel_completion();
-                            } else {
-                                app.should_quit = true;
                             }
+                            // Use /quit to exit the broker
                         }
                         _ => {}
                     }
@@ -402,11 +414,13 @@ async fn ui_error(ui_tx: &mpsc::Sender<tui::Message>, text: impl Into<String>) {
         .await;
 }
 
-fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, Box<dyn Error>> {
+fn parse_args(args: impl IntoIterator<Item = String>) -> Result<(Args, BrokerConfig), Box<dyn Error>> {
     let mut verbose = false;
     let mut addr: Option<String> = None;
     let mut cert_dir: Option<PathBuf> = None;
     let mut regenerate_token = false;
+    let mut config_path: Option<String> = None;
+    let mut dump_config = false;
 
     let mut args_iter = args.into_iter().peekable();
 
@@ -421,6 +435,14 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, Box<dyn Er
                         .ok_or("--cert-dir requires a path argument")?,
                 ));
             }
+            "--config" | "-c" => {
+                config_path = Some(
+                    args_iter
+                        .next()
+                        .ok_or("--config requires a path argument")?,
+                );
+            }
+            "--dump-config" => dump_config = true,
             "--help" | "-h" => {
                 eprintln!("usage: broker [OPTIONS] [addr]");
                 eprintln!();
@@ -430,6 +452,8 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, Box<dyn Er
                     "  --cert-dir <PATH>   Certificate directory (default: ~/.config/rustynaut)"
                 );
                 eprintln!("  --regenerate-token  Generate new enrollment token");
+                eprintln!("  --config, -c <PATH> Config file path");
+                eprintln!("  --dump-config       Print effective config and exit");
                 eprintln!();
                 eprintln!("  addr default: 127.0.0.1:4242");
                 std::process::exit(0);
@@ -447,12 +471,29 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, Box<dyn Er
         }
     }
 
-    Ok(Args {
+    // Load configuration (file + env vars)
+    let config = ConfigLoader::load_broker_config(config_path.as_deref())?;
+
+    // CLI addr overrides config
+    let addr = addr.or_else(|| config.server.bind_address.clone().into())
+        .unwrap_or_else(|| "127.0.0.1:4242".to_string());
+
+    // CLI cert_dir overrides config
+    let cert_dir = cert_dir.unwrap_or(config.server.cert_dir.clone());
+
+    // CLI verbose overrides config logging level
+    let verbose = verbose || config.logging.level == "debug" || config.logging.level == "trace";
+
+    let args = Args {
         verbose,
-        addr: addr.unwrap_or_else(|| "127.0.0.1:4242".to_string()),
-        cert_dir: cert_dir.unwrap_or_else(default_broker_cert_dir),
+        addr,
+        cert_dir,
         regenerate_token,
-    })
+        config_path,
+        dump_config,
+    };
+
+    Ok((args, config))
 }
 
 /// Detect local IP addresses from network interfaces using pure Rust
@@ -1398,15 +1439,15 @@ mod tests {
     #[test]
     fn test_parse_args_defaults() {
         let args: Vec<String> = vec![];
-        let result = parse_args(args).unwrap();
+        let (result, _config) = parse_args(args).unwrap();
         assert!(!result.verbose);
-        assert_eq!(result.addr, "127.0.0.1:4242");
+        assert_eq!(result.addr, "0.0.0.0:4242");
     }
 
     #[test]
     fn test_parse_args_with_address() {
         let args = vec!["0.0.0.0:8080".to_string()];
-        let result = parse_args(args).unwrap();
+        let (result, _config) = parse_args(args).unwrap();
         assert!(!result.verbose);
         assert_eq!(result.addr, "0.0.0.0:8080");
     }
@@ -1414,15 +1455,15 @@ mod tests {
     #[test]
     fn test_parse_args_verbose_short() {
         let args = vec!["-v".to_string()];
-        let result = parse_args(args).unwrap();
+        let (result, _config) = parse_args(args).unwrap();
         assert!(result.verbose);
-        assert_eq!(result.addr, "127.0.0.1:4242");
+        assert_eq!(result.addr, "0.0.0.0:4242");
     }
 
     #[test]
     fn test_parse_args_verbose_long() {
         let args = vec!["--verbose".to_string(), "0.0.0.0:9000".to_string()];
-        let result = parse_args(args).unwrap();
+        let (result, _config) = parse_args(args).unwrap();
         assert!(result.verbose);
         assert_eq!(result.addr, "0.0.0.0:9000");
     }
@@ -1430,7 +1471,7 @@ mod tests {
     #[test]
     fn test_parse_args_flags_anywhere() {
         let args = vec!["0.0.0.0:9000".to_string(), "-v".to_string()];
-        let result = parse_args(args).unwrap();
+        let (result, _config) = parse_args(args).unwrap();
         assert!(result.verbose);
         assert_eq!(result.addr, "0.0.0.0:9000");
     }
@@ -1450,7 +1491,7 @@ mod tests {
     #[test]
     fn test_parse_args_with_cert_dir() {
         let args = vec!["--cert-dir".to_string(), "/tmp/certs".to_string()];
-        let result = parse_args(args).unwrap();
+        let (result, _config) = parse_args(args).unwrap();
         assert_eq!(result.cert_dir, std::path::PathBuf::from("/tmp/certs"));
     }
 }

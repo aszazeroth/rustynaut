@@ -32,6 +32,10 @@ cd client && cargo run -- --enroll <TOKEN> <broker_addr> <username>
 cd broker && cargo clippy
 cd client && cargo clippy
 
+# make sure to actually review clippy warnings
+**DO NOT** all allow directives just to skip warnings
+allow dead code is OK for future implemenations, but use only for that
+
 # Format code
 cd broker && cargo fmt
 cd client && cargo fmt

@@ -112,11 +112,39 @@ pub struct App {
     /// Selected completion index
     pub selected_completion: Option<usize>,
 
-    /// Selected message index (for copy functionality via mouse)
-    pub selected_message_index: Option<usize>,
+    /// Text selection state for click-and-drag
+    pub text_selection: Option<TextSelection>,
+
+    /// Whether currently dragging to select text
+    pub is_selecting: bool,
+
+    /// Drag start position for mouse drag detection
+    drag_start_position: Option<(u16, u16)>,
 
     /// Message area bounds for mouse click calculation
     message_area: Option<Rect>,
+
+    /// Input area bounds for mouse selection
+    input_area: Option<Rect>,
+}
+
+/// Text selection state for click-and-drag
+#[derive(Clone, Debug)]
+pub struct TextSelection {
+    /// Start position (message index, character offset)
+    pub start: TextPosition,
+    /// End position (message index, character offset)
+    pub end: TextPosition,
+    /// Whether this selection is in the input area (for future use)
+    #[allow(dead_code)]
+    pub is_input_area: bool,
+}
+
+/// Position within text (message index, character offset)
+#[derive(Clone, Debug, Copy, PartialEq)]
+pub struct TextPosition {
+    pub message_index: usize,
+    pub char_offset: usize,
 }
 
 impl App {
@@ -140,8 +168,11 @@ impl App {
             completer: Completer::new(),
             current_completions: Vec::new(),
             selected_completion: None,
-            selected_message_index: None,
+            text_selection: None,
+            is_selecting: false,
+            drag_start_position: None,
             message_area: None,
+            input_area: None,
         }
     }
 
@@ -543,51 +574,233 @@ impl App {
         self.show_sidebar = !self.show_sidebar;
     }
 
-    /// Select a message by index (for copying)
-    pub fn select_message(&mut self, index: usize) {
-        if self.selected_message_index == Some(index) {
-            // Deselect if already selected
-            self.selected_message_index = None;
-        } else {
-            // Select new message
-            self.selected_message_index = Some(index);
-        }
-    }
-
-    /// Clear the current message selection
-    pub fn clear_selection(&mut self) {
-        self.selected_message_index = None;
-    }
-
-    /// Copy currently selected message to clipboard
+    /// Copy currently selected text to clipboard
     pub fn copy_selected_message(&mut self) {
-        if let Some(index) = self.selected_message_index {
-            if index < self.messages.len() {
-                let text = self.get_message_text(&self.messages[index]);
+        // First check if there's a text selection
+        if let Some(selection) = &self.text_selection {
+            // Handle input area selection
+            if selection.is_input_area {
+                let start = selection.start.char_offset.min(self.input.len());
+                let end = selection.end.char_offset.min(self.input.len());
+                if start < end {
+                    let text_to_copy = self.input[start..end].to_string();
+                    self.copy_to_clipboard(&text_to_copy);
+                    return;
+                }
+            }
+
+            // Handle message selection
+            if selection.start.message_index < self.messages.len()
+                && selection.end.message_index < self.messages.len()
+            {
+                let start_msg = &self.messages[selection.start.message_index];
+                let end_msg = &self.messages[selection.end.message_index];
+
+                let start_text = self.get_message_text(start_msg);
+                let end_text = self.get_message_text(end_msg);
+
+                let text = if selection.start.message_index == selection.end.message_index {
+                    // Same message - extract partial text
+                    let start = selection.start.char_offset.min(start_text.len());
+                    let end = selection.end.char_offset.min(start_text.len());
+                    start_text[start..end].to_string()
+                } else {
+                    // Multiple messages - get range
+                    let mut result = String::new();
+
+                    // First message (partial)
+                    let start = selection.start.char_offset.min(start_text.len());
+                    result.push_str(&start_text[start..]);
+
+                    // Middle messages (full)
+                    for i in (selection.start.message_index + 1)..selection.end.message_index {
+                        if i < self.messages.len() {
+                            result.push('\n');
+                            result.push_str(&self.get_message_text(&self.messages[i]));
+                        }
+                    }
+
+                    // Last message (partial)
+                    if selection.end.message_index < self.messages.len() {
+                        result.push('\n');
+                        let end = selection.end.char_offset.min(end_text.len());
+                        result.push_str(&end_text[..end]);
+                    }
+
+                    result
+                };
+
                 self.copy_to_clipboard(&text);
             }
         }
+
+        // No valid selection - do nothing
     }
 
-    /// Handle mouse click in message area
+    /// Handle mouse click in message area - select entire message
     pub fn handle_mouse_click(&mut self, row: u16) {
         if let Some(area) = self.message_area {
-            // Calculate which message was clicked based on row position
-            let visible_count = (area.height as usize).saturating_sub(2); // Account for borders
+            let visible_count = (area.height as usize).saturating_sub(2);
             let start = self
                 .scroll_offset
                 .saturating_sub(visible_count.saturating_sub(1));
 
-            // The row within the message list (0 = first visible message)
-            let relative_row = (row.saturating_sub(area.y + 1)) as usize; // +1 for top border
+            let relative_row = (row.saturating_sub(area.y + 1)) as usize;
 
             if relative_row < visible_count {
                 let message_index = start + relative_row;
                 if message_index < self.messages.len() {
-                    self.select_message(message_index);
+                    // Select entire message
+                    let text = self.get_message_text(&self.messages[message_index]);
+                    self.text_selection = Some(TextSelection {
+                        start: TextPosition {
+                            message_index,
+                            char_offset: 0,
+                        },
+                        end: TextPosition {
+                            message_index,
+                            char_offset: text.len(),
+                        },
+                        is_input_area: false,
+                    });
                 }
             }
         }
+    }
+
+    /// Start a drag selection at the given position
+    pub fn start_selection_drag(&mut self, row: u16, col: u16) {
+        self.drag_start_position = Some((row, col));
+        self.is_selecting = true;
+
+        // Check if click is in input area
+        if let Some(input_area) = self.input_area {
+            if row >= input_area.y && row < input_area.y + input_area.height {
+                // Click in input area - set up input selection
+                let prompt_len = format!("[{}] > ", self.current_room).len();
+                let col_in_input = col.saturating_sub(input_area.x) as usize;
+                let char_pos = col_in_input.saturating_sub(prompt_len);
+
+                self.text_selection = Some(TextSelection {
+                    start: TextPosition {
+                        message_index: 0, // Use 0 for input area
+                        char_offset: char_pos,
+                    },
+                    end: TextPosition {
+                        message_index: 0,
+                        char_offset: char_pos,
+                    },
+                    is_input_area: true,
+                });
+                return;
+            }
+        }
+
+        // Click in message area - select the message
+        self.handle_mouse_click(row);
+    }
+
+    /// Update the selection while dragging
+    pub fn update_selection_drag(&mut self, row: u16, col: u16) {
+        if !self.is_selecting {
+            return;
+        }
+
+        // Check if we're in input area
+        if let Some(input_area) = self.input_area {
+            if row >= input_area.y && row < input_area.y + input_area.height {
+                // Dragging in input area
+                let prompt_len = format!("[{}] > ", self.current_room).len();
+                let col_in_input = col.saturating_sub(input_area.x) as usize;
+                let char_pos = col_in_input.saturating_sub(prompt_len);
+
+                if let Some(selection) = &mut self.text_selection {
+                    if selection.is_input_area {
+                        selection.end.char_offset = char_pos.min(self.input.len());
+                    }
+                }
+                return;
+            }
+        }
+
+        // Message area dragging
+        if let Some(area) = self.message_area {
+            let visible_count = (area.height as usize).saturating_sub(2);
+            let scroll_start = self
+                .scroll_offset
+                .saturating_sub(visible_count.saturating_sub(1));
+            let relative_row = (row.saturating_sub(area.y + 1)) as usize;
+
+            if relative_row < visible_count {
+                let message_index = scroll_start + relative_row;
+                if message_index < self.messages.len() {
+                    let char_offset = (col.saturating_sub(area.x + 1)) as usize;
+
+                    // Get start position from drag start
+                    if let Some((start_row, start_col)) = self.drag_start_position {
+                        // Check if start was in input area
+                        if let Some(input_area) = self.input_area {
+                            if start_row >= input_area.y
+                                && start_row < input_area.y + input_area.height
+                            {
+                                // Started in input, moved to message - just select this message
+                                self.text_selection = None;
+                                self.handle_mouse_click(row);
+                                return;
+                            }
+                        }
+
+                        // Calculate start message index
+                        let start_relative = (start_row.saturating_sub(area.y + 1)) as usize;
+                        let start_message = scroll_start.saturating_add(start_relative);
+                        let start_offset = (start_col.saturating_sub(area.x + 1)) as usize;
+
+                        if start_message < self.messages.len() {
+                            let start_text_len =
+                                self.get_message_text(&self.messages[start_message]).len();
+                            let start_char = start_offset.min(start_text_len);
+                            let end_char = char_offset
+                                .min(self.get_message_text(&self.messages[message_index]).len());
+
+                            // Normalize: ensure start < end
+                            let (start_idx, start_ch, end_idx, end_ch) = if start_message
+                                < message_index
+                                || (start_message == message_index && start_char <= end_char)
+                            {
+                                (start_message, start_char, message_index, end_char)
+                            } else {
+                                (message_index, end_char, start_message, start_char)
+                            };
+
+                            self.text_selection = Some(TextSelection {
+                                start: TextPosition {
+                                    message_index: start_idx,
+                                    char_offset: start_ch,
+                                },
+                                end: TextPosition {
+                                    message_index: end_idx,
+                                    char_offset: end_ch,
+                                },
+                                is_input_area: false,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// End the drag selection
+    pub fn end_selection_drag(&mut self) {
+        self.is_selecting = false;
+        self.drag_start_position = None;
+    }
+
+    /// Clear the current text selection
+    pub fn clear_text_selection(&mut self) {
+        self.text_selection = None;
+        self.is_selecting = false;
+        self.drag_start_position = None;
     }
 
     /// Get the text content of a message
@@ -645,6 +858,7 @@ impl App {
         self.draw_status_bar(frame, main_layout[2]);
 
         // Input area
+        self.input_area = Some(main_layout[3]);
         self.draw_input(frame, main_layout[3]);
     }
 
@@ -722,8 +936,7 @@ impl App {
             .enumerate()
             .map(|(idx, msg)| {
                 let absolute_idx = start + idx;
-                let is_selected = self.selected_message_index == Some(absolute_idx);
-                self.format_message_with_selection(msg, is_selected)
+                self.format_message_with_selection(msg, absolute_idx)
             })
             .collect();
 
@@ -740,11 +953,19 @@ impl App {
     }
 
     /// Format a message for display with optional selection highlighting
+    /// Takes the absolute message index to check against text_selection
     fn format_message_with_selection<'a>(
         &self,
         msg: &'a Message,
-        is_selected: bool,
+        message_index: usize,
     ) -> ListItem<'a> {
+        // Check if this message has any selection
+        let selection = self.text_selection.as_ref().filter(|s| {
+            !s.is_input_area
+                && s.start.message_index <= message_index
+                && message_index <= s.end.message_index
+        });
+
         let timestamp = match msg {
             Message::Info { timestamp, .. } => timestamp,
             Message::Error { timestamp, .. } => timestamp,
@@ -754,43 +975,118 @@ impl App {
             Message::FileTransfer { timestamp, .. } => timestamp,
         };
         let ts_str = Self::format_timestamp(timestamp);
-        let ts_span = Span::styled(
-            format!("[{}] ", ts_str),
-            Style::default().fg(Color::Rgb(0x58, 0x6E, 0x75)),
-        );
+        let ts_len = ts_str.len() + 3; // [timestamp] + space
+
+        // Helper to apply selection highlighting to a text range
+        let apply_selection = |spans: &mut Vec<Span<'a>>, text_start: usize, text: &str| {
+            if let Some(sel) = selection {
+                // Calculate offset within this message
+                let msg_start = sel.start.message_index;
+                let msg_end = sel.end.message_index;
+
+                if msg_start == msg_end && msg_start == message_index {
+                    // Single message selection - highlight partial
+                    let sel_start = sel.start.char_offset.saturating_sub(text_start);
+                    let sel_end = sel.end.char_offset.saturating_sub(text_start);
+
+                    let text_len = text.len();
+                    let start = sel_start.min(text_len);
+                    let end = sel_end.min(text_len);
+
+                    if start < end {
+                        spans.push(Span::raw(text[..start].to_string()));
+                        spans.push(Span::styled(
+                            text[start..end].to_string(),
+                            Style::default().bg(COLOR_HILITE).fg(COLOR_BG),
+                        ));
+                        spans.push(Span::raw(text[end..].to_string()));
+                        return;
+                    }
+                } else if msg_start == message_index {
+                    // First message of multi-select
+                    let sel_start = sel.start.char_offset.saturating_sub(text_start);
+                    if sel_start < text.len() {
+                        spans.push(Span::raw(text[..sel_start].to_string()));
+                        spans.push(Span::styled(
+                            text[sel_start..].to_string(),
+                            Style::default().bg(COLOR_HILITE).fg(COLOR_BG),
+                        ));
+                        return;
+                    }
+                } else if msg_end == message_index {
+                    // Last message of multi-select
+                    let sel_end = sel.end.char_offset.saturating_sub(text_start);
+                    if sel_end > 0 {
+                        spans.push(Span::styled(
+                            text[..sel_end.min(text.len())].to_string(),
+                            Style::default().bg(COLOR_HILITE).fg(COLOR_BG),
+                        ));
+                        spans.push(Span::raw(text[sel_end.min(text.len())..].to_string()));
+                        return;
+                    }
+                } else {
+                    // Middle message - fully selected
+                    spans.push(Span::styled(
+                        text.to_string(),
+                        Style::default().bg(COLOR_HILITE).fg(COLOR_BG),
+                    ));
+                    return;
+                }
+            }
+            // No selection or doesn't overlap
+            spans.push(Span::raw(text.to_string()));
+        };
 
         let item = match msg {
             Message::Info { text, .. } => {
-                let spans = vec![
-                    ts_span,
+                let mut spans = vec![
+                    Span::styled(
+                        format!("[{}] ", ts_str),
+                        Style::default().fg(Color::Rgb(0x58, 0x6E, 0x75)),
+                    ),
                     Span::styled("INFO ", Style::default().fg(COLOR_ACCENT)),
-                    Span::raw(text.clone()),
                 ];
+                apply_selection(&mut spans, ts_len + 5, text); // +5 for "INFO "
                 ListItem::new(Line::from(spans))
             }
             Message::Error { text, .. } => {
-                let spans = vec![
-                    ts_span,
+                let mut spans = vec![
+                    Span::styled(
+                        format!("[{}] ", ts_str),
+                        Style::default().fg(Color::Rgb(0x58, 0x6E, 0x75)),
+                    ),
                     Span::styled("ERR  ", Style::default().fg(COLOR_ERR)),
-                    Span::raw(text.clone()),
                 ];
+                apply_selection(&mut spans, ts_len + 5, text);
                 ListItem::new(Line::from(spans))
             }
             Message::Chat { user, text, .. } => {
-                let spans = vec![
-                    ts_span,
-                    Span::styled(format!("{}: ", user), Style::default().fg(COLOR_HILITE)),
-                    Span::raw(text.clone()),
+                let user_prefix = format!("{}: ", user);
+                let user_len = user_prefix.len();
+                let text_start = ts_len + user_len;
+                let mut spans = vec![
+                    Span::styled(
+                        format!("[{}] ", ts_str),
+                        Style::default().fg(Color::Rgb(0x58, 0x6E, 0x75)),
+                    ),
+                    Span::styled(user_prefix, Style::default().fg(COLOR_HILITE)),
                 ];
+                apply_selection(&mut spans, text_start, text);
                 ListItem::new(Line::from(spans))
             }
             Message::Clip { room, preview, .. } => {
-                let spans = vec![
-                    ts_span,
+                let room_prefix = format!("[{}] ", room);
+                let room_len = room_prefix.len();
+                let text_start = ts_len + 5 + room_len; // +5 for "CLIP "
+                let mut spans = vec![
+                    Span::styled(
+                        format!("[{}] ", ts_str),
+                        Style::default().fg(Color::Rgb(0x58, 0x6E, 0x75)),
+                    ),
                     Span::styled("CLIP ", Style::default().fg(Color::Rgb(0x26, 0x8B, 0xD2))),
-                    Span::styled(format!("[{}] ", room), Style::default().fg(COLOR_ACCENT)),
-                    Span::raw(preview.clone()),
+                    Span::styled(room_prefix, Style::default().fg(COLOR_ACCENT)),
                 ];
+                apply_selection(&mut spans, text_start, preview);
                 ListItem::new(Line::from(spans))
             }
             Message::FileOffer {
@@ -800,31 +1096,31 @@ impl App {
                 size,
                 ..
             } => {
-                let spans = vec![
-                    ts_span,
+                let prefix = format!("[{}] {} offers: {} ({})", room, user, filename, size);
+                let mut spans = vec![
+                    Span::styled(
+                        format!("[{}] ", ts_str),
+                        Style::default().fg(Color::Rgb(0x58, 0x6E, 0x75)),
+                    ),
                     Span::styled("FILE ", Style::default().fg(Color::Rgb(0x6C, 0x71, 0xC4))),
-                    Span::styled(format!("[{}] ", room), Style::default().fg(COLOR_ACCENT)),
-                    Span::styled(format!("{} ", user), Style::default().fg(COLOR_HILITE)),
-                    Span::raw(format!("offers: {} ({})", filename, size)),
                 ];
+                apply_selection(&mut spans, ts_len + 5, &prefix);
                 ListItem::new(Line::from(spans))
             }
             Message::FileTransfer { text, .. } => {
-                let spans = vec![
-                    ts_span,
+                let mut spans = vec![
+                    Span::styled(
+                        format!("[{}] ", ts_str),
+                        Style::default().fg(Color::Rgb(0x58, 0x6E, 0x75)),
+                    ),
                     Span::styled("FILE ", Style::default().fg(Color::Rgb(0x6C, 0x71, 0xC4))),
-                    Span::raw(text.clone()),
                 ];
+                apply_selection(&mut spans, ts_len + 5, text);
                 ListItem::new(Line::from(spans))
             }
         };
 
-        // Apply selection highlighting
-        if is_selected {
-            item.style(Style::default().bg(COLOR_ACCENT).fg(COLOR_BG))
-        } else {
-            item
-        }
+        item
     }
 
     /// Draw the sidebar showing users
@@ -872,17 +1168,41 @@ impl App {
         // Split into prompt and input
         let prompt = format!("[{}] > ", self.current_room);
 
-        // Create text with cursor indicator
+        // Check for text selection in input area
+        let input_selection = self
+            .text_selection
+            .as_ref()
+            .filter(|s| s.is_input_area)
+            .map(|s| (s.start.char_offset, s.end.char_offset));
+
+        // Create text with cursor indicator and selection
         let mut spans = vec![Span::styled(
             prompt.clone(),
             Style::default().fg(COLOR_ACCENT),
         )];
 
-        // Add input text
+        // Add input text with selection highlighting
         if self.input.is_empty() {
             spans.push(Span::styled(" ", Style::default().bg(COLOR_BG)));
+        } else if let Some((sel_start, sel_end)) = input_selection {
+            // Render with selection highlight
+            let sel_start = sel_start.min(self.input.len());
+            let sel_end = sel_end.min(self.input.len());
+
+            if sel_start > 0 {
+                spans.push(Span::raw(self.input[..sel_start].to_string()));
+            }
+            if sel_start < sel_end {
+                spans.push(Span::styled(
+                    self.input[sel_start..sel_end].to_string(),
+                    Style::default().bg(COLOR_HILITE).fg(COLOR_BG),
+                ));
+            }
+            if sel_end < self.input.len() {
+                spans.push(Span::raw(self.input[sel_end..].to_string()));
+            }
         } else {
-            // Show text with cursor position
+            // Show text with cursor position (no selection)
             if self.cursor_pos < self.input.len() {
                 let before = &self.input[..self.cursor_pos];
                 let at_cursor = &self.input[self.cursor_pos..self.cursor_pos + 1];

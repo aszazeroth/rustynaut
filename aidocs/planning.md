@@ -924,8 +924,14 @@ async fn main() -> Result<()> {
 - Press 'y' key to copy the currently selected message to clipboard
 - Simple and intuitive for copying entire messages
 
+**Completed:**
+- [x] **Exit copy mode**: Press ESC to deselect currently selected message
+- [x] **Message selection**: Click to select entire message
+- [x] **Copy to clipboard**: 'y' key copies selected message
+
 **Future Enhancements:**
-- [x] **Exit copy mode**: Add a way to exit/escape from message selection mode (e.g., Esc key or clicking elsewhere) ✅ Press ESC to deselect currently selected message
+
+#### Basic Selection & Copy
 - [ ] **Click and drag text selection**: Enable mouse click-and-drag to select arbitrary text within messages
   - Should work anywhere in the message area
   - Allow partial text selection (not just whole messages)
@@ -937,11 +943,67 @@ async fn main() -> Result<()> {
   - Invert colors or use different background for selected text range
   - Update selection in real-time as user drags
 
+#### Advanced Selection Features
+- [ ] **Multi-message selection**: Ctrl+Click or Shift+Click to select multiple messages
+  - Copy all selected messages at once
+  - Visual indicator for multi-select mode
+- [ ] **Select all**: Ctrl+A in message area selects all visible messages
+  - Useful for saving conversation history
+  - Option to include/exclude system messages (INFO, ERR)
+- [ ] **Keyboard navigation**: Arrow keys to navigate between messages
+  - Up/Down to move selection
+  - Space to select/deselect message
+  - Enter to copy current selection
+- [ ] **Quick copy without selection**: Copy last message with double-click or specific hotkey
+  - Alt+C or similar for "copy last"
+  - Configurable in settings
+
+#### Copy Options & Formatting
+- [ ] **Copy format options**: Choose what to include when copying
+  - Plain text only (default)
+  - With timestamps: `[14:32:10] alice: Hello`
+  - With username only: `alice: Hello`
+  - Full metadata: timestamp, room, user, message
+- [ ] **Copy as different formats**: Support multiple clipboard formats
+  - Plain text (always)
+  - Markdown: `**alice**: Hello` or `> alice: Hello`
+  - JSON for programmatic use (if applicable)
+- [ ] **Copy file references**: Special handling for file transfer messages
+  - Copy filename
+  - Copy full path (if local)
+  - Copy file URL/ID for re-download
+
+#### UX Improvements
+- [ ] **Context menu on right-click**: Show copy options on right-click
+  - "Copy message"
+  - "Copy username"
+  - "Copy timestamp"
+  - "Copy selection" (when text selected)
+- [ ] **Copy indicator**: Visual confirmation when copy succeeds
+  - Brief toast notification "Copied!"
+  - Status bar message
+  - Temporary highlight flash
+- [ ] **Mouse mode toggle**: Allow disabling TUI mouse handling
+  - `--no-mouse` CLI flag
+  - Falls back to terminal's native selection
+  - Useful for users who prefer terminal's copy mode
+
+#### Search & Find
+- [ ] **Search in messages**: Find text within message history
+  - Ctrl+F to open search box
+  - Navigate between matches with F3/Shift+F3
+  - Copy found text directly
+- [ ] **Filter then copy**: Show only matching messages, copy filtered set
+  - Useful for extracting specific conversations
+
 **Implementation Notes:**
 - Requires tracking mouse down position and drag coordinates
 - Need to map screen coordinates to text positions within messages
-- Consider using terminal's native selection where possible (e.g.,按住 Shift for terminal selection)
+- Consider using terminal's native selection where possible (e.g., hold Shift for terminal selection)
 - Balance between TUI-managed selection and terminal-native selection
+- Cross-platform clipboard handling via `arboard` crate
+- Performance: Efficient text position mapping for large message history
+- Accessibility: Ensure keyboard-only workflows work well
 
 ---
 
@@ -964,6 +1026,24 @@ Currently, the codebase has significant duplication between the `broker/` and `c
 | **Testing** | Common crate can be tested independently |
 | **Documentation** | Clear separation of concerns |
 | **Future Extensibility** | Easier to add new components (e.g., GUI client, web interface) |
+
+### TUI Code Duplication
+
+Both broker and client have TUI implementations (`broker/src/tui.rs` and `client/src/tui.rs`) with significant duplication:
+- Message types (`Message` enum)
+- Text selection handling (`TextSelection`, `TextPosition` structs)
+- Input handling and command history
+- Completion/tab-complete logic
+- Rendering logic (message area, input area, sidebar, status bar)
+- Mouse event handling
+
+**Future Refactoring:**
+- [ ] Extract common TUI components to a shared module in `common/`
+- [ ] Create a shared `TuiApp` base struct that both broker and client extend
+- [ ] Factor out message rendering, input handling, completion as reusable components
+- [ ] Share text selection logic between broker and client
+
+**Note:** The broker TUI should remain lightweight (no clipboard dependency) while the client TUI includes full clipboard integration.
 
 ### Current Duplication Analysis
 
@@ -1339,6 +1419,20 @@ After workspace refactoring is complete, consider:
 
 Ready-to-pick tasks organized by category. Select one and move it to "In Progress".
 
+### Client Resilience
+- [x] **Auto-reconnection with exponential backoff** - See "Client Auto-Reconnection" section below for detailed plan
+  - Reconnect on broker restart or network interruption (enrolled clients only)
+  - 3 attempts with exponential backoff (1s → 2s → 4s, max 8s)
+  - Restore username and room membership after reconnect ✅ COMPLETE
+
+### Configuration Management
+- [x] **Unified configuration system** - See "Configuration Management" section below for detailed plan
+  - [x] TOML config files in OS-appropriate locations (~/.config/rustynaut/ on Linux, etc.)
+  - [x] Layered config: CLI flags > Env vars > Config file > Defaults
+  - [ ] Hot-reload support for logging levels and UI settings (deferred)
+  - [x] Validation with helpful error messages
+  - [x] Config migration between versions
+
 ### File Transfers
 - [ ] Auto-accept option (configurable per-user or per-room)
 - [ ] Transfer timeout (configurable, default 60s)
@@ -1360,9 +1454,12 @@ Ready-to-pick tasks organized by category. Select one and move it to "In Progres
 - [ ] Tab completion for usernames (in `/accept`)
 - [ ] Tab completion for room names (in `/join`)
 - [ ] Tab completion for filenames (in `/accept <user>`)
-- [ ] Click-and-drag text selection in messages
-- [ ] Click-and-drag text selection in input/command line
-- [ ] Visual selection highlight during drag operations
+- [ ] **Text Selection & Copy** - See "TUI Text Selection & Copy" section below for detailed roadmap
+  - Click-and-drag text selection in messages and input area
+  - Multi-message selection, select all, keyboard navigation
+  - Copy format options (plain, with timestamps, markdown)
+  - Context menu on right-click
+  - Search and copy functionality
 - [ ] File transfer progress bars
 - [ ] Sidebar showing users in room (toggle with key)
 - [ ] Configuration file for TUI preferences
@@ -1380,3 +1477,588 @@ Ready-to-pick tasks organized by category. Select one and move it to "In Progres
 - [ ] API documentation for common crate
 - [ ] Deployment guides (Docker, systemd)
 - [ ] Security hardening guide
+
+---
+
+## Client Auto-Reconnection with Exponential Backoff
+
+### Overview
+Implement automatic reconnection for enrolled clients when the connection to the broker is lost. This feature provides resilience against transient network failures and broker restarts, with exponential backoff to prevent hammering the server.
+
+### Use Cases
+1. **Broker restart**: Client automatically reconnects when broker comes back online
+2. **Network interruption**: Temporary network issues don't require manual restart
+3. **VM migration**: Client VMs moving between hosts maintain connectivity
+4. **WiFi handoff**: Laptops switching networks stay connected
+
+### Design Decisions
+
+| Decision | Rationale |
+|----------|-----------|
+| **Enrolled clients only** | Requires valid certificates; unenrolled clients exit on disconnect |
+| **Max 3 attempts** | Balances recovery vs infinite loops; user can manually retry after |
+| **Exponential backoff** | 1s → 2s → 4s prevents overwhelming broker during startup |
+| **8s max delay** | Cap prevents excessive wait times; total max ~15s |
+| **State restoration** | Re-joins same room with same username after reconnect |
+
+### Reconnection Flow
+
+```
+Connection Lost
+      ↓
+Check: Enrolled? (has certs in ~/.config/rustynaut/client/)
+      ↓ No
+  Exit gracefully
+      ↓ Yes
+Check: Graceful disconnect? (/quit, /exit)
+      ↓ Yes
+  Exit gracefully
+      ↓ No
+Attempt 1: Wait 1s → Connect → Success? → Resume
+      ↓ Failed
+Attempt 2: Wait 2s → Connect → Success? → Resume
+      ↓ Failed
+Attempt 3: Wait 4s → Connect → Success? → Resume
+      ↓ Failed
+Wait 8s → Connect → Success? → Resume
+      ↓ Failed
+Show: "Reconnection failed. Press Enter to retry, Ctrl+C to exit"
+```
+
+### Backoff Schedule
+
+| Attempt | Delay | Cumulative |
+|---------|-------|------------|
+| 1 | 1s | 1s |
+| 2 | 2s | 3s |
+| 3 | 4s | 7s |
+| Max | 8s | 15s |
+
+Formula: `delay = min(base * 2^(attempt-1), max_delay)`
+
+### UI Feedback
+
+**During reconnection:**
+```
+[14:32:10] WARN Connection lost (broken pipe)
+[14:32:10] INFO Reconnecting in 1s... (attempt 1/3)
+[14:32:11] INFO Connected to 192.168.1.100:4242
+[14:32:11] INFO Rejoined room: lobby
+```
+
+**After max attempts:**
+```
+[14:32:25] ERR Reconnection failed after 3 attempts
+[14:32:25] INFO Press Enter to retry now, or Ctrl+C to exit
+> █
+```
+
+### Implementation Todo
+
+#### Phase 1: State Tracking & Detection
+- [x] Create `ReconnectionConfig` struct with backoff parameters (already in `common/src/config/types.rs`)
+- [x] Add `ConnectionState` enum: `Connected`, `Disconnected`, `Reconnecting` (in `client/src/reconnect.rs`)
+- [x] Track `connection_start_time` to filter rapid failures (< 5s) (in ReconnectionManager)
+- [x] Distinguish intentional disconnect (`/quit`) from errors (DisconnectReason enum)
+- [x] Store reconnection context: broker_addr, username, room (ReconnectContext struct)
+
+#### Phase 2: Reconnection Manager
+- [x] Create `ReconnectionManager` struct in `client/src/reconnect.rs`
+- [x] Implement `should_reconnect(&self, reason: DisconnectReason) -> bool`
+- [x] Implement exponential backoff calculation
+- [x] Implement async `wait_backoff(&mut self)` method
+- [x] Add attempt counter with reset on successful connection
+
+#### Phase 3: Main Loop Integration
+- [x] Broadcast channel for connection status
+- [x] Display connection status messages in TUI ("Disconnected from broker", "Reconnected to broker", "Attempting to reconnect...")
+- [x] Wrap connection logic in outer reconnection loop (creates new channels on each attempt)
+- [x] Check enrollment status before attempting reconnect
+- [x] Detect connection failures and trigger reconnect flow (network task sends Disconnected state)
+- [x] Preserve TUI state (message history) across reconnections (TUI is separate from network)
+- [x] Reset backoff counter on successful connection
+
+#### Phase 4: State Restoration
+- [x] Re-send `USER <username>` after reconnect
+- [x] Re-send `JOIN <room>` after reconnect
+- [ ] Restore any pending file transfers? (debatable)
+- [ ] Clear `recent_clip_ids` to avoid echo suppression issues
+
+#### Phase 5: CLI & Configuration
+- [x] Config file section `[reconnection]` (already in config types)
+- [ ] Add CLI flags to override config (future)
+
+#### Phase 6: Edge Cases
+- [ ] Handle broker IP change (re-resolve DNS)
+- [ ] Handle certificate expiration during reconnect
+- [ ] Cancel reconnection on Ctrl+C during wait
+- [ ] Handle concurrent clipboard updates during reconnect
+- [ ] Prevent duplicate clipboard sends on reconnect
+
+#### Phase 7: Testing
+- [x] Unit: Backoff calculation (tests in client/src/reconnect.rs)
+- [ ] Unit: Eligibility checks
+- [ ] Integration: Broker restart, client reconnects
+- [ ] Integration: Network drop (iptables -j DROP)
+- [ ] Integration: 3 failures, manual retry succeeds
+- [ ] Integration: Non-enrolled client exits immediately
+- [ ] Integration: Graceful quit doesn't trigger reconnect
+
+### Current Implementation Status (2026-02-15)
+
+**Completed:**
+- `common/src/config/types.rs`: `ReconnectConfig` struct with fields: enabled, max_attempts, base_delay_seconds, max_delay_seconds, min_connection_seconds
+- `client/src/reconnect.rs`: `ReconnectionManager` with:
+  - `ConnectionState` enum (Connected, Disconnected, Reconnecting)
+  - `DisconnectReason` enum (Intentional, BrokerRestart, NetworkError, Timeout, Unknown)
+  - `ReconnectContext` struct (broker_addr, username, room)
+  - Exponential backoff: 1s → 2s → 4s, capped at 8s
+  - `should_reconnect()` checks: enabled, max_attempts, min_connection_seconds, intentional disconnect
+  - Unit tests for backoff logic
+- Network task sends `ConnectionState::Disconnected` on connection errors
+- TUI displays status messages on connection state changes
+
+**Not Yet Implemented:**
+- Actual reconnection retry loop (needs to recreate network channels and sender/receiver pairs)
+- State restoration after reconnect (re-send USER and JOIN)
+- Manual retry prompt after max attempts
+
+**Key Insight:** The reconnection infrastructure is in place, but completing the full auto-reconnect requires more complex channel management - the network sender (`net_tx`) and receiver (`net_rx`) need to be recreated on each reconnection attempt.
+
+### Configuration
+
+**Default config (config.toml):**
+```toml
+[reconnection]
+enabled = true
+max_attempts = 3
+base_delay_seconds = 1
+max_delay_seconds = 8
+min_connection_seconds = 5  # Don't reconnect if connected < 5s
+```
+
+**CLI overrides:**
+```bash
+# Disable reconnection
+rustynaut --no-reconnect 192.168.1.100:4242 alice
+
+# Custom backoff
+rustynaut --reconnect-attempts 5 --reconnect-base 2 192.168.1.100:4242 alice
+```
+
+### Code Skeleton
+
+```rust
+// client/src/reconnect.rs
+use std::time::{Duration, Instant};
+use tokio::time::sleep;
+
+pub struct ReconnectionManager {
+    config: ReconnectionConfig,
+    attempt: u32,
+    context: ReconnectContext,
+}
+
+pub struct ReconnectionConfig {
+    pub enabled: bool,
+    pub max_attempts: u32,
+    pub base_delay: Duration,
+    pub max_delay: Duration,
+    pub min_connection_duration: Duration,
+}
+
+pub struct ReconnectContext {
+    pub broker_addr: SocketAddr,
+    pub username: String,
+    pub room: String,
+}
+
+#[derive(Debug)]
+pub enum DisconnectReason {
+    IoError(std::io::Error),
+    BrokerClosed,
+    UserQuit,
+    AuthenticationFailed,
+}
+
+impl ReconnectionManager {
+    pub fn should_reconnect(&self, reason: &DisconnectReason, connected_duration: Duration) -> bool {
+        if !self.config.enabled { return false; }
+        if self.attempt >= self.config.max_attempts { return false; }
+        if matches!(reason, DisconnectReason::UserQuit | DisconnectReason::AuthenticationFailed) {
+            return false;
+        }
+        if connected_duration < self.config.min_connection_duration {
+            return false;  // Avoid rapid reconnect loops
+        }
+        true
+    }
+    
+    pub async fn wait_backoff(&mut self) {
+        let delay = self.calculate_backoff();
+        self.attempt += 1;
+        sleep(delay).await;
+    }
+    
+    fn calculate_backoff(&self) -> Duration {
+        let exponential = self.config.base_delay * 2u32.pow(self.attempt);
+        std::cmp::min(exponential, self.config.max_delay)
+    }
+    
+    pub fn reset(&mut self) {
+        self.attempt = 0;
+    }
+}
+```
+
+### Open Questions
+
+1. **Should we restore file transfers?** Probably not - too complex, user can re-initiate
+2. **Should backoff reset on manual retry?** Yes - user explicitly wants to try now
+3. **DNS caching?** Re-resolve on each attempt to handle broker IP changes
+4. **Multiple brokers?** Future: support fallback brokers for high availability
+
+
+---
+
+## Configuration Management
+
+### Overview
+A unified configuration system for both broker and client using TOML format with OS-appropriate paths. Configuration provides persistent settings across restarts, user customization, and environment-specific overrides.
+
+### Goals
+- **Cross-platform paths**: Use OS-native config directories (XDG, macOS Library, Windows AppData)
+- **Layered configuration**: CLI flags > Environment vars > Config file > Defaults
+- **Hot-reload support**: Some settings reloadable without restart
+- **Validation**: Fail fast on invalid config with helpful error messages
+- **Documentation**: Self-documenting via comments and examples
+
+### Configuration Locations
+
+Using the `dirs` crate for platform-appropriate paths:
+
+| OS | Broker Config | Client Config | Notes |
+|----|--------------|---------------|-------|
+| **Linux** | `~/.config/rustynaut/broker.toml` | `~/.config/rustynaut/client.toml` | Follows XDG Base Directory spec |
+| **macOS** | `~/Library/Application Support/rustynaut/broker.toml` | `~/Library/Application Support/rustynaut/client.toml` | Standard macOS app support dir |
+| **Windows** | `%APPDATA%\rustynaut\broker.toml` | `%APPDATA%\rustynaut\client.toml` | Roaming app data |
+
+**Additional paths searched (in order of precedence):**
+1. Path specified via `--config <path>` CLI flag
+2. `RUSTYNAUT_CONFIG` environment variable
+3. Platform-specific location above
+4. Current directory: `./rustynaut.toml` (development convenience)
+
+### Configuration Structure
+
+#### Broker Configuration (`broker.toml`)
+
+```toml
+# Rustynaut Broker Configuration
+# Full documentation: https://github.com/aszazeroth/rustynaut/docs/config.md
+
+[server]
+# Network binding
+bind_address = "0.0.0.0:4242"
+
+# TLS settings
+tls_enabled = true
+cert_dir = "~/.config/rustynaut"  # Expands to platform path
+# auto_generate_certs = true  # Generate self-signed on first run
+
+# Enrollment settings
+enrollment_enabled = true
+# enrollment_token = "auto"  # "auto" = generate UUID, or specify fixed token
+# enrollment_window_hours = 0  # 0 = no limit, otherwise hours since startup
+# single_use_token = false
+# max_enrollments_per_ip = 5
+
+[limits]
+max_clients = 100
+max_rooms = 50
+max_clients_per_room = 50
+max_message_size = 2097152  # 2MB in bytes
+max_file_size = 1073741824  # 1GB in bytes
+rate_limit_messages_per_second = 10
+
+[logging]
+level = "info"  # trace, debug, info, warn, error
+format = "pretty"  # pretty, json, compact
+# output = "stderr"  # stderr, stdout, or path to file
+# file_rotation = "daily"  # daily, hourly, never
+
+[features]
+rooms_enabled = true
+file_transfers = true
+clipboard_sync = true
+
+[timeouts]
+client_idle_timeout_seconds = 300  # 5 minutes
+file_transfer_timeout_seconds = 60
+enrollment_session_timeout_seconds = 30
+```
+
+#### Client Configuration (`client.toml`)
+
+```toml
+# Rustynaut Client Configuration
+# Full documentation: https://github.com/aszazeroth/rustynaut/docs/config.md
+
+[connection]
+# Default broker to connect to (can override via CLI)
+# broker_address = "192.168.1.100:4242"
+# default_username = "alice"
+# default_room = "lobby"
+
+# Reconnection settings
+[connection.reconnect]
+enabled = true
+max_attempts = 3
+base_delay_seconds = 1
+max_delay_seconds = 8
+min_connection_seconds = 5
+
+# TLS settings
+[connection.tls]
+enabled = true
+cert_dir = "~/.config/rustynaut/client"
+# verify_server_cert = true  # Set false for self-signed dev certs
+# ca_cert_path = "~/.config/rustynaut/ca.crt"  # Override CA
+
+[clipboard]
+# Clipboard sync settings
+enabled = true
+# poll_interval_ms = 100
+file_detection = true
+auto_offer_files = true
+file_size_threshold_kb = 64
+
+[ui]
+# TUI preferences
+theme = "default"  # default, dark, light
+show_timestamps = true
+timestamp_format = "%H:%M:%S"
+show_user_list = true
+user_list_position = "right"  # right, left, hidden
+message_wrap = true
+# mouse_enabled = true  # Enable mouse support in TUI
+
+[ui.colors]
+# Optional custom color scheme (hex or named)
+# primary = "#00ff00"
+# accent = "cyan"
+# error = "red"
+
+[logging]
+level = "info"
+# log_file = "~/.local/share/rustynaut/client.log"  # Platform-appropriate
+
+[keybindings]
+# Custom keybindings (TUI mode)
+# quit = "q"
+# copy = "y"
+# paste = "p"
+# accept_file = "a"
+```
+
+### Configuration Loading Priority
+
+Settings are resolved in this order (last wins):
+
+1. **Built-in defaults** (hardcoded in binary)
+2. **Config file** (platform-specific location)
+3. **Environment variables** (`RUSTYNAUT_*` prefix)
+4. **CLI arguments** (highest priority)
+
+**Example override chain:**
+```bash
+# Config file has: level = "info"
+# Environment: RUSTYNAUT_LOGGING_LEVEL=debug
+# CLI: --verbose
+
+# Result: level = "debug" (CLI wins, --verbose implies debug)
+```
+
+### Environment Variable Mapping
+
+All config values can be set via environment variables using uppercase with underscores:
+
+```bash
+# Broker examples
+RUSTYNAUT_SERVER_BIND_ADDRESS="0.0.0.0:8080"
+RUSTYNAUT_SERVER_TLS_ENABLED=false
+RUSTYNAUT_LIMITS_MAX_CLIENTS=50
+RUSTYNAUT_LOGGING_LEVEL=trace
+
+# Client examples
+RUSTYNAUT_CONNECTION_BROKER_ADDRESS="192.168.1.100:4242"
+RUSTYNAUT_CONNECTION_RECONNECT_ENABLED=true
+RUSTYNAUT_CLIPBOARD_ENABLED=true
+RUSTYNAUT_UI_THEME="dark"
+```
+
+**Nested keys** use double underscore: `section__key` or single underscore depending on parser.
+
+### Hot-Reload Support (Future)
+
+> **Status:** Not yet implemented. Consider for future release.
+
+Some settings could be changed without restart:
+
+| Setting | Hot-Reload | Notes |
+|---------|-----------|-------|
+| `logging.level` | Future | Immediate effect |
+| `limits.*` | Future | Applies to new connections |
+| `server.bind_address` | ❌ No | Requires restart |
+| `features.*` | ❌ No | Requires restart |
+| `ui.*` | Future | Client TUI only |
+
+**Future implementation:**
+- Use `notify` crate to watch config file for changes
+- Debounce events (500ms) to avoid rapid reloads
+- Validate new config before applying
+- Log config reload events
+
+### Configuration Validation
+
+All config files are validated on load with helpful error messages:
+
+```rust
+// Example validation
+fn validate_config(config: &Config) -> Result<(), ConfigError> {
+    if config.limits.max_clients == 0 {
+        return Err(ConfigError::InvalidValue {
+            field: "limits.max_clients",
+            value: "0",
+            reason: "Must be greater than 0",
+        });
+    }
+    
+    if config.connection.reconnect.max_attempts > 10 {
+        warn!("High reconnection attempts may cause connection storms");
+    }
+    
+    Ok(())
+}
+```
+
+**Validation errors include:**
+- Line numbers for TOML parse errors
+- Field path for invalid values
+- Suggested fixes where possible
+
+### Configuration Migration
+
+When config format changes between versions:
+
+1. **Semantic versioning for config:** Config version matches app version
+2. **Automatic migration:** On load, detect old format and migrate in-memory
+3. **Backup:** Save old config as `config.toml.backup.YYYYMMDD`
+4. **Notification:** Log message about migration
+
+```rust
+// Migration example
+if config.version == "0.1.0" {
+    // Migrate old "reconnect_attempts" to new nested format
+    if let Some(old) = config.connection.reconnect_attempts {
+        config.connection.reconnect.max_attempts = old;
+    }
+    config.version = CURRENT_VERSION;
+}
+```
+
+### Implementation Roadmap
+
+#### Phase 1: Core Configuration System
+- [ ] Add `config` crate dependency (with toml feature)
+- [ ] Create `Config` structs for broker and client with serde derives
+- [ ] Implement config file discovery (platform paths via `dirs`)
+- [ ] Implement layered loading (defaults → file → env → CLI)
+- [ ] Add config validation framework
+- [ ] Create default config files with comments
+
+#### Phase 2: Integration
+- [x] Broker: Load config on startup, replace hardcoded values
+- [x] Client: Load config on startup, use as defaults for CLI args
+- [x] Update CLI argument parsing to use config as defaults
+- [x] Add `--config <path>` CLI flag to both binaries
+- [x] Add `--dump-config` flag to print effective config
+
+#### Phase 3: Hot-Reload (Deferred to Future)
+- [ ] ~~Implement file watching with `notify` crate~~ - Deferred
+- [ ] ~~Add debouncing for config changes~~ - Deferred
+- [ ] ~~Implement hot-reload for logging level~~ - Deferred
+- [ ] ~~Implement hot-reload for UI settings (TUI theme, etc.)~~ - Deferred
+- [ ] ~~Log config reload events~~ - Deferred
+
+#### Phase 4: Environment Variables
+- [x] Implement env var prefix parsing (`RUSTYNAUT_*`)
+- [ ] Support nested keys via separator
+- [ ] Document all env vars in help text
+- [ ] Add example `.env` file to repository
+
+#### Phase 5: Migration & Polish
+- [x] Add config version field
+- [x] Implement migration framework
+- [ ] Create comprehensive config documentation
+- [ ] Add config validation tests
+- [ ] Create example configs for common scenarios
+
+### Configuration File Templates
+
+**Development broker (`broker.dev.toml`):**
+```toml
+[server]
+bind_address = "127.0.0.1:4242"
+tls_enabled = false
+
+[logging]
+level = "debug"
+format = "pretty"
+
+[features]
+rooms_enabled = true
+```
+
+**Production broker (`broker.prod.toml`):**
+```toml
+[server]
+bind_address = "0.0.0.0:4242"
+tls_enabled = true
+
+[limits]
+max_clients = 500
+rate_limit_messages_per_second = 20
+
+[logging]
+level = "info"
+format = "json"
+output = "/var/log/rustynaut/broker.log"
+```
+
+**VM client (`client.vm.toml`):**
+```toml
+[connection]
+broker_address = "192.168.1.100:4242"
+default_username = "vm-guest"
+
+[connection.reconnect]
+enabled = true
+max_attempts = 5
+
+[clipboard]
+file_detection = true
+auto_offer_files = true
+
+[ui]
+show_timestamps = false  # Cleaner output for automation
+```
+
+### Open Questions
+
+1. **Config encryption?** Should sensitive values (tokens) be encryptable?
+2. **Remote config?** Support fetching config from URL (for fleet management)?
+3. **Config UI?** TUI command to edit config interactively (`/config`)?
+4. **Per-room config?** Different settings per room (rate limits, features)?
+5. **Config overrides?** Support `.rustynaut.toml` in current directory (git-style)?
+
