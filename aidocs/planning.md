@@ -6,6 +6,24 @@ Rustynaut is a cross-platform clipboard sharing application with room-based pub/
 
 ---
 
+## Next Improvements (High Priority)
+
+Quick wins and bug fixes to pick up next:
+
+- [ ] **Command field cursor** - Show a blinking cursor in the input field for better UX
+- [ ] **Fix 'Y' key in command field** - Currently 'Y' is locked for "Yank" (copy), but should allow typing 'Y'/'y' when no message is selected
+- [ ] **Re-enable echo of own /SAY messages** - Show your own chat messages in the TUI after sending
+- [ ] **TUI code refactor** - Extract duplicated TUI components (message types, text selection, input handling, completion, rendering) to shared module in `common/`
+  - Broker TUI (`broker/src/tui.rs`) and client TUI (`client/src/tui.rs`) have significant duplication
+  - Create `common/src/tui/` module with shared types and utilities
+  - Keep broker TUI lightweight (no clipboard), client TUI includes full clipboard integration
+- [ ] **Auto-scroll in TUI** - Ensure messages auto-scroll to bottom when new content arrives
+  - Should auto-scroll when user is already at the bottom
+  - Should NOT auto-scroll if user has scrolled up to read history
+  - Maybe add a visual indicator when scrolled up (e.g., "New messages below" or arrow)
+
+---
+
 ## Remaining Improvements
 
 ### File Transfers
@@ -29,6 +47,20 @@ Rustynaut is a cross-platform clipboard sharing application with room-based pub/
 - [ ] Tab completion for usernames (in `/accept`)
 - [ ] Tab completion for room names (in `/join`)
 - [ ] Tab completion for filenames (in `/accept <user>`)
+- [ ] **Recent File Offers Popup** - Show last N file offers per active client in room
+  - Use same modal popup as tab completions
+  - Configurable: 3-5 offers per client (default: 3)
+  - Only show offers from clients currently active in the room
+  - Broker stores offers in Shared state (per-client ring buffer)
+  - Keybinding to open popup (e.g., `Ctrl+O` or `/offers` command)
+  - Click or navigate to select and accept an offer directly
+  - Prevents accidental over-shadowing of offers by newer ones
+- [ ] **Clipboard History** - Access previous clipboard entries
+  - Same popup concept as file offers
+  - Configurable: 3-5 recent clips (default: 3)
+  - Broker stores last N clips per room (or per client)
+  - Keybinding to cycle through history (e.g., `Ctrl+Shift+V` or `/clips` command)
+  - Prevents losing clipboard content when new copy over-shadows
 - [ ] Click-and-drag text selection
 - [ ] Multi-message selection
 - [ ] Copy format options

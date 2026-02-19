@@ -722,7 +722,16 @@ async fn run_tui_loop(
                                 app.should_quit = true;
                             }
                             crossterm::event::KeyCode::Char('y') => {
-                                app.copy_selected_message();
+                                // Only copy if there's an actual selection, otherwise type 'y'
+                                if app.text_selection.is_some() {
+                                    app.copy_selected_message();
+                                } else if let Some(cmd) = app.handle_input('y') {
+                                    if cmd == "/quit" || cmd == "/exit" {
+                                        app.should_quit = true;
+                                    } else if let Err(e) = process_command(cmd, net_tx_opt.as_ref()).await {
+                                        app.add_error(format!("Failed to send: {}", e));
+                                    }
+                                }
                             }
                             crossterm::event::KeyCode::Char(c) => {
                                 if !app.current_completions.is_empty() {
