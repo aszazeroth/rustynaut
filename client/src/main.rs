@@ -9,8 +9,9 @@ mod clipboard_files;
 mod tls;
 mod tui;
 mod completion;
+mod reconnect;
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, broadcast};
 use tokio::time::{self, Duration};
 
 use std::collections::HashMap;
@@ -21,8 +22,10 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::exit;
 
+use rustynaut_common::config::{ClientConfig, ConfigLoader};
 use rustynaut_common::constants::{FILE_CHUNK_SIZE, MAX_LINE_LENGTH};
 use rustynaut_common::utils::{decode_base64, encode_base64};
+use reconnect::{ConnectionState, DisconnectReason, ReconnectContext, ReconnectionManager};
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -155,6 +158,7 @@ const BANNER: &str = concat!(
 );
 
 /// Parsed command-line arguments
+#[allow(dead_code)]
 struct Args {
     verbose: bool,
     addr: SocketAddr,
@@ -162,12 +166,16 @@ struct Args {
     room: String,
     enroll_token: Option<String>,
     cert_dir: PathBuf,
+    config_path: Option<String>,
+    dump_config: bool,
 }
 
-fn parse_args() -> Result<Args, Box<dyn Error>> {
+fn parse_args() -> Result<(Args, ClientConfig), Box<dyn Error>> {
     let mut verbose = false;
     let mut enroll_token: Option<String> = None;
     let mut cert_dir: Option<PathBuf> = None;
+    let mut config_path: Option<String> = None;
+    let mut dump_config = false;
     let mut positional = Vec::new();
 
     let mut args_iter = env::args().skip(1).peekable();
@@ -189,6 +197,14 @@ fn parse_args() -> Result<Args, Box<dyn Error>> {
                         .ok_or("--cert-dir requires a path argument")?,
                 ));
             }
+            "--config" | "-c" => {
+                config_path = Some(
+                    args_iter
+                        .next()
+                        .ok_or("--config requires a path argument")?,
+                );
+            }
+            "--dump-config" => dump_config = true,
             "--help" | "-h" => {
                 eprintln!("usage: client [OPTIONS] <addr> [username] [room]");
                 eprintln!();
@@ -197,6 +213,8 @@ fn parse_args() -> Result<Args, Box<dyn Error>> {
                 eprintln!("  --enroll <TOKEN>        Enroll with broker using token");
                 eprintln!("  --cert-dir <PATH>       Certificate directory");
                 eprintln!("                          (default: ~/.config/rustynaut/client)");
+                eprintln!("  --config, -c <PATH>    Config file path");
+                eprintln!("  --dump-config           Print effective config and exit");
                 std::process::exit(0);
             }
             _ if arg.starts_with('-') => {
@@ -206,31 +224,138 @@ fn parse_args() -> Result<Args, Box<dyn Error>> {
         }
     }
 
+    // Load configuration (file + env vars)
+    let config = ConfigLoader::load_client_config(config_path.as_deref())?;
+
+    // Handle --dump-config before requiring addr
+    if dump_config {
+        let toml = ConfigLoader::client_to_toml_string(&config)?;
+        println!("{}", toml);
+        std::process::exit(0);
+    }
+
     let addr = positional
         .first()
+        .map(|s| s.as_str())
+        .or(config.connection.broker_address.as_deref())
         .ok_or("usage: client [OPTIONS] <addr> [username] [room]")?
         .parse::<SocketAddr>()?;
 
-    let username = positional.get(1).cloned().unwrap_or_else(default_username);
+    let username = positional
+        .get(1)
+        .cloned()
+        .or_else(|| config.connection.default_username.clone())
+        .unwrap_or_else(default_username);
     let room = positional
         .get(2)
         .cloned()
+        .or_else(|| config.connection.default_room.clone())
         .unwrap_or_else(|| "lobby".to_string());
 
-    Ok(Args {
+    // CLI cert_dir overrides config
+    let cert_dir = cert_dir.unwrap_or(config.connection.tls.cert_dir.clone());
+
+    // CLI verbose overrides config logging level
+    let verbose = verbose || config.logging.level == "debug" || config.logging.level == "trace";
+
+    let args = Args {
         verbose,
         addr,
         username,
         room,
         enroll_token,
-        cert_dir: cert_dir.unwrap_or_else(rustynaut_common::tls::default_client_cert_dir),
-    })
+        cert_dir,
+        config_path,
+        dump_config,
+    };
+
+    Ok((args, config))
+}
+
+/// Spawn a new network connection task
+fn spawn_network_connection(
+    addr: SocketAddr,
+    tls_config: tls::TlsClientConfig,
+    ui_tx: mpsc::Sender<tui::Message>,
+    conn_status_tx: broadcast::Sender<ConnectionState>,
+    verbose: bool,
+    mut net_rx: mpsc::Receiver<String>,
+) {
+    tokio::spawn(async move {
+        use futures::{SinkExt, StreamExt};
+        use tokio::net::TcpStream;
+        use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec};
+
+        let tcp_stream = match TcpStream::connect(addr).await {
+            Ok(s) => s,
+            Err(_) => {
+                let _ = conn_status_tx.send(ConnectionState::Disconnected);
+                return;
+            }
+        };
+
+        let host = addr.ip().to_string();
+        let tls_stream = match tls::connect_tls(&tls_config.connector, tcp_stream, &host, false).await {
+            Ok(s) => s,
+            Err(_) => {
+                let _ = conn_status_tx.send(ConnectionState::Disconnected);
+                return;
+            }
+        };
+
+        let (r, w) = tokio::io::split(tls_stream);
+        let mut sink = FramedWrite::new(w, LinesCodec::new_with_max_length(MAX_LINE_LENGTH));
+        let mut stream_reader = FramedRead::new(
+            r,
+            LinesCodec::new_with_max_length(MAX_LINE_LENGTH),
+        );
+
+        // Notify that we're connected
+        let _ = conn_status_tx.send(ConnectionState::Connected);
+
+        loop {
+            tokio::select! {
+                msg = stream_reader.next() => {
+                    match msg {
+                        Some(Ok(message)) => {
+                            if let Err(e) = tcp::handle_message(&message, &ui_tx, verbose).await {
+                                let _ = ui_tx.send(tui::Message::Error { text: format!("Error handling message: {}", e), timestamp: std::time::SystemTime::now() }).await;
+                            }
+                        }
+                        Some(Err(e)) => {
+                            let _ = ui_tx.send(tui::Message::Error { text: format!("Read error: {}", e), timestamp: std::time::SystemTime::now() }).await;
+                            break;
+                        }
+                        None => {
+                            let _ = ui_tx.send(tui::Message::Info { text: "Connection closed".to_string(), timestamp: std::time::SystemTime::now() }).await;
+                            break;
+                        }
+                    }
+                }
+                msg = net_rx.recv() => {
+                    match msg {
+                        Some(line) => {
+                            if let Err(e) = sink.send(&line).await {
+                                let _ = ui_tx.send(tui::Message::Error { text: format!("Write error: {}", e), timestamp: std::time::SystemTime::now() }).await;
+                                break;
+                            }
+                        }
+                        None => {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        let _ = conn_status_tx.send(ConnectionState::Disconnected);
+    });
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     // Parse args first (before TUI setup)
-    let args = parse_args()?;
+    let (args, _config) = parse_args()?;
 
     // Handle enrollment if requested (before TUI)
     if let Some(ref token) = args.enroll_token {
@@ -259,21 +384,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // Add initial messages
     app.add_info("Welcome to Rustynaut!");
     app.add_info(format!("Connecting to {} as {}...", args.addr, args.username));
-    app.add_info("Click a message to select it, press 'y' to copy, ESC to deselect");
+    app.add_info("Click/drag messages to select, drag in input to select text, 'y' to copy, ESC to deselect");
 
-    // Channels for communication between TUI and network
-    let (net_tx, net_rx) = mpsc::channel::<String>(100);
+    // UI channel for receiving messages from network
     let (ui_tx, ui_rx) = mpsc::channel::<tui::Message>(100);
+    
+    // Channel for connection status (for reconnection handling)
+    let (conn_status_tx, conn_status_rx) = broadcast::channel::<ConnectionState>(1);
 
-    // Store net_tx globally so message handlers can send file chunks
-    if let Ok(mut guard) = FILE_TX.lock() {
-        *guard = Some(net_tx.clone());
-    }
+    // Channel for clipboard to send messages to network (TUI loop forwards)
+    let (clipboard_tx, clipboard_rx) = mpsc::channel::<String>(100);
 
     // Clone for clipboard task
     let room_for_clipboard = args.room.clone();
-    let _verbose_for_clipboard = args.verbose;
-    let clipboard_tx = net_tx.clone();
+    let clipboard_tx_clone = clipboard_tx.clone();
 
     // Spawn clipboard monitoring task
     tokio::spawn(async move {
@@ -318,7 +442,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 let offer_msg = format!(
                                     "FILE_OFFER {room_for_clipboard} {filename_b64} {size}"
                                 );
-                                if clipboard_tx.send(offer_msg).await.is_err() {
+                                if clipboard_tx_clone.send(offer_msg).await.is_err() {
                                     break;
                                 }
                             }
@@ -380,7 +504,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
                         let offer_msg =
                             format!("FILE_OFFER {room_for_clipboard} {filename_b64} {size}");
-                        if clipboard_tx.send(offer_msg).await.is_err() {
+                        if clipboard_tx_clone.send(offer_msg).await.is_err() {
                             break;
                         }
 
@@ -390,7 +514,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 }
 
                 let encoded = encode_base64(&current_content);
-                if clipboard_tx
+                if clipboard_tx_clone
                     .send(format!("CLIP {room_for_clipboard} {encoded}"))
                     .await
                     .is_err()
@@ -402,42 +526,29 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     });
 
-    // Send initial USER and JOIN
-    if net_tx
-        .send(format!("USER {}", args.username))
-        .await
-        .is_err()
-    {
-        app.add_error("Failed to send USER command");
-    }
-    if net_tx
-        .send(format!("JOIN {}", args.room))
-        .await
-        .is_err()
-    {
-        app.add_error("Failed to send JOIN command");
-    }
+    // Get TLS config for connections
+    let tls_config = tls::init_tls_with_client_cert(&args.cert_dir)
+        .map_err(|e| -> Box<dyn Error> { e })?;
 
-    // Spawn network connection task
-    let addr = args.addr;
-    let cert_dir = args.cert_dir.clone();
-    let verbose = args.verbose;
-    
-    tokio::spawn(async move {
-        match tls::init_tls_with_client_cert(&cert_dir) {
-            Ok(tls_config) => {
-                if let Err(e) = tls_transport::connect_with_channels(&addr, &tls_config, net_rx, ui_tx, verbose).await {
-                    eprintln!("TLS connection error: {}", e);
-                }
-            }
-            Err(e) => {
-                eprintln!("TLS init error: {}", e);
-            }
-        }
-    });
+    // Pass config and ui_tx to TUI loop
+    let config = _config;
 
-    // Main TUI event loop
-    let result = run_tui_loop(&mut terminal, &mut app, net_tx, ui_rx).await;
+    // Main TUI event loop - handles connection, reconnection, and UI
+    let result = run_tui_loop(
+        &mut terminal,
+        &mut app,
+        ui_tx,
+        ui_rx,
+        conn_status_tx,
+        conn_status_rx,
+        clipboard_rx,
+        config,
+        args.addr,
+        tls_config,
+        args.username.clone(),
+        args.room.clone(),
+        args.verbose,
+    ).await;
 
     // Restore terminal
     tui::restore_terminal()?;
@@ -445,15 +556,61 @@ async fn main() -> Result<(), Box<dyn Error>> {
     result
 }
 
-/// Main TUI event loop
+/// Main TUI event loop with reconnection support
 async fn run_tui_loop(
     terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
     app: &mut tui::App,
-    net_tx: mpsc::Sender<String>,
+    ui_tx: mpsc::Sender<tui::Message>,
     mut ui_rx: mpsc::Receiver<tui::Message>,
+    conn_status_tx: broadcast::Sender<ConnectionState>,
+    mut conn_status_rx: broadcast::Receiver<ConnectionState>,
+    mut clipboard_rx: mpsc::Receiver<String>,
+    config: ClientConfig,
+    broker_addr: SocketAddr,
+    tls_config: tls::TlsClientConfig,
+    username: String,
+    room: String,
+    verbose: bool,
 ) -> Result<(), Box<dyn Error>> {
     let mut last_tick = tokio::time::Instant::now();
     let tick_rate = tokio::time::Duration::from_millis(100);
+
+    // Connection state - channels for network communication
+    let (net_tx, net_rx) = mpsc::channel::<String>(100);
+    let mut net_tx_opt: Option<mpsc::Sender<String>> = Some(net_tx.clone());
+
+    // Store net_tx globally so message handlers can send file chunks
+    if let Ok(mut guard) = FILE_TX.lock() {
+        *guard = Some(net_tx.clone());
+    }
+
+    let (reconnect_trigger_tx, mut reconnect_trigger_rx) = mpsc::channel::<()>(1);
+    let mut reconnect_scheduled = false;
+    
+    // Reconnection manager
+    let reconnect_config = config.connection.reconnect.clone();
+    let reconnect_ctx = ReconnectContext {
+        broker_addr: broker_addr.to_string(),
+        username: username.clone(),
+        room: room.clone(),
+    };
+    let mut reconnect_mgr = ReconnectionManager::new(reconnect_config, reconnect_ctx);
+
+    // Spawn initial network connection
+    spawn_network_connection(
+        broker_addr,
+        tls_config.clone(),
+        ui_tx.clone(),
+        conn_status_tx.clone(),
+        verbose,
+        net_rx,
+    );
+
+    // Send initial USER and JOIN
+    if let Some(ref tx) = net_tx_opt {
+        let _ = tx.send(format!("USER {}", username)).await;
+        let _ = tx.send(format!("JOIN {}", room)).await;
+    }
 
     loop {
         // Draw UI
@@ -473,6 +630,86 @@ async fn run_tui_loop(
             }
         }
 
+        // Forward clipboard updates to the network
+        while let Ok(msg) = clipboard_rx.try_recv() {
+            if let Some(ref tx) = net_tx_opt {
+                let _ = tx.send(msg).await;
+            }
+        }
+
+        // Check for connection status changes
+        let mut reconnected = false;
+        while let Ok(state) = conn_status_rx.try_recv() {
+            match state {
+                ConnectionState::Disconnected => {
+                    app.add_info("Disconnected from broker");
+                    let should_reconnect = reconnect_mgr.should_reconnect(DisconnectReason::NetworkError);
+                    reconnect_mgr.set_disconnected();
+
+                    if should_reconnect && !reconnect_scheduled {
+                        let delay = reconnect_mgr.start_backoff();
+                        reconnect_scheduled = true;
+                        let _ = conn_status_tx.send(ConnectionState::Reconnecting);
+                        app.add_info(format!(
+                            "Reconnecting in {}s... (attempt {}/{})",
+                            delay.as_secs(),
+                            reconnect_mgr.attempt(),
+                            reconnect_mgr.max_attempts()
+                        ));
+
+                        let reconnect_trigger_tx = reconnect_trigger_tx.clone();
+                        tokio::spawn(async move {
+                            time::sleep(delay).await;
+                            let _ = reconnect_trigger_tx.send(()).await;
+                        });
+                    } else if reconnect_mgr.attempt() >= reconnect_mgr.max_attempts() {
+                        app.add_info("Reconnection failed. Press Enter to retry, Ctrl+C to exit");
+                    }
+                }
+                ConnectionState::Connected => {
+                    app.add_info("Reconnected to broker");
+                    reconnect_mgr.set_connected();
+                    reconnect_scheduled = false;
+                    reconnected = true;
+                }
+                ConnectionState::Reconnecting => {
+                    app.add_info("Attempting to reconnect...");
+                }
+            }
+        }
+
+        // If we just reconnected, re-send USER and JOIN
+        if reconnected {
+            if let Some(ref tx) = net_tx_opt {
+                let _ = tx.send(format!("USER {}", username)).await;
+                let _ = tx.send(format!("JOIN {}", room)).await;
+            }
+        }
+
+        // Execute a scheduled reconnect without blocking the UI
+        while reconnect_trigger_rx.try_recv().is_ok() {
+            reconnect_scheduled = false;
+
+            let (new_tx, new_rx) = mpsc::channel::<String>(100);
+            net_tx_opt = Some(new_tx.clone());
+
+            if let Ok(mut guard) = FILE_TX.lock() {
+                *guard = Some(new_tx.clone());
+            }
+
+            spawn_network_connection(
+                broker_addr,
+                tls_config.clone(),
+                ui_tx.clone(),
+                conn_status_tx.clone(),
+                verbose,
+                new_rx,
+            );
+
+            let _ = new_tx.send(format!("USER {}", username)).await;
+            let _ = new_tx.send(format!("JOIN {}", room)).await;
+        }
+
         // Poll for events with timeout
         if crossterm::event::poll(std::time::Duration::from_millis(10))? {
             match crossterm::event::read()? {
@@ -485,66 +722,87 @@ async fn run_tui_loop(
                                 app.should_quit = true;
                             }
                             crossterm::event::KeyCode::Char('y') => {
-                                // Copy selected message to clipboard
-                                app.copy_selected_message();
+                                // Only copy if there's an actual selection, otherwise type 'y'
+                                if app.text_selection.is_some() {
+                                    app.copy_selected_message();
+                                } else if let Some(cmd) = app.handle_input('y') {
+                                    if cmd == "/quit" || cmd == "/exit" {
+                                        app.should_quit = true;
+                                    } else if let Err(e) = process_command(cmd, net_tx_opt.as_ref()).await {
+                                        app.add_error(format!("Failed to send: {}", e));
+                                    }
+                                }
                             }
                             crossterm::event::KeyCode::Char(c) => {
-                                // Cancel completions when typing
                                 if !app.current_completions.is_empty() {
                                     app.cancel_completion();
                                 }
                                 if let Some(cmd) = app.handle_input(c) {
-                                    // Process command
                                     if cmd == "/quit" || cmd == "/exit" {
                                         app.should_quit = true;
-                                    } else if let Err(e) = process_command(cmd, &net_tx).await {
+                                    } else if let Err(e) = process_command(cmd, net_tx_opt.as_ref()).await {
                                         app.add_error(format!("Failed to send: {}", e));
                                     }
                                 }
                             }
                             crossterm::event::KeyCode::Backspace => app.handle_backspace(),
-                            crossterm::event::KeyCode::Delete => app.handle_delete(),
                             crossterm::event::KeyCode::Left => app.cursor_left(),
                             crossterm::event::KeyCode::Right => app.cursor_right(),
-                            crossterm::event::KeyCode::Home => app.cursor_home(),
-                            crossterm::event::KeyCode::End => app.cursor_end(),
-                            crossterm::event::KeyCode::Up => app.history_previous(),
-                            crossterm::event::KeyCode::Down => app.history_next(),
-                            crossterm::event::KeyCode::PageUp => {
-                                for _ in 0..5 {
-                                    app.scroll_up();
+                            crossterm::event::KeyCode::Up => {
+                                if !app.current_completions.is_empty() {
+                                    app.handle_tab();
+                                } else {
+                                    app.history_previous();
                                 }
                             }
-                            crossterm::event::KeyCode::PageDown => {
-                                for _ in 0..5 {
-                                    app.scroll_down();
+                            crossterm::event::KeyCode::Down => {
+                                if !app.current_completions.is_empty() {
+                                    app.handle_tab();
+                                } else {
+                                    app.history_next();
                                 }
                             }
                             crossterm::event::KeyCode::Tab => {
-                                // Tab completion
                                 app.handle_tab();
                             }
                             crossterm::event::KeyCode::Enter => {
-                                if !app.current_completions.is_empty() {
+                                if app.input.is_empty()
+                                    && reconnect_mgr.state() == ConnectionState::Disconnected
+                                    && reconnect_mgr.attempt() >= reconnect_mgr.max_attempts()
+                                    && !reconnect_scheduled
+                                {
+                                    reconnect_mgr.reset();
+                                    let delay = reconnect_mgr.start_backoff();
+                                    reconnect_scheduled = true;
+                                    let _ = conn_status_tx.send(ConnectionState::Reconnecting);
+                                    app.add_info(format!(
+                                        "Reconnecting in {}s... (attempt {}/{})",
+                                        delay.as_secs(),
+                                        reconnect_mgr.attempt(),
+                                        reconnect_mgr.max_attempts()
+                                    ));
+
+                                    let reconnect_trigger_tx = reconnect_trigger_tx.clone();
+                                    tokio::spawn(async move {
+                                        time::sleep(delay).await;
+                                        let _ = reconnect_trigger_tx.send(()).await;
+                                    });
+                                } else if !app.current_completions.is_empty() {
                                     app.apply_completion();
                                 } else if let Some(cmd) = app.handle_input('\n') {
-                                    // Process command
                                     if cmd == "/quit" || cmd == "/exit" {
                                         app.should_quit = true;
-                                    } else if let Err(e) = process_command(cmd, &net_tx).await {
+                                    } else if let Err(e) = process_command(cmd, net_tx_opt.as_ref()).await {
                                         app.add_error(format!("Failed to send: {}", e));
                                     }
                                 }
                             }
                             crossterm::event::KeyCode::F(1) => app.toggle_sidebar(),
                             crossterm::event::KeyCode::Esc => {
-                                if app.selected_message_index.is_some() {
-                                    // Clear message selection first
-                                    app.clear_selection();
+                                if app.text_selection.is_some() {
+                                    app.clear_text_selection();
                                 } else if !app.current_completions.is_empty() {
                                     app.cancel_completion();
-                                } else {
-                                    app.should_quit = true;
                                 }
                             }
                             _ => {}
@@ -552,9 +810,19 @@ async fn run_tui_loop(
                     }
                 }
                 crossterm::event::Event::Mouse(mouse_event) => {
-                    if let crossterm::event::MouseEventKind::Down(_) = mouse_event.kind {
-                        // Handle mouse click in message area
-                        app.handle_mouse_click(mouse_event.row);
+                    match mouse_event.kind {
+                        crossterm::event::MouseEventKind::Down(button) => {
+                            if button == crossterm::event::MouseButton::Left {
+                                app.start_selection_drag(mouse_event.row, mouse_event.column);
+                            }
+                        }
+                        crossterm::event::MouseEventKind::Drag(_button) => {
+                            app.update_selection_drag(mouse_event.row, mouse_event.column);
+                        }
+                        crossterm::event::MouseEventKind::Up(_button) => {
+                            app.end_selection_drag();
+                        }
+                        _ => {}
                     }
                 }
                 _ => {}
@@ -566,6 +834,7 @@ async fn run_tui_loop(
         }
 
         if app.should_quit {
+            let _ = conn_status_tx.send(ConnectionState::Disconnected);
             break;
         }
     }
@@ -574,14 +843,18 @@ async fn run_tui_loop(
 }
 
 /// Process a user command and send to network
-async fn process_command(cmd: String, net_tx: &mpsc::Sender<String>) -> Result<(), Box<dyn Error>> {
+async fn process_command(cmd: String, net_tx: Option<&mpsc::Sender<String>>) -> Result<(), Box<dyn Error>> {
     let message = if cmd.starts_with('/') {
         format!("CMD {}", cmd)
     } else {
         format!("SAY {}", cmd)
     };
     
-    net_tx.send(message).await.map_err(|e| e.into())
+    if let Some(tx) = net_tx {
+        tx.send(message).await.map_err(|e| e.into())
+    } else {
+        Err("Not connected".into())
+    }
 }
 
 /// Enroll with the broker to obtain client certificates
@@ -821,6 +1094,7 @@ mod tcp {
     use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec, LinesCodecError};
 
     /// Connect using channels for TUI integration
+    #[allow(dead_code)]
     pub async fn connect_with_channels(
         addr: &SocketAddr,
         mut net_rx: mpsc::Receiver<String>,

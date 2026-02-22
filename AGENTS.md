@@ -1,59 +1,59 @@
 # AGENTS.md - Rustynaut Developer Guide
 
-## Please use ENGLISH as the communication language as the code is written in ENGLISH
+## Communication Language
+
+Please use **ENGLISH** for all communication as the codebase is written in ENGLISH.
 
 ## Project Overview
 
-Rustynaut is a cross-platform clipboard sharing application with a broker (server) and CLI client, written in Rust using Tokio. Features TLS/mTLS encryption, room-based pub/sub, and file transfers.
+Rustynaut is a cross-platform clipboard sharing application with a broker (server) and CLI client, written in Rust using Tokio. Features TLS/mTLS encryption, room-based pub/sub, file transfers, and TUI interface.
 
-- **broker/** - Tokio-based chat/clipboard server
-- **client/** - CLI clipboard sync client
-- Each crate is isolated (no workspace); run commands from respective directories
+- **broker/** - Tokio-based chat/clipboard server with TUI
+- **client/** - CLI clipboard sync client with TUI
+- **common/** - Shared library crate (protocol, TLS, config, utilities)
+- Workspace root uses Cargo workspace with shared dependencies
 
 ## Build Commands
 
 ```bash
-# Build both components
-cd broker && cargo build --release
-cd client && cargo build --release
+# Build all components (from workspace root)
+cargo build --release
 
-# Run in development (TLS required)
-cd broker && cargo run -- 0.0.0.0:4242
-cd client && cargo run -- 127.0.0.1:4242 alice lobby
+# Run broker
+cd broker && cargo run --release -- 0.0.0.0:4242
 
-# Enroll first-time clients
-cd client && cargo run -- --enroll <TOKEN> <broker_addr> <username>
+# Run client
+cd client && cargo run --release -- 192.168.1.100:4242 alice lobby
+
+# Enroll first-time client
+cd client && cargo run --release -- --enroll <TOKEN> <broker_addr> <username>
 ```
 
 ## Lint & Format
 
 ```bash
-# Run clippy in each crate directory (REQUIRED before committing)
-cd broker && cargo clippy
-cd client && cargo clippy
+# Run clippy on entire workspace (REQUIRED before committing)
+cargo clippy --workspace
+
+# Review all warnings - DO NOT add allow directives to skip them
+# allow(dead_code) is OK for future implementations only
 
 # Format code
-cd broker && cargo fmt
-cd client && cargo fmt
+cargo fmt --all
 ```
 
 ## Test Commands
 
 ```bash
 # Run all tests
-cargo test
-
-# Run a single test
-cargo test test_parse_user_valid
+cargo test --workspace
 
 # Run tests with output
-cargo test -- --nocapture
+cargo test --workspace -- --nocapture
 
-# Run with tokio (async tests use #[tokio::test])
-cargo test
+# Run specific test
+cargo test test_parse_user_valid --workspace
 ```
-
-Note: Tests are primarily unit tests for protocol parsing. Integration testing requires running broker + multiple clients manually.
 
 ## Code Style Guidelines
 
@@ -61,6 +61,7 @@ Note: Tests are primarily unit tests for protocol parsing. Integration testing r
 - Group: std lib → external crates → internal modules
 - Use `use crate::` for internal modules
 - Prefer explicit imports over wildcard `*`
+- In workspace: `use rustynaut_common::...` for shared types
 
 ### Formatting
 - 4 spaces indentation
@@ -98,11 +99,11 @@ Note: Tests are primarily unit tests for protocol parsing. Integration testing r
 ### Logging
 - Use `tracing` crate (already configured)
 - Levels: `trace!` (verbose), `debug!`, `info!`, `warn!`, `error!`
-- Keep stdout clean (banners print first)
-- Override with `RUST_LOG="chat=trace" cargo run`
+- Keep stdout clean (TUI handles display)
+- Override with `RUST_LOG="rustynaut=trace" cargo run`
 
 ### Security
-- TLS enabled by default
+- TLS enabled by default (--no-tls for dev only)
 - Use `rcgen` for certificate generation
 - Certificate storage via `dirs` crate (platform-appropriate)
 - Log certificate fingerprints for verification
@@ -118,9 +119,13 @@ const FILE_CHUNK_SIZE: usize = 64 * 1024;        // 64KB chunks
 
 ## Wire Protocol
 
-Client → Broker: `USER <name>`, `JOIN <room>`, `CLIP <room> <b64>`, `CMD /<cmd>`, `SAY <text>`, `ENROLL <token> <username>`
+**Client → Broker:**
+- `USER <name>`, `JOIN <room>`, `CLIP <room> <b64>`, `CMD /<cmd>`, `SAY <text>`, `ENROLL <token> <username>`
+- File transfer: `FILE_OFFER`, `FILE_ACCEPT`, `FILE_CHUNK`, `FILE_END`, `FILE_CANCEL`
 
-Broker → Client: `INFO <text>`, `ERR <text>`, `CLIP <room> <b64> <id>`, `SAY <user> <text>`, `ENROLLED <cert_b64> <key_b64> <ca_b64>`
+**Broker → Client:**
+- `INFO <text>`, `ERR <text>`, `CLIP <room> <b64> <id>`, `SAY <user> <text>`, `ENROLLED <cert_b64> <key_b64> <ca_b64>`
+- File transfer: `FILE_INCOMING`, `FILE_DONE`, `FILE_SENT`, `FILE_CANCELLED`
 
 ## Testing Notes
 
@@ -129,6 +134,7 @@ Broker → Client: `INFO <text>`, `ERR <text>`, `CLIP <room> <b64> <id>`, `SAY <
 - Test TLS enrollment flow end-to-end
 - Verify cross-platform clipboard sync
 - Check echo suppression (broker-side hash dedup + client-side tracking)
+- Test auto-reconnection: broker restart should trigger client reconnect
 
 ## Common Tasks
 
@@ -139,13 +145,16 @@ cd broker && cargo run --release -- --regenerate-token 0.0.0.0:4242
 # Enroll a new client
 cd client && cargo run --release -- --enroll <TOKEN> <broker_addr> <username>
 
-# Verbose logging
-cargo run --release -- --verbose 0.0.0.0:4242
+# Run with verbose logging
+RUST_LOG="rustynaut=trace" cargo run --release
+
+# Custom config file
+cargo run --release -- --config /path/to/config.toml
 ```
 
-## Dependencies
+## Workspace Dependencies
 
-Key crates used:
+Key crates (defined at workspace level):
 - `tokio` - Async runtime
 - `tokio-rustls` / `rustls` - TLS encryption
 - `rcgen` - Certificate generation
@@ -153,5 +162,29 @@ Key crates used:
 - `tracing` - Logging
 - `arboard` - Cross-platform clipboard
 - `dirs` - Platform config directories
+- `ratatui` / `tui-prompts` / `crossterm` - TUI framework
 - `base64` - Binary encoding
 - `sha2` / `ring` - Cryptography
+- `config` - Configuration management
+
+## Architecture Notes
+
+### Workspace Structure
+- `rustynaut-common`: Shared protocol, types, TLS utilities, config
+- `rustynaut-broker`: Server with rooms, file transfers, TUI
+- `rustynaut-client`: Client with clipboard sync, TUI, auto-reconnection
+
+### Key Features
+- **mTLS with auto-enrollment**: Token-based certificate generation
+- **Room-based pub/sub**: Scoped clipboard/file sharing per room
+- **File transfers**: Broker-mediated, chunked, SHA256 verified
+- **Auto-reconnection**: Exponential backoff for enrolled clients
+- **Configuration**: TOML-based with CLI/env overrides
+- **TUI**: Ratatui-based with text selection and copy support
+
+### Certificate Storage
+```
+~/.config/rustynaut/              # Linux
+~/Library/Application Support/rustynaut/  # macOS
+%APPDATA%\rustynaut\              # Windows
+```

@@ -12,6 +12,7 @@ use tokio_rustls::{client::TlsStream, TlsConnector};
 use rustynaut_common::tls::{cert_fingerprint, load_certs, load_private_key, EnrolledCertBundle};
 
 /// TLS configuration for the client
+#[derive(Clone)]
 pub struct TlsClientConfig {
     pub connector: TlsConnector,
 }

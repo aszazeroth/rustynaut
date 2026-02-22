@@ -110,6 +110,21 @@ impl Completer {
     }
 }
 
+/// Text selection state for click-and-drag (broker: visual only, no clipboard)
+#[derive(Clone, Debug)]
+pub struct TextSelection {
+    pub start: TextPosition,
+    pub end: TextPosition,
+    pub is_input_area: bool,
+}
+
+/// Position within text (message index, character offset)
+#[derive(Clone, Debug, Copy, PartialEq)]
+pub struct TextPosition {
+    pub message_index: usize,
+    pub char_offset: usize,
+}
+
 pub struct App {
     pub bind_addr: String,
     pub tls_enabled: bool,
@@ -132,6 +147,9 @@ pub struct App {
     completer: Completer,
     pub current_completions: Vec<Completion>,
     pub selected_completion: Option<usize>,
+
+    /// Text selection state for click-and-drag (for visual highlight, no clipboard)
+    pub text_selection: Option<TextSelection>,
 }
 
 impl App {
@@ -155,6 +173,7 @@ impl App {
             completer: Completer::new(),
             current_completions: Vec::new(),
             selected_completion: None,
+            text_selection: None,
         }
     }
 
@@ -187,6 +206,7 @@ impl App {
         });
     }
 
+    #[allow(dead_code)]
     pub fn add_error(&mut self, text: impl Into<String>) {
         self.add_message(Message::Error {
             text: text.into(),
@@ -459,6 +479,10 @@ impl App {
         self.show_sidebar = !self.show_sidebar;
     }
 
+    pub fn clear_text_selection(&mut self) {
+        self.text_selection = None;
+    }
+
     pub fn draw(&mut self, frame: &mut Frame<'_>) {
         let area = frame.area();
         self.terminal_height = area.height;
@@ -500,7 +524,7 @@ impl App {
             " ██████  ██   ██  ██████  ██   ██ ███████ ██   ██",
         ];
 
-        let meta_text = "https://github.com/aszazeroth/rustynaut";
+        let meta_text = " https://github.com/aszazeroth/rustynaut";
         let version_text = format!(" {}", BROKER_VERSION);
 
         let max_art_width = art.iter().map(|l| l.chars().count()).max().unwrap_or(0);
