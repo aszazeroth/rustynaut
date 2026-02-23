@@ -13,7 +13,7 @@ edition = "2021"
 [workspace.dependencies]
 arboard = "3"
 base64 = "0.22"
-toml = "0.8"
+toml = "1.0"
 serde = { version = "1", features = ["derive"] }
 thiserror = "1"
 crossterm = "0.29"
