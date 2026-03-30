@@ -23,7 +23,7 @@ ratatui = "0.30"
 ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
 rustls-pemfile = "2"
-sha2 = "0.10"
+sha2 = "0.11"
 tokio = { version = "1.36.0", features = ["full", "tracing"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 tokio-stream = "0.1.14"
