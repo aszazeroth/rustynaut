@@ -17,7 +17,6 @@ pub struct TlsClientConfig {
     pub connector: TlsConnector,
 }
 
-
 /// Check if client is enrolled (has valid certificates)
 pub fn is_enrolled(cert_dir: &Path) -> bool {
     let cert_path = cert_dir.join("client.crt");
