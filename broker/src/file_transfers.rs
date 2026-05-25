@@ -174,3 +174,125 @@ fn offer_key(room: &str, sender_username: &str, filename_b64: &str) -> OfferKey 
         filename_b64.to_string(),
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn addr(port: u16) -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], port))
+    }
+
+    #[test]
+    fn test_accept_offer_creates_active_transfer() {
+        let mut transfers = FileTransfers::new();
+        let sender = addr(10_001);
+        let acceptor = addr(10_002);
+
+        transfers.register_offer(sender, "alice", "lobby", "report.pdf", 12345);
+
+        assert_eq!(
+            transfers.accept_offer(acceptor, "lobby", "alice", "report.pdf"),
+            Some((1, sender))
+        );
+        assert_eq!(transfers.pending_offer_count(), 0);
+        assert_eq!(transfers.next_transfer_id(), 1);
+
+        let transfer = transfers.get_transfer(1).unwrap();
+        assert_eq!(transfer.sender, sender);
+        assert_eq!(transfer.sender_username, "alice");
+        assert_eq!(transfer.room, "lobby");
+        assert_eq!(transfer.filename_b64, "report.pdf");
+        assert_eq!(transfer.size, 12345);
+        assert_eq!(transfer.state, TransferState::Offered);
+        assert_eq!(transfer.acceptors.len(), 1);
+        assert!(transfer.acceptors.contains(&acceptor));
+    }
+
+    #[test]
+    fn test_accept_offer_adds_multiple_acceptors_to_existing_offered_transfer() {
+        let mut transfers = FileTransfers::new();
+        let sender = addr(10_011);
+        let first_acceptor = addr(10_012);
+        let second_acceptor = addr(10_013);
+
+        transfers.register_offer(sender, "alice", "lobby", "report.pdf", 12345);
+
+        assert_eq!(
+            transfers.accept_offer(first_acceptor, "lobby", "alice", "report.pdf"),
+            Some((1, sender))
+        );
+        assert_eq!(
+            transfers.accept_offer(second_acceptor, "lobby", "alice", "report.pdf"),
+            Some((1, sender))
+        );
+        assert_eq!(transfers.next_transfer_id(), 1);
+
+        let transfer = transfers.get_transfer(1).unwrap();
+        assert_eq!(transfer.acceptors.len(), 2);
+        assert!(transfer.acceptors.contains(&first_acceptor));
+        assert!(transfer.acceptors.contains(&second_acceptor));
+    }
+
+    #[test]
+    fn test_accept_offer_rejects_when_transfer_already_transferring() {
+        let mut transfers = FileTransfers::new();
+        let sender = addr(10_021);
+        let first_acceptor = addr(10_022);
+        let second_acceptor = addr(10_023);
+
+        transfers.register_offer(sender, "alice", "lobby", "report.pdf", 12345);
+        let (transfer_id, _) = transfers
+            .accept_offer(first_acceptor, "lobby", "alice", "report.pdf")
+            .unwrap();
+        transfers.get_transfer_mut(transfer_id).unwrap().state = TransferState::Transferring;
+
+        assert_eq!(
+            transfers.accept_offer(second_acceptor, "lobby", "alice", "report.pdf"),
+            None
+        );
+
+        let transfer = transfers.get_transfer(transfer_id).unwrap();
+        assert_eq!(transfer.acceptors.len(), 1);
+        assert!(transfer.acceptors.contains(&first_acceptor));
+        assert!(!transfer.acceptors.contains(&second_acceptor));
+    }
+
+    #[test]
+    fn test_find_latest_offer_filters_by_room_and_sender_and_returns_newest() {
+        let mut transfers = FileTransfers::new();
+
+        transfers.register_offer(addr(10_031), "alice", "lobby", "old.pdf", 1);
+        transfers.register_offer(addr(10_032), "alice", "dev", "other-room.pdf", 2);
+        transfers.register_offer(addr(10_033), "bob", "lobby", "other-user.pdf", 3);
+        transfers.register_offer(addr(10_034), "alice", "lobby", "new.pdf", 4);
+
+        assert_eq!(
+            transfers.find_latest_offer("lobby", "alice"),
+            Some("new.pdf".to_string())
+        );
+        assert_eq!(
+            transfers.find_latest_offer("dev", "alice"),
+            Some("other-room.pdf".to_string())
+        );
+        assert_eq!(transfers.find_latest_offer("missing", "alice"), None);
+        assert_eq!(transfers.find_latest_offer("lobby", "carol"), None);
+    }
+
+    #[test]
+    fn test_list_offers_filters_to_current_room() {
+        let mut transfers = FileTransfers::new();
+
+        transfers.register_offer(addr(10_041), "alice", "lobby", "report.pdf", 123);
+        transfers.register_offer(addr(10_042), "bob", "lobby", "notes.txt", 456);
+        transfers.register_offer(addr(10_043), "alice", "dev", "secret.pdf", 789);
+
+        let mut offers = transfers.list_offers("lobby");
+        offers.sort_unstable();
+
+        assert_eq!(
+            offers,
+            vec![("alice", "report.pdf", 123), ("bob", "notes.txt", 456)]
+        );
+    }
+}
