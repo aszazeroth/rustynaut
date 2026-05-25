@@ -15,16 +15,18 @@
 
 #![warn(rust_2018_idioms)]
 
+mod file_transfers;
 mod tls;
 mod tui;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::error::Error;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Instant, SystemTime};
+use std::time::SystemTime;
 
+use crate::file_transfers::{FileTransfers, TransferState};
 use futures::SinkExt;
 use rustynaut_common::config::{BrokerConfig, ConfigLoader};
 use rustynaut_common::constants::{MAX_FILE_SIZE, MAX_LINE_LENGTH, MAX_RECENT_CLIPS_PER_ROOM};
@@ -553,41 +555,6 @@ type Tx = mpsc::UnboundedSender<String>;
 /// Shorthand for the receive half of the message channel.
 type Rx = mpsc::UnboundedReceiver<String>;
 
-/// State of a file transfer
-#[derive(Debug, Clone, PartialEq)]
-enum TransferState {
-    /// Offer sent, waiting for acceptors
-    Offered,
-    /// Transfer in progress
-    Transferring,
-}
-
-/// A pending file offer (before any accepts)
-#[derive(Debug, Clone)]
-struct PendingOffer {
-    sender: SocketAddr,
-    sender_username: String,
-    room: String,
-    filename_b64: String,
-    size: u64,
-    created_at: Instant,
-}
-
-/// An active file transfer (after at least one accept)
-#[derive(Debug)]
-struct FileTransfer {
-    sender: SocketAddr,
-    sender_username: String,
-    room: String,
-    filename_b64: String,
-    size: u64,
-    acceptors: HashSet<SocketAddr>,
-    state: TransferState,
-}
-
-/// Unique key for a pending offer (room + sender + filename)
-type OfferKey = (String, String, String); // (room, sender_username, filename_b64)
-
 /// Data that is shared between all peers in the chat server.
 ///
 /// This is the set of `Tx` handles for all connected clients. Whenever a
@@ -601,12 +568,7 @@ struct Shared {
     recent_clips: HashMap<String, VecDeque<u64>>,
     /// Recent file offer hashes per room for deduplication (room -> recent hashes)
     recent_file_offers: HashMap<String, VecDeque<u64>>,
-    /// Pending file offers waiting for acceptors (key: room+sender+filename)
-    pending_offers: HashMap<OfferKey, PendingOffer>,
-    /// Active file transfers (key: transfer_id)
-    active_transfers: HashMap<u64, FileTransfer>,
-    /// Next transfer ID
-    next_transfer_id: u64,
+    file_transfers: FileTransfers,
 }
 
 #[derive(Clone)]
@@ -643,9 +605,7 @@ impl Shared {
             next_clip_id: 0,
             recent_clips: HashMap::new(),
             recent_file_offers: HashMap::new(),
-            pending_offers: HashMap::new(),
-            active_transfers: HashMap::new(),
-            next_transfer_id: 0,
+            file_transfers: FileTransfers::new(),
         }
     }
 
@@ -658,47 +618,19 @@ impl Shared {
         filename_b64: &str,
         size: u64,
     ) {
-        let key = (
-            room.to_string(),
-            sender_username.to_string(),
-            filename_b64.to_string(),
-        );
-        self.pending_offers.insert(
-            key,
-            PendingOffer {
-                sender,
-                sender_username: sender_username.to_string(),
-                room: room.to_string(),
-                filename_b64: filename_b64.to_string(),
-                size,
-                created_at: Instant::now(),
-            },
-        );
+        self.file_transfers
+            .register_offer(sender, sender_username, room, filename_b64, size);
     }
 
     /// Find the most recent offer from a user in a room
     /// Returns the filename_b64 of the offer if found
     fn find_latest_offer(&self, room: &str, sender_username: &str) -> Option<String> {
-        self.pending_offers
-            .values()
-            .filter(|offer| offer.room == room && offer.sender_username == sender_username)
-            .max_by_key(|offer| offer.created_at)
-            .map(|offer| offer.filename_b64.clone())
+        self.file_transfers.find_latest_offer(room, sender_username)
     }
 
     /// List all pending offers in a room (for /offers command)
     fn list_offers(&self, room: &str) -> Vec<(&str, &str, u64)> {
-        self.pending_offers
-            .values()
-            .filter(|offer| offer.room == room)
-            .map(|offer| {
-                (
-                    offer.sender_username.as_str(),
-                    offer.filename_b64.as_str(),
-                    offer.size,
-                )
-            })
-            .collect()
+        self.file_transfers.list_offers(room)
     }
 
     /// Accept a file offer and start a transfer
@@ -710,60 +642,26 @@ impl Shared {
         sender_username: &str,
         filename_b64: &str,
     ) -> Option<(u64, SocketAddr)> {
-        let key = (
-            room.to_string(),
-            sender_username.to_string(),
-            filename_b64.to_string(),
-        );
-
-        // Check if there's already an active transfer for this offer
-        for (tid, transfer) in &mut self.active_transfers {
-            if transfer.room == room
-                && transfer.sender_username == sender_username
-                && transfer.filename_b64 == filename_b64
-                && transfer.state == TransferState::Offered
-            {
-                // Add this acceptor to existing transfer
-                transfer.acceptors.insert(acceptor);
-                return Some((*tid, transfer.sender));
-            }
-        }
-
-        // Look for pending offer
-        if let Some(offer) = self.pending_offers.remove(&key) {
-            self.next_transfer_id += 1;
-            let transfer_id = self.next_transfer_id;
-
-            let mut acceptors = HashSet::new();
-            acceptors.insert(acceptor);
-
-            self.active_transfers.insert(
-                transfer_id,
-                FileTransfer {
-                    sender: offer.sender,
-                    sender_username: offer.sender_username,
-                    room: offer.room,
-                    filename_b64: offer.filename_b64,
-                    size: offer.size,
-                    acceptors,
-                    state: TransferState::Offered,
-                },
-            );
-
-            return Some((transfer_id, offer.sender));
-        }
-
-        None
+        self.file_transfers
+            .accept_offer(acceptor, room, sender_username, filename_b64)
     }
 
     /// Get transfer by ID
-    fn get_transfer(&self, transfer_id: u64) -> Option<&FileTransfer> {
-        self.active_transfers.get(&transfer_id)
+    fn get_transfer(&self, transfer_id: u64) -> Option<&file_transfers::FileTransfer> {
+        self.file_transfers.get_transfer(transfer_id)
     }
 
     /// Get mutable transfer by ID
-    fn get_transfer_mut(&mut self, transfer_id: u64) -> Option<&mut FileTransfer> {
-        self.active_transfers.get_mut(&transfer_id)
+    fn get_transfer_mut(&mut self, transfer_id: u64) -> Option<&mut file_transfers::FileTransfer> {
+        self.file_transfers.get_transfer_mut(transfer_id)
+    }
+
+    fn remove_transfer(&mut self, transfer_id: u64) -> Option<file_transfers::FileTransfer> {
+        self.file_transfers.remove_transfer(transfer_id)
+    }
+
+    fn insert_transfer(&mut self, transfer_id: u64, transfer: file_transfers::FileTransfer) {
+        self.file_transfers.insert_transfer(transfer_id, transfer);
     }
 
     /// Send a message to a specific peer
@@ -775,7 +673,7 @@ impl Shared {
 
     /// Send a message to all acceptors of a transfer
     fn send_to_acceptors(&self, transfer_id: u64, message: &str) {
-        if let Some(transfer) = self.active_transfers.get(&transfer_id) {
+        if let Some(transfer) = self.file_transfers.get_transfer(transfer_id) {
             for &acceptor in &transfer.acceptors {
                 self.send_to_peer(acceptor, message);
             }
@@ -1174,7 +1072,7 @@ where
                                 if let Ok(transfer_id) = rest.parse::<u64>() {
                                     let mut state = state.lock().await;
 
-                                    if let Some(transfer) = state.active_transfers.remove(&transfer_id) {
+                                    if let Some(transfer) = state.remove_transfer(transfer_id) {
                                         // Notify all participants
                                         let cancel_msg = format!("FILE_CANCELLED {transfer_id} cancelled by {username}");
                                         state.send_to_peer(transfer.sender, &cancel_msg);
@@ -1296,7 +1194,7 @@ where
                     if let Some(transfer_id) = parse_file_cancel(&msg) {
                         let mut state = state.lock().await;
 
-                        if let Some(transfer) = state.active_transfers.remove(&transfer_id) {
+                        if let Some(transfer) = state.remove_transfer(transfer_id) {
                             // Notify all participants
                             let cancel_msg = format!("FILE_CANCELLED {transfer_id} cancelled by {username}");
                             state.send_to_peer(transfer.sender, &cancel_msg);
@@ -1337,11 +1235,11 @@ where
                     if let Some((transfer_id, sha256)) = parse_file_end(&msg) {
                         let mut state = state.lock().await;
 
-                        if let Some(transfer) = state.active_transfers.remove(&transfer_id) {
+                        if let Some(transfer) = state.remove_transfer(transfer_id) {
                             if transfer.sender != addr {
                                 peer.lines.send("ERR not the sender of this transfer").await?;
                                 // Put it back
-                                state.active_transfers.insert(transfer_id, transfer);
+                                state.insert_transfer(transfer_id, transfer);
                                 continue;
                             }
 
@@ -1509,8 +1407,8 @@ mod tests {
             shared.accept_offer(acceptor, "lobby", "alice", "report.pdf"),
             Some((1, sender))
         );
-        assert!(shared.pending_offers.is_empty());
-        assert_eq!(shared.next_transfer_id, 1);
+        assert_eq!(shared.file_transfers.pending_offer_count(), 0);
+        assert_eq!(shared.file_transfers.next_transfer_id(), 1);
 
         let transfer = shared.get_transfer(1).unwrap();
         assert_eq!(transfer.sender, sender);
@@ -1540,7 +1438,7 @@ mod tests {
             shared.accept_offer(second_acceptor, "lobby", "alice", "report.pdf"),
             Some((1, sender))
         );
-        assert_eq!(shared.next_transfer_id, 1);
+        assert_eq!(shared.file_transfers.next_transfer_id(), 1);
 
         let transfer = shared.get_transfer(1).unwrap();
         assert_eq!(transfer.acceptors.len(), 2);
