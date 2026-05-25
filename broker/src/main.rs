@@ -29,7 +29,7 @@ use futures::SinkExt;
 use rustynaut_common::config::{BrokerConfig, ConfigLoader};
 use rustynaut_common::constants::{MAX_FILE_SIZE, MAX_LINE_LENGTH, MAX_RECENT_CLIPS_PER_ROOM};
 use rustynaut_common::parsing::{
-    parse_cmd, parse_clip, parse_enroll, parse_file_accept, parse_file_cancel, parse_file_chunk,
+    parse_clip, parse_cmd, parse_enroll, parse_file_accept, parse_file_cancel, parse_file_chunk,
     parse_file_end, parse_file_offer, parse_join, parse_say, parse_user,
 };
 use rustynaut_common::utils::{decode_base64, encode_base64, format_size};
@@ -45,8 +45,6 @@ struct Args {
     addr: String,
     cert_dir: PathBuf,
     regenerate_token: bool,
-    #[allow(dead_code)]
-    config_path: Option<String>,
     dump_config: bool,
 }
 
@@ -219,7 +217,9 @@ async fn run_tui_loop(
                 if key.kind == crossterm::event::KeyEventKind::Press {
                     match key.code {
                         crossterm::event::KeyCode::Char('c')
-                            if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) =>
+                            if key
+                                .modifiers
+                                .contains(crossterm::event::KeyModifiers::CONTROL) =>
                         {
                             shutdown_requested = true;
                             request_shutdown(&state, &shutdown_tx, &ui_tx).await;
@@ -273,10 +273,8 @@ async fn run_tui_loop(
                         }
                         crossterm::event::KeyCode::F(1) => app.toggle_sidebar(),
                         crossterm::event::KeyCode::Esc => {
-                            // Only clear selection or cancel completions - never quit via ESC
-                            if app.text_selection.is_some() {
-                                app.clear_text_selection();
-                            } else if !app.current_completions.is_empty() {
+                            // Only cancel completions - never quit via ESC
+                            if !app.current_completions.is_empty() {
                                 app.cancel_completion();
                             }
                             // Use /quit to exit the broker
@@ -321,9 +319,7 @@ async fn handle_broker_command(
             };
             ui_info(ui_tx, format!("Connected clients: {peer_count}")).await;
             ui_info(ui_tx, format!("Active rooms: {rooms_display}")).await;
-            let _ = ui_tx
-                .send(tui::Message::Stats { peer_count, rooms })
-                .await;
+            let _ = ui_tx.send(tui::Message::Stats { peer_count, rooms }).await;
             Ok(false)
         }
         "/token" => {
@@ -391,9 +387,7 @@ async fn collect_stats(state: &Arc<Mutex<Shared>>) -> (usize, Vec<String>) {
 
 async fn send_stats(state: &Arc<Mutex<Shared>>, ui_tx: &mpsc::Sender<tui::Message>) {
     let (peer_count, rooms) = collect_stats(state).await;
-    let _ = ui_tx
-        .send(tui::Message::Stats { peer_count, rooms })
-        .await;
+    let _ = ui_tx.send(tui::Message::Stats { peer_count, rooms }).await;
 }
 
 async fn ui_info(ui_tx: &mpsc::Sender<tui::Message>, text: impl Into<String>) {
@@ -414,7 +408,9 @@ async fn ui_error(ui_tx: &mpsc::Sender<tui::Message>, text: impl Into<String>) {
         .await;
 }
 
-fn parse_args(args: impl IntoIterator<Item = String>) -> Result<(Args, BrokerConfig), Box<dyn Error>> {
+fn parse_args(
+    args: impl IntoIterator<Item = String>,
+) -> Result<(Args, BrokerConfig), Box<dyn Error>> {
     let mut verbose = false;
     let mut addr: Option<String> = None;
     let mut cert_dir: Option<PathBuf> = None;
@@ -475,7 +471,8 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<(Args, BrokerCon
     let config = ConfigLoader::load_broker_config(config_path.as_deref())?;
 
     // CLI addr overrides config
-    let addr = addr.or_else(|| config.server.bind_address.clone().into())
+    let addr = addr
+        .or_else(|| config.server.bind_address.clone().into())
         .unwrap_or_else(|| "127.0.0.1:4242".to_string());
 
     // CLI cert_dir overrides config
@@ -489,7 +486,6 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<(Args, BrokerCon
         addr,
         cert_dir,
         regenerate_token,
-        config_path,
         dump_config,
     };
 

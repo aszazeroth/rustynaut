@@ -6,12 +6,12 @@
 #![warn(rust_2018_idioms)]
 
 mod clipboard_files;
-mod tls;
-mod tui;
 mod completion;
 mod reconnect;
+mod tls;
+mod tui;
 
-use tokio::sync::{mpsc, broadcast};
+use tokio::sync::{broadcast, mpsc};
 use tokio::time::{self, Duration};
 
 use std::collections::HashMap;
@@ -19,15 +19,15 @@ use std::env;
 use std::error::Error;
 use std::io::Write;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::path::PathBuf;
 use std::process::exit;
+use std::sync::Mutex;
 
+use reconnect::{ConnectionState, DisconnectReason, ReconnectionManager};
 use rustynaut_common::config::{ClientConfig, ConfigLoader};
 use rustynaut_common::constants::{FILE_CHUNK_SIZE, MAX_LINE_LENGTH};
 use rustynaut_common::utils::{decode_base64, encode_base64};
-use reconnect::{ConnectionState, DisconnectReason, ReconnectContext, ReconnectionManager};
-use std::path::Path;
-use std::sync::Mutex;
 
 use lazy_static::lazy_static;
 
@@ -64,6 +64,7 @@ struct IncomingTransfer {
     file: std::fs::File,
     temp_path: PathBuf,
     bytes_received: u64,
+    expected_size: u64,
 }
 
 lazy_static! {
@@ -158,7 +159,6 @@ const BANNER: &str = concat!(
 );
 
 /// Parsed command-line arguments
-#[allow(dead_code)]
 struct Args {
     verbose: bool,
     addr: SocketAddr,
@@ -166,8 +166,6 @@ struct Args {
     room: String,
     enroll_token: Option<String>,
     cert_dir: PathBuf,
-    config_path: Option<String>,
-    dump_config: bool,
 }
 
 fn parse_args() -> Result<(Args, ClientConfig), Box<dyn Error>> {
@@ -265,8 +263,6 @@ fn parse_args() -> Result<(Args, ClientConfig), Box<dyn Error>> {
         room,
         enroll_token,
         cert_dir,
-        config_path,
-        dump_config,
     };
 
     Ok((args, config))
@@ -295,20 +291,19 @@ fn spawn_network_connection(
         };
 
         let host = addr.ip().to_string();
-        let tls_stream = match tls::connect_tls(&tls_config.connector, tcp_stream, &host, false).await {
-            Ok(s) => s,
-            Err(_) => {
-                let _ = conn_status_tx.send(ConnectionState::Disconnected);
-                return;
-            }
-        };
+        let tls_stream =
+            match tls::connect_tls(&tls_config.connector, tcp_stream, &host, false).await {
+                Ok(s) => s,
+                Err(_) => {
+                    let _ = conn_status_tx.send(ConnectionState::Disconnected);
+                    return;
+                }
+            };
 
         let (r, w) = tokio::io::split(tls_stream);
         let mut sink = FramedWrite::new(w, LinesCodec::new_with_max_length(MAX_LINE_LENGTH));
-        let mut stream_reader = FramedRead::new(
-            r,
-            LinesCodec::new_with_max_length(MAX_LINE_LENGTH),
-        );
+        let mut stream_reader =
+            FramedRead::new(r, LinesCodec::new_with_max_length(MAX_LINE_LENGTH));
 
         // Notify that we're connected
         let _ = conn_status_tx.send(ConnectionState::Connected);
@@ -378,17 +373,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut terminal = tui::setup_terminal()?;
     let mut app = tui::App::new(args.username.clone(), args.room.clone());
     app.handle_room_join(&args.room);
-    app.completion_context_mut()
-        .add_user(args.username.clone());
+    app.completion_context_mut().add_user(args.username.clone());
 
     // Add initial messages
     app.add_info("Welcome to Rustynaut!");
-    app.add_info(format!("Connecting to {} as {}...", args.addr, args.username));
-    app.add_info("Click/drag messages to select, drag in input to select text, 'y' to copy, ESC to deselect");
+    app.add_info(format!(
+        "Connecting to {} as {}...",
+        args.addr, args.username
+    ));
+    app.add_info(
+        "Click/drag messages to select, drag in input to select text, 'y' to copy, ESC to deselect",
+    );
 
     // UI channel for receiving messages from network
     let (ui_tx, ui_rx) = mpsc::channel::<tui::Message>(100);
-    
+
     // Channel for connection status (for reconnection handling)
     let (conn_status_tx, conn_status_rx) = broadcast::channel::<ConnectionState>(1);
 
@@ -414,7 +413,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         };
         let mut previous_files: Option<Vec<std::path::PathBuf>> = None;
         let mut interval = time::interval(Duration::from_secs(2));
-        
+
         loop {
             interval.tick().await;
 
@@ -430,13 +429,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     .file_name()
                                     .and_then(|n| n.to_str())
                                     .unwrap_or("unknown");
-                let filename_b64 = encode_base64(filename);
+                                let filename_b64 = encode_base64(filename);
 
                                 if let Ok(mut pending) = PENDING_OUTGOING.lock() {
-                                    pending.insert(filename_b64.clone(), PendingOutgoingFile {
-                                        path: path.clone(),
-                                        size,
-                                    });
+                                    pending.insert(
+                                        filename_b64.clone(),
+                                        PendingOutgoingFile {
+                                            path: path.clone(),
+                                            size,
+                                        },
+                                    );
                                 }
 
                                 let offer_msg = format!(
@@ -467,7 +469,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     }
                 }
             };
-            
+
             if current_content != previous_content {
                 previous_files = None;
 
@@ -496,10 +498,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         let filename_b64 = encode_base64(filename);
 
                         if let Ok(mut pending) = PENDING_OUTGOING.lock() {
-                            pending.insert(filename_b64.clone(), PendingOutgoingFile {
-                                path: path.clone(),
-                                size,
-                            });
+                            pending.insert(
+                                filename_b64.clone(),
+                                PendingOutgoingFile {
+                                    path: path.clone(),
+                                    size,
+                                },
+                            );
                         }
 
                         let offer_msg =
@@ -527,8 +532,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     });
 
     // Get TLS config for connections
-    let tls_config = tls::init_tls_with_client_cert(&args.cert_dir)
-        .map_err(|e| -> Box<dyn Error> { e })?;
+    let tls_config =
+        tls::init_tls_with_client_cert(&args.cert_dir).map_err(|e| -> Box<dyn Error> { e })?;
 
     // Pass config and ui_tx to TUI loop
     let config = _config;
@@ -537,41 +542,61 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let result = run_tui_loop(
         &mut terminal,
         &mut app,
-        ui_tx,
-        ui_rx,
-        conn_status_tx,
-        conn_status_rx,
-        clipboard_rx,
-        config,
-        args.addr,
-        tls_config,
-        args.username.clone(),
-        args.room.clone(),
-        args.verbose,
-    ).await;
+        TuiLoopArgs {
+            ui_tx,
+            ui_rx,
+            conn_status_tx,
+            conn_status_rx,
+            clipboard_rx,
+            config,
+            broker_addr: args.addr,
+            tls_config,
+            username: args.username.clone(),
+            room: args.room.clone(),
+            verbose: args.verbose,
+        },
+    )
+    .await;
 
     // Restore terminal
     tui::restore_terminal()?;
-    
+
     result
 }
 
-/// Main TUI event loop with reconnection support
-async fn run_tui_loop(
-    terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
-    app: &mut tui::App,
+struct TuiLoopArgs {
     ui_tx: mpsc::Sender<tui::Message>,
-    mut ui_rx: mpsc::Receiver<tui::Message>,
+    ui_rx: mpsc::Receiver<tui::Message>,
     conn_status_tx: broadcast::Sender<ConnectionState>,
-    mut conn_status_rx: broadcast::Receiver<ConnectionState>,
-    mut clipboard_rx: mpsc::Receiver<String>,
+    conn_status_rx: broadcast::Receiver<ConnectionState>,
+    clipboard_rx: mpsc::Receiver<String>,
     config: ClientConfig,
     broker_addr: SocketAddr,
     tls_config: tls::TlsClientConfig,
     username: String,
     room: String,
     verbose: bool,
+}
+
+/// Main TUI event loop with reconnection support
+async fn run_tui_loop(
+    terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
+    app: &mut tui::App,
+    args: TuiLoopArgs,
 ) -> Result<(), Box<dyn Error>> {
+    let TuiLoopArgs {
+        ui_tx,
+        mut ui_rx,
+        conn_status_tx,
+        mut conn_status_rx,
+        mut clipboard_rx,
+        config,
+        broker_addr,
+        tls_config,
+        username,
+        room,
+        verbose,
+    } = args;
     let mut last_tick = tokio::time::Instant::now();
     let tick_rate = tokio::time::Duration::from_millis(100);
 
@@ -586,15 +611,10 @@ async fn run_tui_loop(
 
     let (reconnect_trigger_tx, mut reconnect_trigger_rx) = mpsc::channel::<()>(1);
     let mut reconnect_scheduled = false;
-    
+
     // Reconnection manager
     let reconnect_config = config.connection.reconnect.clone();
-    let reconnect_ctx = ReconnectContext {
-        broker_addr: broker_addr.to_string(),
-        username: username.clone(),
-        room: room.clone(),
-    };
-    let mut reconnect_mgr = ReconnectionManager::new(reconnect_config, reconnect_ctx);
+    let mut reconnect_mgr = ReconnectionManager::new(reconnect_config);
 
     // Spawn initial network connection
     spawn_network_connection(
@@ -622,9 +642,13 @@ async fn run_tui_loop(
                 tui::Message::Info { text, .. } => app.handle_info(&text),
                 tui::Message::Error { text, .. } => app.add_error(text),
                 tui::Message::Chat { user, text, .. } => app.add_chat(user, text),
-                tui::Message::FileOffer { room, user, filename, size, .. } => {
-                    app.handle_file_offer(&room, &user, &filename, &size)
-                }
+                tui::Message::FileOffer {
+                    room,
+                    user,
+                    filename,
+                    size,
+                    ..
+                } => app.handle_file_offer(&room, &user, &filename, &size),
                 tui::Message::FileTransfer { text, .. } => app.handle_file_transfer(&text),
                 tui::Message::Clip { room, preview, .. } => app.handle_clip(&room, &preview),
             }
@@ -643,7 +667,8 @@ async fn run_tui_loop(
             match state {
                 ConnectionState::Disconnected => {
                     app.add_info("Disconnected from broker");
-                    let should_reconnect = reconnect_mgr.should_reconnect(DisconnectReason::NetworkError);
+                    let should_reconnect =
+                        reconnect_mgr.should_reconnect(DisconnectReason::NetworkError);
                     reconnect_mgr.set_disconnected();
 
                     if should_reconnect && !reconnect_scheduled {
@@ -717,7 +742,9 @@ async fn run_tui_loop(
                     if key.kind == crossterm::event::KeyEventKind::Press {
                         match key.code {
                             crossterm::event::KeyCode::Char('c')
-                                if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) =>
+                                if key
+                                    .modifiers
+                                    .contains(crossterm::event::KeyModifiers::CONTROL) =>
                             {
                                 app.should_quit = true;
                             }
@@ -728,7 +755,9 @@ async fn run_tui_loop(
                                 } else if let Some(cmd) = app.handle_input('y') {
                                     if cmd == "/quit" || cmd == "/exit" {
                                         app.should_quit = true;
-                                    } else if let Err(e) = process_command(cmd, net_tx_opt.as_ref()).await {
+                                    } else if let Err(e) =
+                                        process_command(cmd, net_tx_opt.as_ref()).await
+                                    {
                                         app.add_error(format!("Failed to send: {}", e));
                                     }
                                 }
@@ -740,14 +769,21 @@ async fn run_tui_loop(
                                 if let Some(cmd) = app.handle_input(c) {
                                     if cmd == "/quit" || cmd == "/exit" {
                                         app.should_quit = true;
-                                    } else if let Err(e) = process_command(cmd, net_tx_opt.as_ref()).await {
+                                    } else if let Err(e) =
+                                        process_command(cmd, net_tx_opt.as_ref()).await
+                                    {
                                         app.add_error(format!("Failed to send: {}", e));
                                     }
                                 }
                             }
                             crossterm::event::KeyCode::Backspace => app.handle_backspace(),
+                            crossterm::event::KeyCode::Delete => app.handle_delete(),
                             crossterm::event::KeyCode::Left => app.cursor_left(),
                             crossterm::event::KeyCode::Right => app.cursor_right(),
+                            crossterm::event::KeyCode::Home => app.cursor_home(),
+                            crossterm::event::KeyCode::End => app.cursor_end(),
+                            crossterm::event::KeyCode::PageUp => app.scroll_up(),
+                            crossterm::event::KeyCode::PageDown => app.scroll_down(),
                             crossterm::event::KeyCode::Up => {
                                 if !app.current_completions.is_empty() {
                                     app.handle_tab();
@@ -792,7 +828,9 @@ async fn run_tui_loop(
                                 } else if let Some(cmd) = app.handle_input('\n') {
                                     if cmd == "/quit" || cmd == "/exit" {
                                         app.should_quit = true;
-                                    } else if let Err(e) = process_command(cmd, net_tx_opt.as_ref()).await {
+                                    } else if let Err(e) =
+                                        process_command(cmd, net_tx_opt.as_ref()).await
+                                    {
                                         app.add_error(format!("Failed to send: {}", e));
                                     }
                                 }
@@ -809,22 +847,20 @@ async fn run_tui_loop(
                         }
                     }
                 }
-                crossterm::event::Event::Mouse(mouse_event) => {
-                    match mouse_event.kind {
-                        crossterm::event::MouseEventKind::Down(button) => {
-                            if button == crossterm::event::MouseButton::Left {
-                                app.start_selection_drag(mouse_event.row, mouse_event.column);
-                            }
+                crossterm::event::Event::Mouse(mouse_event) => match mouse_event.kind {
+                    crossterm::event::MouseEventKind::Down(button) => {
+                        if button == crossterm::event::MouseButton::Left {
+                            app.start_selection_drag(mouse_event.row, mouse_event.column);
                         }
-                        crossterm::event::MouseEventKind::Drag(_button) => {
-                            app.update_selection_drag(mouse_event.row, mouse_event.column);
-                        }
-                        crossterm::event::MouseEventKind::Up(_button) => {
-                            app.end_selection_drag();
-                        }
-                        _ => {}
                     }
-                }
+                    crossterm::event::MouseEventKind::Drag(_button) => {
+                        app.update_selection_drag(mouse_event.row, mouse_event.column);
+                    }
+                    crossterm::event::MouseEventKind::Up(_button) => {
+                        app.end_selection_drag();
+                    }
+                    _ => {}
+                },
                 _ => {}
             }
         }
@@ -843,13 +879,16 @@ async fn run_tui_loop(
 }
 
 /// Process a user command and send to network
-async fn process_command(cmd: String, net_tx: Option<&mpsc::Sender<String>>) -> Result<(), Box<dyn Error>> {
+async fn process_command(
+    cmd: String,
+    net_tx: Option<&mpsc::Sender<String>>,
+) -> Result<(), Box<dyn Error>> {
     let message = if cmd.starts_with('/') {
         format!("CMD {}", cmd)
     } else {
         format!("SAY {}", cmd)
     };
-    
+
     if let Some(tx) = net_tx {
         tx.send(message).await.map_err(|e| e.into())
     } else {
@@ -885,9 +924,9 @@ async fn enroll(
 
     // Extract host for TLS SNI
     let host = addr.ip().to_string();
-        let tls_stream = tls::connect_tls(&tls_config.connector, stream, &host, true)
-            .await
-            .map_err(|e| -> Box<dyn Error> { e })?;
+    let tls_stream = tls::connect_tls(&tls_config.connector, stream, &host, true)
+        .await
+        .map_err(|e| -> Box<dyn Error> { e })?;
 
     let mut framed = Framed::new(tls_stream, LinesCodec::new_with_max_length(MAX_LINE_LENGTH));
 
@@ -903,9 +942,8 @@ async fn enroll(
     // Wait for response
     if let Some(Ok(line)) = framed.next().await {
         if line.starts_with("ENROLLED ") {
-            let bundle =
-                rustynaut_common::tls::parse_enrolled_response(&line)
-                    .map_err(|e| -> Box<dyn Error> { e })?;
+            let bundle = rustynaut_common::tls::parse_enrolled_response(&line)
+                .map_err(|e| -> Box<dyn Error> { e })?;
             tls::save_enrolled_certs(cert_dir, &bundle).map_err(|e| -> Box<dyn Error> { e })?;
 
             println!("Enrollment successful!");
@@ -962,12 +1000,21 @@ fn default_username() -> String {
         .unwrap_or_else(|_| "anon".to_string())
 }
 
-/// Generate FILE_CHUNK messages for a file transfer
-/// Returns a Vec of messages to send (FILE_CHUNK and FILE_END)
-fn generate_file_chunks(filename_b64: &str, transfer_id: &str) -> Vec<String> {
-    let mut messages = Vec::new();
+fn final_filename(filename: &str) -> String {
+    filename
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|name| !name.is_empty())
+        .unwrap_or("rustynaut-file")
+        .to_string()
+}
 
-    // Look up the pending file
+/// Stream FILE_CHUNK messages for a file transfer without buffering the whole file.
+async fn send_file_chunks(
+    filename_b64: &str,
+    transfer_id: &str,
+    tx: mpsc::Sender<String>,
+) -> Result<(), String> {
     let file_info = if let Ok(pending) = PENDING_OUTGOING.lock() {
         pending.get(filename_b64).map(|p| (p.path.clone(), p.size))
     } else {
@@ -975,89 +1022,156 @@ fn generate_file_chunks(filename_b64: &str, transfer_id: &str) -> Vec<String> {
     };
 
     let Some((path, _size)) = file_info else {
-        eprintln!("No pending file for {}", filename_b64);
-        return messages;
+        return Err(format!("No pending file for {filename_b64}"));
     };
 
-    // Read file and generate chunks
-    let file_data = match std::fs::read(&path) {
-        Ok(data) => data,
-        Err(e) => {
-            eprintln!("Failed to read file {}: {}", path.display(), e);
-            return messages;
-        }
-    };
-
-    // Compute SHA256
     use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(&file_data);
-    let hash = hasher.finalize();
-    let sha256_hex = hex::encode(hash);
+    use tokio::io::AsyncReadExt;
 
-    // Generate chunks
+    let mut file = tokio::fs::File::open(&path)
+        .await
+        .map_err(|e| format!("Failed to open file {}: {}", path.display(), e))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; FILE_CHUNK_SIZE];
     let mut offset: u64 = 0;
-    for chunk in file_data.chunks(FILE_CHUNK_SIZE) {
+
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .await
+            .map_err(|e| format!("Failed to read file {}: {}", path.display(), e))?;
+        if read == 0 {
+            break;
+        }
+
+        let chunk = &buffer[..read];
+        hasher.update(chunk);
         let chunk_b64 = encode_base64(chunk);
-        messages.push(format!("FILE_CHUNK {transfer_id} {offset} {chunk_b64}"));
-        offset += chunk.len() as u64;
+        tx.send(format!("FILE_CHUNK {transfer_id} {offset} {chunk_b64}"))
+            .await
+            .map_err(|_| "File transfer channel closed".to_string())?;
+        offset += read as u64;
     }
 
-    // FILE_END with checksum
-    messages.push(format!("FILE_END {transfer_id} {sha256_hex}"));
+    let sha256_hex = hex::encode(hasher.finalize());
+    tx.send(format!("FILE_END {transfer_id} {sha256_hex}"))
+        .await
+        .map_err(|_| "File transfer channel closed".to_string())?;
 
-    // Clean up pending
     if let Ok(mut pending) = PENDING_OUTGOING.lock() {
         pending.remove(filename_b64);
     }
 
-    messages
+    Ok(())
 }
 
 /// Handle incoming FILE_INCOMING - prepare to receive a file
-fn prepare_incoming_transfer(transfer_id: u64, filename: &str, _size: u64) -> Result<(), String> {
-    let downloads = resolve_download_dir();
+fn prepare_incoming_transfer(transfer_id: u64, filename: &str, size: u64) -> Result<(), String> {
+    prepare_incoming_transfer_in_dir(transfer_id, filename, size, &resolve_download_dir())
+}
+
+fn prepare_incoming_transfer_in_dir(
+    transfer_id: u64,
+    filename: &str,
+    size: u64,
+    downloads: &Path,
+) -> Result<(), String> {
+    std::fs::create_dir_all(downloads)
+        .map_err(|e| format!("Failed to create download directory: {}", e))?;
     let temp_path = downloads.join(format!(".rustynaut_incoming_{}", transfer_id));
 
     let file = std::fs::File::create(&temp_path)
         .map_err(|e| format!("Failed to create temp file: {}", e))?;
 
-    let mut transfers = INCOMING_TRANSFERS.lock().map_err(|e| format!("Lock failed: {}", e))?;
-    transfers.insert(transfer_id, IncomingTransfer {
-        filename: filename.to_string(),
-        file,
-        temp_path,
-        bytes_received: 0,
-    });
+    let mut transfers = INCOMING_TRANSFERS
+        .lock()
+        .map_err(|e| format!("Lock failed: {}", e))?;
+    transfers.insert(
+        transfer_id,
+        IncomingTransfer {
+            filename: final_filename(filename),
+            file,
+            temp_path,
+            bytes_received: 0,
+            expected_size: size,
+        },
+    );
     Ok(())
 }
 
 /// Handle incoming FILE_CHUNK - write bytes to temp file
-fn handle_file_chunk(transfer_id: u64, _offset: u64, chunk_b64: &str) -> Result<(), String> {
-    let chunk_data = decode_base64(chunk_b64)
-        .map_err(|e| format!("Invalid base64: {}", e))?;
+fn handle_file_chunk(transfer_id: u64, offset: u64, chunk_b64: &str) -> Result<(), String> {
+    let chunk_data = decode_base64(chunk_b64).map_err(|e| format!("Invalid base64: {}", e))?;
 
-    let mut transfers = INCOMING_TRANSFERS.lock().map_err(|e| format!("Lock failed: {}", e))?;
-    let transfer = transfers.get_mut(&transfer_id).ok_or_else(|| format!("Transfer {} not found", transfer_id))?;
-    transfer.file.write_all(&chunk_data).map_err(|e| format!("Write failed: {}", e))?;
+    let mut transfers = INCOMING_TRANSFERS
+        .lock()
+        .map_err(|e| format!("Lock failed: {}", e))?;
+    let transfer = transfers
+        .get_mut(&transfer_id)
+        .ok_or_else(|| format!("Transfer {} not found", transfer_id))?;
+    if offset != transfer.bytes_received {
+        return Err(format!(
+            "Unexpected chunk offset for transfer {}: got {}, expected {}",
+            transfer_id, offset, transfer.bytes_received
+        ));
+    }
+    if transfer.expected_size > 0
+        && transfer.bytes_received + chunk_data.len() as u64 > transfer.expected_size
+    {
+        return Err(format!(
+            "Transfer {} exceeded expected size of {} bytes",
+            transfer_id, transfer.expected_size
+        ));
+    }
+    transfer
+        .file
+        .write_all(&chunk_data)
+        .map_err(|e| format!("Write failed: {}", e))?;
     transfer.bytes_received += chunk_data.len() as u64;
     Ok(())
 }
 
 /// Handle FILE_DONE - verify checksum and move file to final location
-fn finalize_transfer(transfer_id: u64, _expected_sha256: &str) -> Result<String, String> {
-    let mut transfers = INCOMING_TRANSFERS.lock().map_err(|e| format!("Lock failed: {}", e))?;
-    let transfer_info = transfers.remove(&transfer_id).ok_or_else(|| "No such transfer".to_string())?;
+fn finalize_transfer(transfer_id: u64, expected_sha256: &str) -> Result<String, String> {
+    finalize_transfer_in_dir(transfer_id, expected_sha256, &resolve_download_dir())
+}
+
+fn finalize_transfer_in_dir(
+    transfer_id: u64,
+    expected_sha256: &str,
+    downloads: &Path,
+) -> Result<String, String> {
+    let mut transfers = INCOMING_TRANSFERS
+        .lock()
+        .map_err(|e| format!("Lock failed: {}", e))?;
+    let transfer_info = transfers
+        .remove(&transfer_id)
+        .ok_or_else(|| "No such transfer".to_string())?;
     drop(transfers);
 
-    // Close the file (drop it)
+    if transfer_info.expected_size > 0
+        && transfer_info.bytes_received != transfer_info.expected_size
+    {
+        let _ = std::fs::remove_file(&transfer_info.temp_path);
+        return Err(format!(
+            "Received {} of {} expected bytes",
+            transfer_info.bytes_received, transfer_info.expected_size
+        ));
+    }
+
     drop(transfer_info.file);
 
-    // Move to final location
-    let downloads = resolve_download_dir();
+    let actual_sha256 = file_sha256_hex(&transfer_info.temp_path)?;
+    if !expected_sha256.eq_ignore_ascii_case(&actual_sha256) {
+        let _ = std::fs::remove_file(&transfer_info.temp_path);
+        return Err(format!(
+            "Checksum mismatch: expected {}, got {}",
+            expected_sha256, actual_sha256
+        ));
+    }
+
     let mut final_path = downloads.join(&transfer_info.filename);
 
-    // Handle file already exists - add number suffix
     let mut counter = 1;
     while final_path.exists() {
         let stem = Path::new(&transfer_info.filename)
@@ -1079,80 +1193,36 @@ fn finalize_transfer(transfer_id: u64, _expected_sha256: &str) -> Result<String,
     Ok(final_path.display().to_string())
 }
 
+fn file_sha256_hex(path: &Path) -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+
+    let mut file =
+        std::fs::File::open(path).map_err(|e| format!("Failed to read received file: {}", e))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; FILE_CHUNK_SIZE];
+
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|e| format!("Failed to read received file: {}", e))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+
+    Ok(hex::encode(hasher.finalize()))
+}
+
 mod tcp {
-    use futures::{future, Sink, SinkExt, Stream, StreamExt};
-    use rustynaut_common::constants::MAX_LINE_LENGTH;
     use rustynaut_common::parsing::{
         parse_clip_fields, parse_file_cancelled_fields, parse_file_chunk_fields,
         parse_file_done_fields, parse_file_incoming_fields, parse_file_offer_fields,
         parse_file_sent_fields, parse_file_start_fields, parse_say_fields,
     };
     use rustynaut_common::utils::{decode_base64, format_size};
-    use std::{error::Error, net::SocketAddr};
-    use tokio::net::TcpStream;
     use tokio::sync::mpsc;
-    use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec, LinesCodecError};
-
-    /// Connect using channels for TUI integration
-    #[allow(dead_code)]
-    pub async fn connect_with_channels(
-        addr: &SocketAddr,
-        mut net_rx: mpsc::Receiver<String>,
-        ui_tx: mpsc::Sender<crate::tui::Message>,
-        verbose: bool,
-    ) -> Result<(), Box<dyn Error>> {
-        let mut stream = TcpStream::connect(addr).await?;
-        let (r, w) = stream.split();
-        
-        let mut sink = FramedWrite::new(w, LinesCodec::new_with_max_length(MAX_LINE_LENGTH));
-        let mut stream_reader = FramedRead::new(
-            r,
-            LinesCodec::new_with_max_length(MAX_LINE_LENGTH),
-        );
-
-        // Send initial connection message
-        let _ = ui_tx.send(crate::tui::Message::Info { text: format!("Connected to {}", addr), timestamp: std::time::SystemTime::now() }).await;
-
-        loop {
-            tokio::select! {
-                // Read from network
-                msg = stream_reader.next() => {
-                    match msg {
-                        Some(Ok(message)) => {
-                            if let Err(e) = handle_message(&message, &ui_tx, verbose).await {
-                                let _ = ui_tx.send(crate::tui::Message::Error { text: format!("Error handling message: {}", e), timestamp: std::time::SystemTime::now() }).await;
-                            }
-                        }
-                        Some(Err(e)) => {
-                            let _ = ui_tx.send(crate::tui::Message::Error { text: format!("Read error: {}", e), timestamp: std::time::SystemTime::now() }).await;
-                            break;
-                        }
-                        None => {
-                            let _ = ui_tx.send(crate::tui::Message::Info { text: "Connection closed".to_string(), timestamp: std::time::SystemTime::now() }).await;
-                            break;
-                        }
-                    }
-                }
-                // Write to network
-                msg = net_rx.recv() => {
-                    match msg {
-                        Some(line) => {
-                            if let Err(e) = sink.send(&line).await {
-                                let _ = ui_tx.send(crate::tui::Message::Error { text: format!("Write error: {}", e), timestamp: std::time::SystemTime::now() }).await;
-                                break;
-                            }
-                        }
-                        None => {
-                            // Channel closed
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(())
-    }
 
     /// Handle a message from the network and send to UI
     pub async fn handle_message(
@@ -1167,102 +1237,113 @@ mod tcp {
             } else {
                 None
             };
-            
+
             if let Some(msg) = err_msg {
-                let _ = ui_tx.send(crate::tui::Message::Error { 
-                    text: msg,
-                    timestamp: std::time::SystemTime::now()
-                }).await;
+                let _ = ui_tx
+                    .send(crate::tui::Message::Error {
+                        text: msg,
+                        timestamp: std::time::SystemTime::now(),
+                    })
+                    .await;
             }
 
             if verbose {
                 let id_str = id.unwrap_or("?");
-                let _ = ui_tx.send(crate::tui::Message::Info { 
-                    text: format!("clip applied: room={} id={} (b64_len={})", room, id_str, clipboard_b64.len()),
-                    timestamp: std::time::SystemTime::now()
-                }).await;
+                let _ = ui_tx
+                    .send(crate::tui::Message::Info {
+                        text: format!(
+                            "clip applied: room={} id={} (b64_len={})",
+                            room,
+                            id_str,
+                            clipboard_b64.len()
+                        ),
+                        timestamp: std::time::SystemTime::now(),
+                    })
+                    .await;
             }
             return Ok(());
         }
 
         // Handle FILE_OFFER: display as a user-friendly message
-        if let Some((room, username, filename_b64, size_str)) =
-            parse_file_offer_fields(message)
-        {
+        if let Some((room, username, filename_b64, size_str)) = parse_file_offer_fields(message) {
             let filename = decode_base64(filename_b64)
                 .ok()
                 .and_then(|bytes| String::from_utf8(bytes).ok())
                 .unwrap_or_else(|| "<unknown>".to_string());
             let size: u64 = size_str.parse().unwrap_or(0);
             let size_display = format_size(size);
-            
-            let _ = ui_tx.send(crate::tui::Message::FileOffer {
-                room: room.to_string(),
-                user: username.to_string(),
-                filename,
-                size: size_display,
-                timestamp: std::time::SystemTime::now()
-            }).await;
+
+            let _ = ui_tx
+                .send(crate::tui::Message::FileOffer {
+                    room: room.to_string(),
+                    user: username.to_string(),
+                    filename,
+                    size: size_display,
+                    timestamp: std::time::SystemTime::now(),
+                })
+                .await;
             return Ok(());
         }
 
         // Handle FILE_START: sender should begin transfer
-        if let Some((transfer_id, filename_b64, acceptor_count)) =
-            parse_file_start_fields(message)
+        if let Some((transfer_id, filename_b64, acceptor_count)) = parse_file_start_fields(message)
         {
             let filename = decode_base64(filename_b64)
                 .ok()
                 .and_then(|bytes| String::from_utf8(bytes).ok())
                 .unwrap_or_else(|| "<unknown>".to_string());
-            
-            let _ = ui_tx.send(crate::tui::Message::FileTransfer {
-                text: format!(
-                    "File transfer started: {} (transfer_id={}, {} receiver(s))",
-                    filename, transfer_id, acceptor_count
-                ),
-                timestamp: std::time::SystemTime::now()
-            }).await;
-            
+
+            let _ = ui_tx
+                .send(crate::tui::Message::FileTransfer {
+                    text: format!(
+                        "File transfer started: {} (transfer_id={}, {} receiver(s))",
+                        filename, transfer_id, acceptor_count
+                    ),
+                    timestamp: std::time::SystemTime::now(),
+                })
+                .await;
+
             // Spawn a task to send file chunks
             let filename_b64_owned = filename_b64.to_string();
             let transfer_id_owned = transfer_id.to_string();
             tokio::spawn(async move {
-                let messages = crate::generate_file_chunks(&filename_b64_owned, &transfer_id_owned);
                 let tx = crate::FILE_TX.lock().ok().and_then(|guard| guard.clone());
                 if let Some(tx) = tx {
-                    for msg in messages {
-                        if tx.send(msg).await.is_err() {
-                            break;
-                        }
+                    if let Err(e) =
+                        crate::send_file_chunks(&filename_b64_owned, &transfer_id_owned, tx).await
+                    {
+                        eprintln!("File transfer failed: {}", e);
                     }
                 }
             });
-            
+
             return Ok(());
         }
 
         // Handle FILE_INCOMING: receiver should prepare to receive
-        if let Some((transfer_id, filename_b64, size_str)) =
-            parse_file_incoming_fields(message)
-        {
+        if let Some((transfer_id, filename_b64, size_str)) = parse_file_incoming_fields(message) {
             let filename = decode_base64(filename_b64)
                 .ok()
                 .and_then(|bytes| String::from_utf8(bytes).ok())
                 .unwrap_or_else(|| "<unknown>".to_string());
             let size: u64 = size_str.parse().unwrap_or(0);
-            
+
             let tid: u64 = transfer_id.parse().unwrap_or(0);
             if let Err(e) = crate::prepare_incoming_transfer(tid, &filename, size) {
-                let _ = ui_tx.send(crate::tui::Message::Error { 
-                    text: format!("Failed to prepare transfer: {}", e),
-                    timestamp: std::time::SystemTime::now()
-                }).await;
+                let _ = ui_tx
+                    .send(crate::tui::Message::Error {
+                        text: format!("Failed to prepare transfer: {}", e),
+                        timestamp: std::time::SystemTime::now(),
+                    })
+                    .await;
             }
-            
-            let _ = ui_tx.send(crate::tui::Message::FileTransfer {
-                text: format!("Receiving file: {} ({} bytes)", filename, size),
-                timestamp: std::time::SystemTime::now()
-            }).await;
+
+            let _ = ui_tx
+                .send(crate::tui::Message::FileTransfer {
+                    text: format!("Receiving file: {} ({} bytes)", filename, size),
+                    timestamp: std::time::SystemTime::now(),
+                })
+                .await;
             return Ok(());
         }
 
@@ -1271,7 +1352,12 @@ mod tcp {
             let tid: u64 = transfer_id.parse().unwrap_or(0);
             let off: u64 = offset.parse().unwrap_or(0);
             if let Err(e) = crate::handle_file_chunk(tid, off, chunk_b64) {
-                let _ = ui_tx.send(crate::tui::Message::Error { text: format!("Chunk error: {}", e), timestamp: std::time::SystemTime::now() }).await;
+                let _ = ui_tx
+                    .send(crate::tui::Message::Error {
+                        text: format!("Chunk error: {}", e),
+                        timestamp: std::time::SystemTime::now(),
+                    })
+                    .await;
             }
             return Ok(());
         }
@@ -1281,16 +1367,20 @@ mod tcp {
             let tid: u64 = transfer_id.parse().unwrap_or(0);
             match crate::finalize_transfer(tid, sha256) {
                 Ok(final_path) => {
-                    let _ = ui_tx.send(crate::tui::Message::FileTransfer {
-                        text: format!("File received: {}", final_path),
-                        timestamp: std::time::SystemTime::now()
-                    }).await;
+                    let _ = ui_tx
+                        .send(crate::tui::Message::FileTransfer {
+                            text: format!("File received: {}", final_path),
+                            timestamp: std::time::SystemTime::now(),
+                        })
+                        .await;
                 }
                 Err(e) => {
-                    let _ = ui_tx.send(crate::tui::Message::Error {
-                        text: format!("File transfer failed: {}", e),
-                        timestamp: std::time::SystemTime::now()
-                    }).await;
+                    let _ = ui_tx
+                        .send(crate::tui::Message::Error {
+                            text: format!("File transfer failed: {}", e),
+                            timestamp: std::time::SystemTime::now(),
+                        })
+                        .await;
                 }
             }
             return Ok(());
@@ -1298,483 +1388,174 @@ mod tcp {
 
         // Handle FILE_SENT: sender confirmation
         if let Some((transfer_id, count)) = parse_file_sent_fields(message) {
-            let _ = ui_tx.send(crate::tui::Message::FileTransfer {
-                text: format!(
-                    "File sent successfully (transfer_id={}, {} receiver(s))",
-                    transfer_id, count
-                ),
-                timestamp: std::time::SystemTime::now()
-            }).await;
+            let _ = ui_tx
+                .send(crate::tui::Message::FileTransfer {
+                    text: format!(
+                        "File sent successfully (transfer_id={}, {} receiver(s))",
+                        transfer_id, count
+                    ),
+                    timestamp: std::time::SystemTime::now(),
+                })
+                .await;
             return Ok(());
         }
 
         // Handle FILE_CANCELLED
         if let Some((transfer_id, reason)) = parse_file_cancelled_fields(message) {
-            let _ = ui_tx.send(crate::tui::Message::FileTransfer {
-                text: format!("File transfer {} cancelled: {}", transfer_id, reason),
-                timestamp: std::time::SystemTime::now()
-            }).await;
+            let _ = ui_tx
+                .send(crate::tui::Message::FileTransfer {
+                    text: format!("File transfer {} cancelled: {}", transfer_id, reason),
+                    timestamp: std::time::SystemTime::now(),
+                })
+                .await;
             return Ok(());
         }
 
-         // Handle SAY messages
-    if let Some((user, text)) = parse_say_fields(message) {
-        let _ = ui_tx.send(crate::tui::Message::Chat {
-            user: user.to_string(),
-            text: text.to_string(),
-            timestamp: std::time::SystemTime::now()
-        }).await;
-        return Ok(());
-    }
-
-    // Special handling for token commands - this catches the response from broker when /token sent
-    if message.starts_with("INFO Token copied to clipboard") {
-        // The command was successfully processed, just display a helpful message
-        let _ = ui_tx.send(crate::tui::Message::Info { 
-            text: "Token copied to clipboard".to_string(), 
-            timestamp: std::time::SystemTime::now() 
-        }).await;
-        return Ok(());
-    }
-    
-    // Default: treat as info message
-         let _ = ui_tx.send(crate::tui::Message::Info { text: message.to_string(), timestamp: std::time::SystemTime::now() }).await;
-         Ok(())
-    }
-
-    #[allow(dead_code)]
-    pub async fn connect(
-        addr: &SocketAddr,
-        mut stdin: impl Stream<Item = Result<String, LinesCodecError>> + Unpin,
-        mut stdout: impl Sink<String, Error = LinesCodecError> + Unpin,
-        verbose: bool,
-    ) -> Result<(), Box<dyn Error>> {
-        let mut stream = TcpStream::connect(addr).await?;
-        let (r, w) = stream.split();
-        let mut sink = FramedWrite::new(w, LinesCodec::new_with_max_length(MAX_LINE_LENGTH));
-        let mut stream = FramedRead::new(
-            r,
-            LinesCodec::new_with_max_length(MAX_LINE_LENGTH),
-        )
-        .filter_map(|i| match i {
-            Ok(message) => {
-                // Apply clipboard updates silently (avoid printing base64 payloads).
-                if let Some((room, clipboard_b64, id)) = parse_clip_fields(&message) {
-                    if let Err(err) = crate::replace_clipboard_content(clipboard_b64) {
-                        eprintln!("could not replace the clipboard content, {}", err)
-                    }
-
-                    if verbose {
-                        let id_str = id.unwrap_or("?");
-                        eprintln!(
-                            "clip applied: room={room} id={id_str} (b64_len={})",
-                            clipboard_b64.len()
-                        );
-                    }
-                    return future::ready(None);
-                }
-
-                // Handle FILE_OFFER: display as a user-friendly message
-                if let Some((room, username, filename_b64, size_str)) =
-                    parse_file_offer_fields(&message)
-                {
-                    // Decode filename from base64
-                    let filename = decode_base64(filename_b64)
-                        .ok()
-                        .and_then(|bytes| String::from_utf8(bytes).ok())
-                        .unwrap_or_else(|| "<unknown>".to_string());
-                    let size: u64 = size_str.parse().unwrap_or(0);
-                    let size_display = format_size(size);
-                    // Display the file offer to the user with accept hint
-                    let display_msg = format!(
-                        "INFO [{room}] {username} offers file: {filename} ({size_display}) - use /accept {username} {filename} to receive"
-                    );
-                    return future::ready(Some(Ok(display_msg)));
-                }
-
-                // Handle FILE_START: sender should begin transfer
-                if let Some((transfer_id, filename_b64, acceptor_count)) =
-                    parse_file_start_fields(&message)
-                {
-                    let filename = decode_base64(filename_b64)
-                        .ok()
-                        .and_then(|bytes| String::from_utf8(bytes).ok())
-                        .unwrap_or_else(|| "<unknown>".to_string());
-                    let display_msg = format!(
-                        "INFO File transfer started: {filename} (transfer_id={transfer_id}, {acceptor_count} receiver(s))"
-                    );
-                    
-                    // Spawn a task to send file chunks
-                    let filename_b64_owned = filename_b64.to_string();
-                    let transfer_id_owned = transfer_id.to_string();
-                    tokio::spawn(async move {
-                        let messages = crate::generate_file_chunks(&filename_b64_owned, &transfer_id_owned);
-                        // Clone the sender before releasing the lock to avoid holding lock across await
-                        let tx = crate::FILE_TX.lock().ok().and_then(|guard| guard.clone());
-                        if let Some(tx) = tx {
-                            for msg in messages {
-                                if tx.send(msg).await.is_err() {
-                                    eprintln!("Failed to send file chunk");
-                                    break;
-                                }
-                            }
-                        }
-                    });
-                    
-                    return future::ready(Some(Ok(display_msg)));
-                }
-
-                // Handle FILE_INCOMING: receiver should prepare to receive
-                if let Some((transfer_id, filename_b64, size_str)) =
-                    parse_file_incoming_fields(&message)
-                {
-                    let filename = decode_base64(filename_b64)
-                        .ok()
-                        .and_then(|bytes| String::from_utf8(bytes).ok())
-                        .unwrap_or_else(|| "<unknown>".to_string());
-                    let size: u64 = size_str.parse().unwrap_or(0);
-                    let size_display = format_size(size);
-                    
-                    // Prepare to receive the file
-                    let tid: u64 = transfer_id.parse().unwrap_or(0);
-                    if let Err(e) = crate::prepare_incoming_transfer(tid, &filename, size) {
-                        eprintln!("Failed to prepare transfer: {}", e);
-                    }
-                    
-                    let display_msg = format!(
-                        "INFO Receiving file: {filename} ({size_display}) transfer_id={transfer_id}"
-                    );
-                    return future::ready(Some(Ok(display_msg)));
-                }
-
-                // Handle FILE_CHUNK: write chunk to temp file
-                if let Some((transfer_id, offset, chunk_b64)) =
-                    parse_file_chunk_fields(&message)
-                {
-                    let tid: u64 = transfer_id.parse().unwrap_or(0);
-                    let off: u64 = offset.parse().unwrap_or(0);
-                    if let Err(e) = crate::handle_file_chunk(tid, off, chunk_b64) {
-                        eprintln!("Chunk error: {}", e);
-                    }
-                    // Don't print anything for chunks (too noisy)
-                    return future::ready(None);
-                }
-
-                // Handle FILE_DONE: finalize the transfer
-                if let Some((transfer_id, sha256)) =
-                    parse_file_done_fields(&message)
-                {
-                    let tid: u64 = transfer_id.parse().unwrap_or(0);
-                    match crate::finalize_transfer(tid, sha256) {
-                        Ok(final_path) => {
-                            let display_msg = format!(
-                                "INFO File received: {final_path}"
-                            );
-                            return future::ready(Some(Ok(display_msg)));
-                        }
-                        Err(e) => {
-                            let display_msg = format!(
-                                "INFO File transfer failed: {e}"
-                            );
-                            return future::ready(Some(Ok(display_msg)));
-                        }
-                    }
-                }
-
-                // Handle FILE_SENT: sender confirmation
-                if let Some((transfer_id, count)) =
-                    parse_file_sent_fields(&message)
-                {
-                    let display_msg = format!(
-                        "INFO File sent successfully (transfer_id={transfer_id}, {count} receiver(s))"
-                    );
-                    return future::ready(Some(Ok(display_msg)));
-                }
-
-                // Handle FILE_CANCELLED
-                if let Some((transfer_id, reason)) =
-                    parse_file_cancelled_fields(&message)
-                {
-                    let display_msg = format!(
-                        "INFO File transfer {transfer_id} cancelled: {reason}"
-                    );
-                    return future::ready(Some(Ok(display_msg)));
-                }
-
-                future::ready(Some(Ok(message)))
-            }
-            Err(e) => {
-                eprintln!("failed to read from socket; error={}", e);
-                future::ready(None)
-            }
-        });
-
-        match future::join(sink.send_all(&mut stdin), stdout.send_all(&mut stream)).await {
-            (Err(e), _) | (_, Err(e)) => Err(e.into()),
-            _ => Ok(()),
+        // Handle SAY messages
+        if let Some((user, text)) = parse_say_fields(message) {
+            let _ = ui_tx
+                .send(crate::tui::Message::Chat {
+                    user: user.to_string(),
+                    text: text.to_string(),
+                    timestamp: std::time::SystemTime::now(),
+                })
+                .await;
+            return Ok(());
         }
+
+        // Special handling for token commands - this catches the response from broker when /token sent
+        if message.starts_with("INFO Token copied to clipboard") {
+            // The command was successfully processed, just display a helpful message
+            let _ = ui_tx
+                .send(crate::tui::Message::Info {
+                    text: "Token copied to clipboard".to_string(),
+                    timestamp: std::time::SystemTime::now(),
+                })
+                .await;
+            return Ok(());
+        }
+
+        // Default: treat as info message
+        let _ = ui_tx
+            .send(crate::tui::Message::Info {
+                text: message.to_string(),
+                timestamp: std::time::SystemTime::now(),
+            })
+            .await;
+        Ok(())
     }
 }
 
-mod tls_transport {
-    use futures::{future, Sink, SinkExt, Stream, StreamExt};
-    use rustynaut_common::constants::MAX_LINE_LENGTH;
-    use rustynaut_common::parsing::{
-        parse_clip_fields, parse_file_cancelled_fields, parse_file_chunk_fields,
-        parse_file_done_fields, parse_file_incoming_fields, parse_file_offer_fields,
-        parse_file_sent_fields, parse_file_start_fields,
-    };
-    use rustynaut_common::utils::{decode_base64, format_size};
-    use std::{error::Error, net::SocketAddr};
-    use tokio::net::TcpStream;
-    use tokio::sync::mpsc;
-    use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec, LinesCodecError};
+#[cfg(test)]
+mod file_transfer_tests {
+    use super::*;
+    use sha2::{Digest, Sha256};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
-    /// Connect using channels for TUI integration
-    pub async fn connect_with_channels(
-        addr: &SocketAddr,
-        tls_config: &crate::tls::TlsClientConfig,
-        mut net_rx: mpsc::Receiver<String>,
-        ui_tx: mpsc::Sender<crate::tui::Message>,
-        verbose: bool,
-    ) -> Result<(), Box<dyn Error>> {
-        let tcp_stream = TcpStream::connect(addr).await?;
-        
-        // Extract host for TLS SNI
-        let host = addr.ip().to_string();
-        let tls_stream = crate::tls::connect_tls(&tls_config.connector, tcp_stream, &host, false)
-            .await
-            .map_err(|e| -> Box<dyn Error> { e })?;
-
-        let (r, w) = tokio::io::split(tls_stream);
-        let mut sink = FramedWrite::new(w, LinesCodec::new_with_max_length(MAX_LINE_LENGTH));
-        let mut stream_reader = FramedRead::new(
-            r,
-            LinesCodec::new_with_max_length(MAX_LINE_LENGTH),
-        );
-
-        // Send initial connection message
-        let _ = ui_tx.send(crate::tui::Message::Info { text: format!("TLS connected to {}", addr), timestamp: std::time::SystemTime::now() }).await;
-
-        loop {
-            tokio::select! {
-                // Read from network
-                msg = stream_reader.next() => {
-                    match msg {
-                        Some(Ok(message)) => {
-                            if let Err(e) = super::tcp::handle_message(&message, &ui_tx, verbose).await {
-                                let _ = ui_tx.send(crate::tui::Message::Error { text: format!("Error handling message: {}", e), timestamp: std::time::SystemTime::now() }).await;
-                            }
-                        }
-                        Some(Err(e)) => {
-                            let _ = ui_tx.send(crate::tui::Message::Error { text: format!("Read error: {}", e), timestamp: std::time::SystemTime::now() }).await;
-                            break;
-                        }
-                        None => {
-                            let _ = ui_tx.send(crate::tui::Message::Info { text: "Connection closed".to_string(), timestamp: std::time::SystemTime::now() }).await;
-                            break;
-                        }
-                    }
-                }
-                // Write to network
-                msg = net_rx.recv() => {
-                    match msg {
-                        Some(line) => {
-                            if let Err(e) = sink.send(&line).await {
-                                let _ = ui_tx.send(crate::tui::Message::Error { text: format!("Write error: {}", e), timestamp: std::time::SystemTime::now() }).await;
-                                break;
-                            }
-                        }
-                        None => {
-                            // Channel closed
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(())
+    fn test_dir(name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("rustynaut-{name}-{}-{nonce}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 
-    #[allow(dead_code)]
-    pub async fn connect(
-        addr: &SocketAddr,
-        tls_config: &crate::tls::TlsClientConfig,
-        mut stdin: impl Stream<Item = Result<String, LinesCodecError>> + Unpin,
-        mut stdout: impl Sink<String, Error = LinesCodecError> + Unpin,
-        verbose: bool,
-    ) -> Result<(), Box<dyn Error>> {
-        let tcp_stream = TcpStream::connect(addr).await?;
+    fn sha256_hex(data: &[u8]) -> String {
+        hex::encode(Sha256::digest(data))
+    }
 
-        // Extract host for TLS SNI
-        let host = addr.ip().to_string();
-        let tls_stream = crate::tls::connect_tls(&tls_config.connector, tcp_stream, &host, false)
-            .await
-            .map_err(|e| -> Box<dyn Error> { e })?;
+    #[test]
+    fn incoming_transfer_rejects_unexpected_offset() {
+        let dir = test_dir("bad-offset");
+        let transfer_id = 9_001;
+        prepare_incoming_transfer_in_dir(transfer_id, "sample.txt", 5, &dir).unwrap();
 
-        let (r, w) = tokio::io::split(tls_stream);
-        let mut sink = FramedWrite::new(w, LinesCodec::new_with_max_length(MAX_LINE_LENGTH));
-        let mut stream = FramedRead::new(
-            r,
-            LinesCodec::new_with_max_length(MAX_LINE_LENGTH),
+        let err = handle_file_chunk(transfer_id, 3, &encode_base64(b"hello")).unwrap_err();
+        assert!(err.contains("Unexpected chunk offset"));
+
+        let _ = INCOMING_TRANSFERS.lock().unwrap().remove(&transfer_id);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn incoming_transfer_rejects_checksum_mismatch_and_removes_temp_file() {
+        let dir = test_dir("bad-checksum");
+        let transfer_id = 9_002;
+        prepare_incoming_transfer_in_dir(transfer_id, "sample.txt", 5, &dir).unwrap();
+        handle_file_chunk(transfer_id, 0, &encode_base64(b"hello")).unwrap();
+
+        let err = finalize_transfer_in_dir(transfer_id, "not-a-real-checksum", &dir).unwrap_err();
+        assert!(err.contains("Checksum mismatch"));
+        assert!(!dir
+            .join(format!(".rustynaut_incoming_{transfer_id}"))
+            .exists());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn incoming_transfer_verifies_checksum_and_uses_safe_filename() {
+        let dir = test_dir("success");
+        let transfer_id = 9_003;
+        let data = b"hello rustynaut";
+        prepare_incoming_transfer_in_dir(
+            transfer_id,
+            r"..\nested/sample.txt",
+            data.len() as u64,
+            &dir,
         )
-        .filter_map(|i| match i {
-            Ok(message) => {
-                // Apply clipboard updates silently (avoid printing base64 payloads).
-                if let Some((room, clipboard_b64, id)) = parse_clip_fields(&message) {
-                    if let Err(err) = crate::replace_clipboard_content(clipboard_b64) {
-                        eprintln!("could not replace the clipboard content, {}", err)
-                    }
+        .unwrap();
+        handle_file_chunk(transfer_id, 0, &encode_base64(data)).unwrap();
 
-                    if verbose {
-                        let id_str = id.unwrap_or("?");
-                        eprintln!(
-                            "clip applied: room={room} id={id_str} (b64_len={})",
-                            clipboard_b64.len()
-                        );
-                    }
-                    return future::ready(None);
-                }
+        let final_path = finalize_transfer_in_dir(transfer_id, &sha256_hex(data), &dir).unwrap();
+        let final_path = PathBuf::from(final_path);
 
-                // Handle FILE_OFFER: display as a user-friendly message
-                if let Some((room, username, filename_b64, size_str)) =
-                    parse_file_offer_fields(&message)
-                {
-                    // Decode filename from base64
-                    let filename = decode_base64(filename_b64)
-                        .ok()
-                        .and_then(|bytes| String::from_utf8(bytes).ok())
-                        .unwrap_or_else(|| "<unknown>".to_string());
-                    let size: u64 = size_str.parse().unwrap_or(0);
-                    let size_display = format_size(size);
-                    // Display the file offer to the user with accept hint
-                    let display_msg = format!(
-                        "INFO [{room}] {username} offers file: {filename} ({size_display}) - use /accept {username} {filename} to receive"
-                    );
-                    return future::ready(Some(Ok(display_msg)));
-                }
+        assert_eq!(
+            final_path.file_name().and_then(|s| s.to_str()),
+            Some("sample.txt")
+        );
+        assert_eq!(std::fs::read(&final_path).unwrap(), data);
+        assert!(!dir.parent().unwrap().join("sample.txt").exists());
 
-                // Handle FILE_START: sender should begin transfer
-                if let Some((transfer_id, filename_b64, acceptor_count)) =
-                    parse_file_start_fields(&message)
-                {
-                    let filename = decode_base64(filename_b64)
-                        .ok()
-                        .and_then(|bytes| String::from_utf8(bytes).ok())
-                        .unwrap_or_else(|| "<unknown>".to_string());
-                    let display_msg = format!(
-                        "INFO File transfer started: {filename} (transfer_id={transfer_id}, {acceptor_count} receiver(s))"
-                    );
-                    
-                    // Spawn a task to send file chunks
-                    let filename_b64_owned = filename_b64.to_string();
-                    let transfer_id_owned = transfer_id.to_string();
-                    tokio::spawn(async move {
-                        let messages = crate::generate_file_chunks(&filename_b64_owned, &transfer_id_owned);
-                        // Clone the sender before releasing the lock to avoid holding lock across await
-                        let tx = crate::FILE_TX.lock().ok().and_then(|guard| guard.clone());
-                        if let Some(tx) = tx {
-                            for msg in messages {
-                                if tx.send(msg).await.is_err() {
-                                    eprintln!("Failed to send file chunk");
-                                    break;
-                                }
-                            }
-                        }
-                    });
-                    
-                    return future::ready(Some(Ok(display_msg)));
-                }
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
-                // Handle FILE_INCOMING: receiver should prepare to receive
-                if let Some((transfer_id, filename_b64, size_str)) =
-                    parse_file_incoming_fields(&message)
-                {
-                    let filename = decode_base64(filename_b64)
-                        .ok()
-                        .and_then(|bytes| String::from_utf8(bytes).ok())
-                        .unwrap_or_else(|| "<unknown>".to_string());
-                    let size: u64 = size_str.parse().unwrap_or(0);
-                    let size_display = format_size(size);
-                    
-                    // Prepare to receive the file
-                    let tid: u64 = transfer_id.parse().unwrap_or(0);
-                    if let Err(e) = crate::prepare_incoming_transfer(tid, &filename, size) {
-                        eprintln!("Failed to prepare transfer: {}", e);
-                    }
-                    
-                    let display_msg = format!(
-                        "INFO Receiving file: {filename} ({size_display}) transfer_id={transfer_id}"
-                    );
-                    return future::ready(Some(Ok(display_msg)));
-                }
+    #[tokio::test]
+    async fn outgoing_transfer_streams_chunks_and_checksum() {
+        let dir = test_dir("outgoing");
+        let path = dir.join("payload.bin");
+        let data = vec![42_u8; FILE_CHUNK_SIZE + 17];
+        std::fs::write(&path, &data).unwrap();
 
-                // Handle FILE_CHUNK: write chunk to temp file
-                if let Some((transfer_id, offset, chunk_b64)) =
-                    parse_file_chunk_fields(&message)
-                {
-                    let tid: u64 = transfer_id.parse().unwrap_or(0);
-                    let off: u64 = offset.parse().unwrap_or(0);
-                    if let Err(e) = crate::handle_file_chunk(tid, off, chunk_b64) {
-                        eprintln!("Chunk error: {}", e);
-                    }
-                    // Don't print anything for chunks (too noisy)
-                    return future::ready(None);
-                }
+        let filename_b64 = encode_base64(b"payload.bin");
+        let transfer_id = "42";
+        PENDING_OUTGOING.lock().unwrap().insert(
+            filename_b64.clone(),
+            PendingOutgoingFile {
+                path: path.clone(),
+                size: data.len() as u64,
+            },
+        );
 
-                // Handle FILE_DONE: finalize the transfer
-                if let Some((transfer_id, sha256)) =
-                    parse_file_done_fields(&message)
-                {
-                    let tid: u64 = transfer_id.parse().unwrap_or(0);
-                    match crate::finalize_transfer(tid, sha256) {
-                        Ok(final_path) => {
-                            let display_msg = format!(
-                                "INFO File received: {final_path}"
-                            );
-                            return future::ready(Some(Ok(display_msg)));
-                        }
-                        Err(e) => {
-                            let display_msg = format!(
-                                "INFO File transfer failed: {e}"
-                            );
-                            return future::ready(Some(Ok(display_msg)));
-                        }
-                    }
-                }
+        let (tx, mut rx) = mpsc::channel(8);
+        send_file_chunks(&filename_b64, transfer_id, tx)
+            .await
+            .unwrap();
 
-                // Handle FILE_SENT: sender confirmation
-                if let Some((transfer_id, count)) =
-                    parse_file_sent_fields(&message)
-                {
-                    let display_msg = format!(
-                        "INFO File sent successfully (transfer_id={transfer_id}, {count} receiver(s))"
-                    );
-                    return future::ready(Some(Ok(display_msg)));
-                }
-
-                // Handle FILE_CANCELLED
-                if let Some((transfer_id, reason)) =
-                    parse_file_cancelled_fields(&message)
-                {
-                    let display_msg = format!(
-                        "INFO File transfer {transfer_id} cancelled: {reason}"
-                    );
-                    return future::ready(Some(Ok(display_msg)));
-                }
-
-                future::ready(Some(Ok(message)))
-            }
-            Err(e) => {
-                eprintln!("failed to read from socket; error={}", e);
-                future::ready(None)
-            }
-        });
-
-        match future::join(sink.send_all(&mut stdin), stdout.send_all(&mut stream)).await {
-            (Err(e), _) | (_, Err(e)) => Err(e.into()),
-            _ => Ok(()),
+        let mut messages = Vec::new();
+        while let Some(message) = rx.recv().await {
+            messages.push(message);
         }
+
+        assert_eq!(messages.len(), 3);
+        assert!(messages[0].starts_with("FILE_CHUNK 42 0 "));
+        assert!(messages[1].starts_with(&format!("FILE_CHUNK 42 {} ", FILE_CHUNK_SIZE)));
+        assert_eq!(messages[2], format!("FILE_END 42 {}", sha256_hex(&data)));
+        assert!(!PENDING_OUTGOING.lock().unwrap().contains_key(&filename_b64));
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
