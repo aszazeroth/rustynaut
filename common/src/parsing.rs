@@ -340,4 +340,76 @@ mod tests {
     fn test_parse_say_wrong_prefix() {
         assert_eq!(parse_say("CMD hello"), None);
     }
+
+    // ==================== file transfer parser tests ====================
+    #[test]
+    fn test_parse_file_transfer_numeric_fields_reject_invalid_numbers() {
+        assert_eq!(parse_file_cancel("FILE_CANCEL 42"), Some(42));
+        assert_eq!(
+            parse_file_chunk("FILE_CHUNK 42 65536 SGVsbG8="),
+            Some((42, 65536, "SGVsbG8="))
+        );
+        assert_eq!(parse_file_end("FILE_END 42 abc123"), Some((42, "abc123")));
+
+        assert_eq!(parse_file_cancel("FILE_CANCEL nope"), None);
+        assert_eq!(parse_file_chunk("FILE_CHUNK nope 0 SGVsbG8="), None);
+        assert_eq!(parse_file_chunk("FILE_CHUNK 42 nope SGVsbG8="), None);
+        assert_eq!(parse_file_end("FILE_END nope abc123"), None);
+    }
+
+    #[test]
+    fn test_parse_file_transfer_fields_preserve_tail_payloads() {
+        assert_eq!(
+            parse_file_offer("FILE_OFFER lobby report.pdf 12345"),
+            Some(("lobby", "report.pdf", "12345"))
+        );
+        assert_eq!(
+            parse_file_offer_fields("FILE_OFFER lobby alice report.pdf 12345"),
+            Some(("lobby", "alice", "report.pdf", "12345"))
+        );
+        assert_eq!(
+            parse_file_accept("FILE_ACCEPT lobby alice report.pdf"),
+            Some(("lobby", "alice", "report.pdf"))
+        );
+        assert_eq!(
+            parse_file_start_fields("FILE_START 7 report.pdf 2"),
+            Some(("7", "report.pdf", "2"))
+        );
+        assert_eq!(
+            parse_file_incoming_fields("FILE_INCOMING 7 report.pdf 12345"),
+            Some(("7", "report.pdf", "12345"))
+        );
+        assert_eq!(
+            parse_file_chunk_fields("FILE_CHUNK 7 65536 SGVsbG8= with-tail"),
+            Some(("7", "65536", "SGVsbG8= with-tail"))
+        );
+        assert_eq!(
+            parse_file_done_fields("FILE_DONE 7 abc123"),
+            Some(("7", "abc123"))
+        );
+        assert_eq!(parse_file_sent_fields("FILE_SENT 7 2"), Some(("7", "2")));
+        assert_eq!(
+            parse_file_cancelled_fields("FILE_CANCELLED 7 user requested cancel"),
+            Some(("7", "user requested cancel"))
+        );
+        assert_eq!(
+            parse_file_cancelled_fields("FILE_CANCELLED 7"),
+            Some(("7", "unknown"))
+        );
+
+        assert_eq!(parse_file_offer("SAY lobby report.pdf 12345"), None);
+        assert_eq!(parse_file_offer("FILE_OFFER lobby report.pdf"), None);
+        assert_eq!(
+            parse_file_offer_fields("FILE_OFFER lobby alice report.pdf"),
+            None
+        );
+        assert_eq!(parse_file_accept("FILE_ACCEPT lobby alice"), None);
+        assert_eq!(parse_file_start_fields("FILE_START 7 report.pdf"), None);
+        assert_eq!(
+            parse_file_incoming_fields("FILE_INCOMING 7 report.pdf"),
+            None
+        );
+        assert_eq!(parse_file_done_fields("FILE_DONE 7"), None);
+        assert_eq!(parse_file_sent_fields("FILE_SENT 7"), None);
+    }
 }
