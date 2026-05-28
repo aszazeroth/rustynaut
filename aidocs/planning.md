@@ -27,7 +27,7 @@ These are the best low-friction targets after the current branch.
 
 ### P0
 
-- [ ] **Fix reconnect early-drop stalls**
+- [x] **Fix reconnect early-drop stalls**
   - `ReconnectionManager::should_reconnect` rejects reconnects when a session drops before
     `min_connection_seconds`, but the TUI path may not schedule another retry afterward.
   - Expected result: a quick broker disconnect never leaves the client permanently idle.
@@ -38,7 +38,7 @@ These are the best low-friction targets after the current branch.
   - Use partial config overlays with `Option<T>` fields, then validate ranges, enum values, and
     cross-field constraints.
 
-- [ ] **Add typed protocol parsing and validation**
+- [x] **Add typed protocol parsing and validation**
   - Move from mostly string-splitting helpers toward typed `ProtocolMessage` values with bounded
     and validated fields.
   - Validate usernames, room names, base64 payloads, file sizes, offsets, sha256 strings, and empty

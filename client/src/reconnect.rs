@@ -38,7 +38,6 @@ impl ReconnectionManager {
     pub fn set_connected(&mut self) {
         self.state = ConnectionState::Connected;
         self.connection_start = Some(Instant::now());
-        self.attempt = 0;
     }
 
     pub fn set_disconnected(&mut self) {
@@ -54,6 +53,14 @@ impl ReconnectionManager {
         self.connection_start.map(|start| start.elapsed())
     }
 
+    pub fn handle_disconnect(&mut self, reason: DisconnectReason) -> bool {
+        if self.connection_was_stable() {
+            self.attempt = 0;
+        }
+        self.set_disconnected();
+        self.should_reconnect(reason)
+    }
+
     pub fn should_reconnect(&self, reason: DisconnectReason) -> bool {
         if !self.config.enabled {
             return false;
@@ -67,13 +74,13 @@ impl ReconnectionManager {
             return false;
         }
 
-        if let Some(duration) = self.connection_duration() {
-            if duration < Duration::from_secs(self.config.min_connection_seconds) {
-                return false;
-            }
-        }
-
         true
+    }
+
+    fn connection_was_stable(&self) -> bool {
+        self.connection_duration().is_some_and(|duration| {
+            duration >= Duration::from_secs(self.config.min_connection_seconds)
+        })
     }
 
     pub fn calculate_backoff(&self) -> Duration {
@@ -182,13 +189,47 @@ mod tests {
     }
 
     #[test]
-    fn test_set_connected_resets_attempt() {
+    fn test_set_connected_preserves_attempt_until_stable_disconnect() {
         let mut manager = ReconnectionManager::new(test_config());
         manager.attempt = 2;
 
         manager.set_connected();
 
-        assert_eq!(manager.attempt, 0);
+        assert_eq!(manager.attempt, 2);
         assert_eq!(manager.state(), ConnectionState::Connected);
+    }
+
+    #[test]
+    fn test_quick_disconnect_still_reconnects_and_consumes_attempts() {
+        let mut manager = ReconnectionManager::new(test_config());
+        manager.start_backoff();
+        manager.set_connected();
+
+        assert!(manager.handle_disconnect(DisconnectReason::NetworkError));
+        assert_eq!(manager.attempt(), 1);
+        assert_eq!(manager.state(), ConnectionState::Disconnected);
+    }
+
+    #[test]
+    fn test_stable_disconnect_resets_retry_budget() {
+        let mut manager = ReconnectionManager::new(test_config());
+        manager.attempt = 2;
+        manager.state = ConnectionState::Connected;
+        manager.connection_start =
+            Some(Instant::now() - Duration::from_secs(test_config().min_connection_seconds));
+
+        assert!(manager.handle_disconnect(DisconnectReason::NetworkError));
+        assert_eq!(manager.attempt(), 0);
+        assert_eq!(manager.state(), ConnectionState::Disconnected);
+    }
+
+    #[test]
+    fn test_quick_disconnect_stops_after_max_attempts() {
+        let mut manager = ReconnectionManager::new(test_config());
+        manager.attempt = manager.max_attempts();
+        manager.set_connected();
+
+        assert!(!manager.handle_disconnect(DisconnectReason::NetworkError));
+        assert_eq!(manager.state(), ConnectionState::Disconnected);
     }
 }

@@ -668,8 +668,7 @@ async fn run_tui_loop(
                 ConnectionState::Disconnected => {
                     app.add_info("Disconnected from broker");
                     let should_reconnect =
-                        reconnect_mgr.should_reconnect(DisconnectReason::NetworkError);
-                    reconnect_mgr.set_disconnected();
+                        reconnect_mgr.handle_disconnect(DisconnectReason::NetworkError);
 
                     if should_reconnect && !reconnect_scheduled {
                         let delay = reconnect_mgr.start_backoff();
