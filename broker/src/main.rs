@@ -274,11 +274,9 @@ async fn run_tui_loop(
                             }
                         }
                         crossterm::event::KeyCode::F(1) => app.toggle_sidebar(),
-                        crossterm::event::KeyCode::Esc => {
+                        crossterm::event::KeyCode::Esc if !app.current_completions.is_empty() => {
                             // Only cancel completions - never quit via ESC
-                            if !app.current_completions.is_empty() {
-                                app.cancel_completion();
-                            }
+                            app.cancel_completion();
                             // Use /quit to exit the broker
                         }
                         _ => {}

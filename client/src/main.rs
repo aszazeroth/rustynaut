@@ -738,120 +738,118 @@ async fn run_tui_loop(
         // Poll for events with timeout
         if crossterm::event::poll(std::time::Duration::from_millis(10))? {
             match crossterm::event::read()? {
-                crossterm::event::Event::Key(key) => {
-                    if key.kind == crossterm::event::KeyEventKind::Press {
-                        match key.code {
-                            crossterm::event::KeyCode::Char('c')
-                                if key
-                                    .modifiers
-                                    .contains(crossterm::event::KeyModifiers::CONTROL) =>
-                            {
-                                app.should_quit = true;
-                            }
-                            crossterm::event::KeyCode::Char('y') => {
-                                // Only copy if there's an actual selection, otherwise type 'y'
-                                if app.text_selection.is_some() {
-                                    app.copy_selected_message();
-                                } else if let Some(cmd) = app.handle_input('y') {
-                                    if cmd == "/quit" || cmd == "/exit" {
-                                        app.should_quit = true;
-                                    } else if let Err(e) =
-                                        process_command(cmd, net_tx_opt.as_ref()).await
-                                    {
-                                        app.add_error(format!("Failed to send: {}", e));
-                                    }
-                                }
-                            }
-                            crossterm::event::KeyCode::Char(c) => {
-                                if !app.current_completions.is_empty() {
-                                    app.cancel_completion();
-                                }
-                                if let Some(cmd) = app.handle_input(c) {
-                                    if cmd == "/quit" || cmd == "/exit" {
-                                        app.should_quit = true;
-                                    } else if let Err(e) =
-                                        process_command(cmd, net_tx_opt.as_ref()).await
-                                    {
-                                        app.add_error(format!("Failed to send: {}", e));
-                                    }
-                                }
-                            }
-                            crossterm::event::KeyCode::Backspace => app.handle_backspace(),
-                            crossterm::event::KeyCode::Delete => app.handle_delete(),
-                            crossterm::event::KeyCode::Left => app.cursor_left(),
-                            crossterm::event::KeyCode::Right => app.cursor_right(),
-                            crossterm::event::KeyCode::Home => app.cursor_home(),
-                            crossterm::event::KeyCode::End => app.cursor_end(),
-                            crossterm::event::KeyCode::PageUp => app.scroll_up(),
-                            crossterm::event::KeyCode::PageDown => app.scroll_down(),
-                            crossterm::event::KeyCode::Up => {
-                                if !app.current_completions.is_empty() {
-                                    app.handle_tab();
-                                } else {
-                                    app.history_previous();
-                                }
-                            }
-                            crossterm::event::KeyCode::Down => {
-                                if !app.current_completions.is_empty() {
-                                    app.handle_tab();
-                                } else {
-                                    app.history_next();
-                                }
-                            }
-                            crossterm::event::KeyCode::Tab => {
-                                app.handle_tab();
-                            }
-                            crossterm::event::KeyCode::Enter => {
-                                if app.input.is_empty()
-                                    && reconnect_mgr.state() == ConnectionState::Disconnected
-                                    && reconnect_mgr.attempt() >= reconnect_mgr.max_attempts()
-                                    && !reconnect_scheduled
-                                {
-                                    reconnect_mgr.reset();
-                                    let delay = reconnect_mgr.start_backoff();
-                                    reconnect_scheduled = true;
-                                    let _ = conn_status_tx.send(ConnectionState::Reconnecting);
-                                    app.add_info(format!(
-                                        "Reconnecting in {}s... (attempt {}/{})",
-                                        delay.as_secs(),
-                                        reconnect_mgr.attempt(),
-                                        reconnect_mgr.max_attempts()
-                                    ));
-
-                                    let reconnect_trigger_tx = reconnect_trigger_tx.clone();
-                                    tokio::spawn(async move {
-                                        time::sleep(delay).await;
-                                        let _ = reconnect_trigger_tx.send(()).await;
-                                    });
-                                } else if !app.current_completions.is_empty() {
-                                    app.apply_completion();
-                                } else if let Some(cmd) = app.handle_input('\n') {
-                                    if cmd == "/quit" || cmd == "/exit" {
-                                        app.should_quit = true;
-                                    } else if let Err(e) =
-                                        process_command(cmd, net_tx_opt.as_ref()).await
-                                    {
-                                        app.add_error(format!("Failed to send: {}", e));
-                                    }
-                                }
-                            }
-                            crossterm::event::KeyCode::F(1) => app.toggle_sidebar(),
-                            crossterm::event::KeyCode::Esc => {
-                                if app.text_selection.is_some() {
-                                    app.clear_text_selection();
-                                } else if !app.current_completions.is_empty() {
-                                    app.cancel_completion();
-                                }
-                            }
-                            _ => {}
+                crossterm::event::Event::Key(key)
+                    if key.kind == crossterm::event::KeyEventKind::Press =>
+                {
+                    match key.code {
+                        crossterm::event::KeyCode::Char('c')
+                            if key
+                                .modifiers
+                                .contains(crossterm::event::KeyModifiers::CONTROL) =>
+                        {
+                            app.should_quit = true;
                         }
+                        crossterm::event::KeyCode::Char('y') => {
+                            // Only copy if there's an actual selection, otherwise type 'y'
+                            if app.text_selection.is_some() {
+                                app.copy_selected_message();
+                            } else if let Some(cmd) = app.handle_input('y') {
+                                if cmd == "/quit" || cmd == "/exit" {
+                                    app.should_quit = true;
+                                } else if let Err(e) =
+                                    process_command(cmd, net_tx_opt.as_ref()).await
+                                {
+                                    app.add_error(format!("Failed to send: {}", e));
+                                }
+                            }
+                        }
+                        crossterm::event::KeyCode::Char(c) => {
+                            if !app.current_completions.is_empty() {
+                                app.cancel_completion();
+                            }
+                            if let Some(cmd) = app.handle_input(c) {
+                                if cmd == "/quit" || cmd == "/exit" {
+                                    app.should_quit = true;
+                                } else if let Err(e) =
+                                    process_command(cmd, net_tx_opt.as_ref()).await
+                                {
+                                    app.add_error(format!("Failed to send: {}", e));
+                                }
+                            }
+                        }
+                        crossterm::event::KeyCode::Backspace => app.handle_backspace(),
+                        crossterm::event::KeyCode::Delete => app.handle_delete(),
+                        crossterm::event::KeyCode::Left => app.cursor_left(),
+                        crossterm::event::KeyCode::Right => app.cursor_right(),
+                        crossterm::event::KeyCode::Home => app.cursor_home(),
+                        crossterm::event::KeyCode::End => app.cursor_end(),
+                        crossterm::event::KeyCode::PageUp => app.scroll_up(),
+                        crossterm::event::KeyCode::PageDown => app.scroll_down(),
+                        crossterm::event::KeyCode::Up => {
+                            if !app.current_completions.is_empty() {
+                                app.handle_tab();
+                            } else {
+                                app.history_previous();
+                            }
+                        }
+                        crossterm::event::KeyCode::Down => {
+                            if !app.current_completions.is_empty() {
+                                app.handle_tab();
+                            } else {
+                                app.history_next();
+                            }
+                        }
+                        crossterm::event::KeyCode::Tab => {
+                            app.handle_tab();
+                        }
+                        crossterm::event::KeyCode::Enter => {
+                            if app.input.is_empty()
+                                && reconnect_mgr.state() == ConnectionState::Disconnected
+                                && reconnect_mgr.attempt() >= reconnect_mgr.max_attempts()
+                                && !reconnect_scheduled
+                            {
+                                reconnect_mgr.reset();
+                                let delay = reconnect_mgr.start_backoff();
+                                reconnect_scheduled = true;
+                                let _ = conn_status_tx.send(ConnectionState::Reconnecting);
+                                app.add_info(format!(
+                                    "Reconnecting in {}s... (attempt {}/{})",
+                                    delay.as_secs(),
+                                    reconnect_mgr.attempt(),
+                                    reconnect_mgr.max_attempts()
+                                ));
+
+                                let reconnect_trigger_tx = reconnect_trigger_tx.clone();
+                                tokio::spawn(async move {
+                                    time::sleep(delay).await;
+                                    let _ = reconnect_trigger_tx.send(()).await;
+                                });
+                            } else if !app.current_completions.is_empty() {
+                                app.apply_completion();
+                            } else if let Some(cmd) = app.handle_input('\n') {
+                                if cmd == "/quit" || cmd == "/exit" {
+                                    app.should_quit = true;
+                                } else if let Err(e) =
+                                    process_command(cmd, net_tx_opt.as_ref()).await
+                                {
+                                    app.add_error(format!("Failed to send: {}", e));
+                                }
+                            }
+                        }
+                        crossterm::event::KeyCode::F(1) => app.toggle_sidebar(),
+                        crossterm::event::KeyCode::Esc => {
+                            if app.text_selection.is_some() {
+                                app.clear_text_selection();
+                            } else if !app.current_completions.is_empty() {
+                                app.cancel_completion();
+                            }
+                        }
+                        _ => {}
                     }
                 }
                 crossterm::event::Event::Mouse(mouse_event) => match mouse_event.kind {
-                    crossterm::event::MouseEventKind::Down(button) => {
-                        if button == crossterm::event::MouseButton::Left {
-                            app.start_selection_drag(mouse_event.row, mouse_event.column);
-                        }
+                    crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+                        app.start_selection_drag(mouse_event.row, mouse_event.column);
                     }
                     crossterm::event::MouseEventKind::Drag(_button) => {
                         app.update_selection_drag(mouse_event.row, mouse_event.column);
