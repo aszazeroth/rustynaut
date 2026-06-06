@@ -115,6 +115,7 @@ The broker supports these commands:
 - `/rooms` - List active rooms
 - `/who` - Show users in current room
 - `/offers` - List pending file offers
+- `/clips` - List recent clipboard entries
 - `/accept <user> [filename]` - Accept a file offer
 - `/cancel <transfer_id>` - Cancel a file transfer
 

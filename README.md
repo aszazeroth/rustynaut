@@ -298,6 +298,7 @@ Type commands into the client:
 | `/rooms` | List active rooms |
 | `/who` | Show users in current room |
 | `/offers` | List pending file offers in current room |
+| `/clips` | List recent clipboard entries in current room |
 | `/accept <user> [filename]` | Accept a file offer from a user |
 | `/cancel <transfer_id>` | Cancel an in-progress file transfer |
 | `/quit` or `/exit` | Exit the client |

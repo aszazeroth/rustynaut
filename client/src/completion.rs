@@ -38,6 +38,7 @@ impl CompletionContext {
                 "/who".to_string(),
                 "/join".to_string(),
                 "/offers".to_string(),
+                "/clips".to_string(),
                 "/accept".to_string(),
                 "/cancel".to_string(),
                 "/quit".to_string(),
@@ -285,6 +286,7 @@ impl Completer {
             "/who" => "Show users in current room".to_string(),
             "/join" => "Join a room".to_string(),
             "/offers" => "List pending file offers".to_string(),
+            "/clips" => "List recent clipboard entries".to_string(),
             "/accept" => "Accept a file offer".to_string(),
             "/cancel" => "Cancel a file transfer".to_string(),
             "/quit" => "Exit the client".to_string(),
@@ -309,6 +311,9 @@ mod tests {
         let completer = Completer::new();
         let completions = completer.complete_commands("ro");
         assert!(completions.iter().any(|c| c.text == "/rooms"));
+
+        let completions = completer.complete_commands("cl");
+        assert!(completions.iter().any(|c| c.text == "/clips"));
     }
 
     #[test]
