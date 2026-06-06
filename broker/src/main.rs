@@ -564,9 +564,18 @@ struct Shared {
     next_clip_id: u64,
     /// Recent clip content hashes per room for deduplication (room -> recent hashes)
     recent_clips: HashMap<String, VecDeque<u64>>,
+    /// Recent clipboard entries per room for /clips visibility.
+    recent_clip_entries: HashMap<String, VecDeque<RecentClip>>,
     /// Recent file offer hashes per room for deduplication (room -> recent hashes)
     recent_file_offers: HashMap<String, VecDeque<u64>>,
     file_transfers: FileTransfers,
+}
+
+#[derive(Debug, Clone)]
+struct RecentClip {
+    id: u64,
+    username: String,
+    preview: String,
 }
 
 #[derive(Clone)]
@@ -602,6 +611,7 @@ impl Shared {
             peers: HashMap::new(),
             next_clip_id: 0,
             recent_clips: HashMap::new(),
+            recent_clip_entries: HashMap::new(),
             recent_file_offers: HashMap::new(),
             file_transfers: FileTransfers::new(),
         }
@@ -629,6 +639,29 @@ impl Shared {
     /// List all pending offers in a room (for /offers command)
     fn list_offers(&self, room: &str) -> Vec<(&str, &str, u64)> {
         self.file_transfers.list_offers(room)
+    }
+
+    fn file_offer_lines(&self, room: &str) -> Vec<String> {
+        file_offer_lines(room, self.list_offers(room))
+    }
+
+    fn record_recent_clip(&mut self, room: &str, username: &str, id: u64, b64: &str) {
+        let entries = self
+            .recent_clip_entries
+            .entry(room.to_string())
+            .or_default();
+        if entries.len() >= MAX_RECENT_CLIPS_PER_ROOM {
+            entries.pop_front();
+        }
+        entries.push_back(RecentClip {
+            id,
+            username: username.to_string(),
+            preview: clip_preview(b64),
+        });
+    }
+
+    fn clip_lines(&self, room: &str) -> Vec<String> {
+        clip_lines(room, self.recent_clip_entries.get(room))
     }
 
     /// Accept a file offer and start a transfer
@@ -752,6 +785,79 @@ impl Shared {
                 let _ = peer.tx.send(message.into());
             }
         }
+    }
+}
+
+fn help_lines() -> [&'static str; 8] {
+    [
+        "INFO commands:",
+        "INFO   /help - show this help",
+        "INFO   /rooms - list active rooms",
+        "INFO   /who - list users in the current room",
+        "INFO   /offers - list pending file offers in the current room",
+        "INFO   /clips - list recent clipboard entries in the current room",
+        "INFO   /accept <user> [filename] - accept a pending file offer",
+        "INFO   /cancel <transfer_id> - cancel an active file transfer",
+    ]
+}
+
+fn file_offer_lines(room: &str, offers: Vec<(&str, &str, u64)>) -> Vec<String> {
+    if offers.is_empty() {
+        return vec![format!("INFO no pending file offers in {room}")];
+    }
+
+    let mut lines = vec![format!("INFO pending file offers in {room}:")];
+    for (username, filename_b64, size) in offers {
+        let filename = decode_base64(filename_b64)
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .unwrap_or_else(|| "<unknown>".to_string());
+        let size_display = format_size(size);
+        lines.push(format!(
+            "INFO   {username}: {filename} ({size_display}) - /accept {username} {filename}"
+        ));
+    }
+    lines
+}
+
+fn clip_lines(room: &str, clips: Option<&VecDeque<RecentClip>>) -> Vec<String> {
+    let Some(clips) = clips else {
+        return vec![format!("INFO no recent clipboard entries in {room}")];
+    };
+    if clips.is_empty() {
+        return vec![format!("INFO no recent clipboard entries in {room}")];
+    }
+
+    let mut lines = vec![format!("INFO recent clipboard entries in {room}:")];
+    for clip in clips.iter().rev() {
+        lines.push(format!(
+            "INFO   #{} {}: {}",
+            clip.id, clip.username, clip.preview
+        ));
+    }
+    lines
+}
+
+fn clip_preview(b64: &str) -> String {
+    let text = decode_base64(b64)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok());
+    let Some(text) = text else {
+        return "<non-text clipboard>".to_string();
+    };
+
+    let single_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if single_line.is_empty() {
+        return "<empty>".to_string();
+    }
+
+    const MAX_PREVIEW_CHARS: usize = 80;
+    let mut chars = single_line.chars();
+    let preview = chars.by_ref().take(MAX_PREVIEW_CHARS).collect::<String>();
+    if chars.next().is_some() {
+        format!("{preview}...")
+    } else {
+        preview
     }
 }
 
@@ -936,28 +1042,20 @@ where
                     if let Some(cmd) = parse_cmd(&msg) {
                         match cmd {
                             "/help" => {
-                                        peer.lines
-                                            .send("INFO commands: /help /rooms /who /offers /accept <user>".to_string())
-                                            .await?;
+                                for line in help_lines() {
+                                    peer.lines.send(line).await?;
+                                }
                             }
                             "/offers" => {
                                 let state = state.lock().await;
-                                let offers = state.list_offers(&room);
-                                if offers.is_empty() {
-                                    peer.lines.send(format!("INFO no pending file offers in {room}")).await?;
-                                } else {
-                                    let mut lines = vec![format!("INFO pending file offers in {room}:")];
-                                    for (username, filename_b64, size) in offers {
-                                        let filename = decode_base64(filename_b64)
-                                            .ok()
-                                            .and_then(|bytes| String::from_utf8(bytes).ok())
-                                            .unwrap_or_else(|| "<unknown>".to_string());
-                                        let size_display = format_size(size);
-                                        lines.push(format!("INFO   {username}: {filename} ({size_display})"));
-                                    }
-                                    for line in lines {
-                                        peer.lines.send(line).await?;
-                                    }
+                                for line in state.file_offer_lines(&room) {
+                                    peer.lines.send(line).await?;
+                                }
+                            }
+                            "/clips" => {
+                                let state = state.lock().await;
+                                for line in state.clip_lines(&room) {
+                                    peer.lines.send(line).await?;
                                 }
                             }
                             "/rooms" => {
@@ -1105,6 +1203,7 @@ where
 
                         state.next_clip_id += 1;
                         let id = state.next_clip_id;
+                        state.record_recent_clip(&room, &username, id, b64);
                         let out = format!("CLIP {room} {b64} {id}");
                         state.broadcast_to_room(addr, &room, &out).await;
                         continue;
@@ -1416,5 +1515,69 @@ mod tests {
         }
 
         assert!(!shared.is_duplicate_file_offer("lobby", "report.pdf", "123"));
+    }
+
+    #[test]
+    fn test_help_lines_include_clip_and_offer_commands() {
+        let lines = help_lines();
+
+        assert!(lines.iter().any(|line| line.contains("/help")));
+        assert!(lines.iter().any(|line| line.contains("/offers")));
+        assert!(lines.iter().any(|line| line.contains("/clips")));
+        assert!(lines.iter().any(|line| line.contains("/accept")));
+    }
+
+    #[test]
+    fn test_file_offer_lines_format_empty_and_pending_offers() {
+        assert_eq!(
+            file_offer_lines("lobby", Vec::new()),
+            vec!["INFO no pending file offers in lobby"]
+        );
+
+        let filename_b64 = encode_base64("report.pdf");
+        assert_eq!(
+            file_offer_lines("lobby", vec![("alice", &filename_b64, 12_345)]),
+            vec![
+                "INFO pending file offers in lobby:".to_string(),
+                "INFO   alice: report.pdf (12.1 KB) - /accept alice report.pdf".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_clip_lines_format_empty_and_recent_clips() {
+        let mut shared = Shared::new();
+
+        assert_eq!(
+            shared.clip_lines("lobby"),
+            vec!["INFO no recent clipboard entries in lobby"]
+        );
+
+        shared.record_recent_clip("lobby", "alice", 1, &encode_base64("hello from macOS"));
+        shared.record_recent_clip(
+            "lobby",
+            "bob",
+            2,
+            &encode_base64("hello\nfrom\nwindows with several words"),
+        );
+
+        assert_eq!(
+            shared.clip_lines("lobby"),
+            vec![
+                "INFO recent clipboard entries in lobby:".to_string(),
+                "INFO   #2 bob: hello from windows with several words".to_string(),
+                "INFO   #1 alice: hello from macOS".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_clip_preview_truncates_long_text_and_hides_non_text() {
+        let long_text = "a".repeat(81);
+        assert_eq!(
+            clip_preview(&encode_base64(long_text)),
+            format!("{}...", "a".repeat(80))
+        );
+        assert_eq!(clip_preview("not-base64!"), "<non-text clipboard>");
     }
 }
